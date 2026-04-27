@@ -219,22 +219,25 @@ node framework/examples/LLMIntegration.js
 - [x] SDK客户端库
 - [x] Framework核心框架
 - [x] 6个功能模块
-- [x] MiniMax/OpenAI/Anthropic集成
+- [x] MiniMax集成（已测试通过）
+- [x] OpenAI集成
+- [x] Anthropic集成
 - [x] 配置文件系统
 - [x] 渐进式功能开关
 - [x] 上下文摘要API
 - [x] 任务依赖管理
 - [x] 项目分组
+- [x] Git版本管理
 
 ### 进行中 🔄
 
 - [ ] 自动任务识别（分析对话提取任务）
 - [ ] 可视化管理界面
-- [ ] WebSocket实时推送
 
 ### 计划中 📋
 
 - [ ] Docker部署
+- [ ] WebSocket实时推送
 - [ ] 多语言SDK（Python, Go）
 - [ ] 任务版本控制
 - [ ] 任务评论系统
