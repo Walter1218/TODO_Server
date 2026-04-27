@@ -192,7 +192,7 @@ const { message } = await todo.focus();
 | 记忆管理 | - | - | ✅ | 重要信息存储 |
 | Prompt增强 | - | - | ✅ | 自动注入 |
 | 主动提醒 | - | - | ✅ | 定期提醒 |
-| LLM集成 | - | - | ✅ | MiniMax/OpenAI/Claude |
+| **LLM集成** | - | - | ✅ | **MiniMax/OpenAI/Claude（已测试通过）** |
 
 ## 🔧 开发
 
