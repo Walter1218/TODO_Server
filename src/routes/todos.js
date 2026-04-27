@@ -20,7 +20,7 @@ router.use((req, res, next) => {
 router.post('/', (req, res) => {
   try {
     const { agentId } = req.params;
-    const { title, description, priority, context, tags } = req.body;
+    const { title, description, priority, context, tags, dependencies, projectId, position } = req.body;
 
     if (!title) {
       return res.status(400).json({
@@ -37,12 +37,42 @@ router.post('/', (req, res) => {
       });
     }
 
+    if (dependencies !== undefined) {
+      if (!Array.isArray(dependencies)) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: 'Dependencies must be an array'
+        });
+      }
+
+      for (const depId of dependencies) {
+        if (!Todo.findById(agentId, depId)) {
+          return res.status(400).json({
+            error: 'Validation error',
+            message: `Dependency todo not found: ${depId}`
+          });
+        }
+      }
+
+      for (const depId of dependencies) {
+        if (Todo.hasCircularDependency(agentId, 'new-todo', [depId])) {
+          return res.status(400).json({
+            error: 'Validation error',
+            message: `Circular dependency detected for dependency: ${depId}`
+          });
+        }
+      }
+    }
+
     const todo = Todo.create(agentId, {
       title,
       description,
       priority,
       context,
-      tags
+      tags,
+      dependencies,
+      projectId,
+      position
     });
 
     res.status(201).json({
@@ -192,56 +222,6 @@ router.get('/:id', (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to fetch TODO'
-    });
-  }
-});
-
-router.put('/:id', (req, res) => {
-  try {
-    const { agentId, id } = req.params;
-    const { title, description, status, priority, context, tags } = req.body;
-
-    if (!Todo.findById(agentId, id)) {
-      return res.status(404).json({
-        error: 'Not found',
-        message: 'TODO not found'
-      });
-    }
-
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled'];
-    if (status && !validStatuses.includes(status)) {
-      return res.status(400).json({
-        error: 'Validation error',
-        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled'
-      });
-    }
-
-    const validPriorities = ['low', 'medium', 'high', 'critical'];
-    if (priority && !validPriorities.includes(priority)) {
-      return res.status(400).json({
-        error: 'Validation error',
-        message: 'Invalid priority. Must be one of: low, medium, high, critical'
-      });
-    }
-
-    const todo = Todo.update(agentId, id, {
-      title,
-      description,
-      status,
-      priority,
-      context,
-      tags
-    });
-
-    res.json({
-      success: true,
-      data: todo
-    });
-  } catch (error) {
-    console.error('Error updating TODO:', error);
-    res.status(500).json({
-      error: 'Internal server error',
-      message: 'Failed to update TODO'
     });
   }
 });
@@ -439,6 +419,31 @@ router.put('/:id', (req, res) => {
         error: 'Validation error',
         message: 'Invalid priority. Must be one of: low, medium, high, critical'
       });
+    }
+
+    if (dependencies !== undefined) {
+      if (!Array.isArray(dependencies)) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: 'Dependencies must be an array'
+        });
+      }
+
+      for (const depId of dependencies) {
+        if (!Todo.findById(agentId, depId)) {
+          return res.status(400).json({
+            error: 'Validation error',
+            message: `Dependency todo not found: ${depId}`
+          });
+        }
+      }
+
+      if (Todo.hasCircularDependency(agentId, id, dependencies)) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: 'Circular dependency detected'
+        });
+      }
     }
 
     const todo = Todo.update(agentId, id, {

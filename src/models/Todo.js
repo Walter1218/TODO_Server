@@ -225,28 +225,39 @@ class Todo {
 
   static hasCircularDependency(agentId, todoId, newDependencies) {
     const db = getDb();
-    const visited = new Set();
-    const stack = [...newDependencies];
 
-    while (stack.length > 0) {
-      const currentId = stack.pop();
+    if (todoId === 'new-todo' || !newDependencies || newDependencies.length === 0) {
+      return false;
+    }
 
-      if (currentId === todoId) {
-        return true;
-      }
+    for (const depId of newDependencies) {
+      const visited = new Set();
+      const stack = [depId];
 
-      if (visited.has(currentId)) {
-        continue;
-      }
+      while (stack.length > 0) {
+        const currentId = stack.pop();
 
-      visited.add(currentId);
+        if (currentId === todoId) {
+          return true;
+        }
 
-      const stmt = db.prepare('SELECT dependencies FROM todos WHERE id = ? AND agent_id = ?');
-      const row = stmt.get(currentId, agentId);
+        if (visited.has(currentId)) {
+          continue;
+        }
 
-      if (row) {
-        const deps = JSON.parse(row.dependencies || '[]');
-        stack.push(...deps);
+        visited.add(currentId);
+
+        const stmt = db.prepare('SELECT dependencies FROM todos WHERE id = ? AND agent_id = ?');
+        const row = stmt.get(currentId, agentId);
+
+        if (row) {
+          const deps = JSON.parse(row.dependencies || '[]');
+          for (const d of deps) {
+            if (!visited.has(d)) {
+              stack.push(d);
+            }
+          }
+        }
       }
     }
 

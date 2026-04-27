@@ -303,6 +303,42 @@ Agent询问：我的优先任务是什么？
 
 欢迎提交Issue和Pull Request！
 
+## 🐛 Bug修复记录
+
+### v1.1.1 (2026-04-27)
+
+#### 循环依赖检测修复
+
+**问题描述**:
+- 通过PUT请求直接更新`dependencies`字段可以绕过循环依赖检查
+- 导致任务之间形成循环依赖（A→B→A），造成任务无法执行
+
+**根本原因**:
+- `src/routes/todos.js`中存在两个`router.put('/:id')`路由定义
+- Express使用第一个匹配的路由，导致带循环检查的第二个路由未被执行
+- `hasCircularDependency`方法逻辑不完整
+
+**修复内容**:
+1. 删除了重复的旧PUT路由
+2. 在PUT路由中添加了完整的循环依赖验证逻辑
+3. 在POST创建时也添加了循环依赖验证
+4. 修正了`hasCircularDependency`方法的检测算法
+
+**修复文件**:
+- `src/routes/todos.js` - 删除重复路由，添加循环依赖验证
+- `src/models/Todo.js` - 修正hasCircularDependency算法
+
+#### PromptManager正则表达式修复
+
+**问题描述**:
+- `PromptManager.replaceTemplateVariables`方法中RegExp构造错误
+
+**修复内容**:
+- 修正了正则表达式括号位置
+
+**修复文件**:
+- `framework/modules/PromptManager.js`
+
 ## 📄 License
 
 MIT
