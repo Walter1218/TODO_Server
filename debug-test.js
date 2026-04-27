@@ -6,12 +6,12 @@ async function test() {
   const framework = new AgentTaskFramework({
     base: {
       todoServerUrl: 'http://localhost:3000',
-      agentId: 'be071684-a068-46f9-8fc8-04b6484cc356',
+      agentId: process.env.TODO_AGENT_ID || 'test-agent-id',
       enableLogging: true
     },
     llm: {
       provider: 'minimax',
-      apiKey: 'sk-cp-5Ta1Ur5ytb4uy4HPVW9Pu6Gcox0-maiU4TGZ-GQs22JeGHPY-7jhoh2n0boUE6IUp9ilRJrMPQjaVNOP9Z61Lw-8qY8k7p0huF-vxcI6MuqNdaD3Jjxgap0',
+      apiKey: process.env.MINIMAX_API_KEY || 'test-api-key',
       model: 'MiniMax-M2.7',
       temperature: 0.7,
       maxTokens: 500
