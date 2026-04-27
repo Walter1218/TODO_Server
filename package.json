@@ -1,0 +1,26 @@
+{
+  "name": "agent-todo-server",
+  "version": "1.0.0",
+  "description": "TODO task management service for AI agents to reduce context inflation and task divergence",
+  "main": "src/server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "agent": "node start.js"
+  },
+  "keywords": [
+    "todo",
+    "task-management",
+    "ai-agent",
+    "context-management"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "uuid": "^11.0.5"
+  }
+}

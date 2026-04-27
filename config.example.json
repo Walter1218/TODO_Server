@@ -1,0 +1,80 @@
+{
+  "name": "Agent TODO Framework 配置",
+  "version": "1.0.0",
+  "description": "智能体任务聚焦框架配置文件",
+
+  "server": {
+    "url": "http://localhost:3000",
+    "description": "TODO Server 地址"
+  },
+
+  "llm": {
+    "provider": "minimax",
+    "description": "LLM 提供者: minimax | openai | anthropic",
+
+    "minimax": {
+      "apiKey": "YOUR_MINIMAX_API_KEY",
+      "groupId": "YOUR_MINIMAX_GROUP_ID",
+      "model": "MiniMax-Text-01",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+
+    "openai": {
+      "apiKey": "YOUR_OPENAI_API_KEY",
+      "model": "gpt-3.5-turbo",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+
+    "anthropic": {
+      "apiKey": "YOUR_ANTHROPIC_API_KEY",
+      "model": "claude-3-5-haiku-20241022",
+      "temperature": 0.7,
+      "maxTokens": 1024
+    }
+  },
+
+  "agent": {
+    "id": "default-agent",
+    "name": "默认智能体"
+  },
+
+  "features": {
+    "taskManagement": {
+      "enabled": true,
+      "autoCreateTasks": false,
+      "autoUpdateStatus": false,
+      "priority": "medium"
+    },
+    "contextManagement": {
+      "enabled": true,
+      "injectInterval": "every_turn",
+      "maxContextLength": 2000,
+      "prioritizeBy": "priority"
+    },
+    "memoryManagement": {
+      "enabled": true,
+      "memoryTypes": ["task_history", "key_decisions"],
+      "memoryRetention": 7,
+      "autoSummarize": false
+    },
+    "promptManagement": {
+      "enabled": true,
+      "autoEnhance": true,
+      "addChecklist": true,
+      "addProgress": true
+    },
+    "proactiveInteraction": {
+      "enabled": true,
+      "remindInterval": 5,
+      "suggestOnIdle": true,
+      "blockOffTopic": false
+    },
+    "dependencyManagement": {
+      "enabled": true,
+      "autoDetect": false,
+      "showBlockers": true
+    }
+  }
+}

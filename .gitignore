@@ -1,0 +1,38 @@
+# 依赖
+node_modules/
+package-lock.json
+
+# 数据库
+data/
+
+# 日志
+logs/
+*.log
+npm-debug.log*
+
+# 环境变量
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+
+# 编译文件
+dist/
+build/
+
+# 测试覆盖率
+coverage/
+
+# API密钥（使用config.example.json）
+# config.json  # 不要提交包含真实密钥的配置文件
