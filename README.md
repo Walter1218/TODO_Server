@@ -230,6 +230,12 @@ node framework/examples/LLMIntegration.js
 - [x] 任务依赖管理
 - [x] 项目分组
 - [x] Git版本管理
+- [x] 循环依赖检测
+- [x] 智能建议系统
+- [x] Prompt增强
+- [x] 主动提醒机制
+- [x] 角色模板系统
+- [x] 任务链规划
 
 ### 进行中 🔄
 
