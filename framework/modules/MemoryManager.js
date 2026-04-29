@@ -81,9 +81,74 @@ class MemoryManager {
       return;
     }
 
-    // 这里需要接入LLM来分析对话并提取关键信息
-    // 临时实现：简单关键词检测
-    
+    const text = (userMessage || '') + ' ' + (response.message || response || '');
+    if (text.trim().length < 10) {
+      return;
+    }
+
+    const llmManager = this.framework.modules.llmManager;
+    if (!llmManager || !llmManager.hasProvider()) {
+      this.framework.log('⚠️ LLM 未配置，回退到关键词提取记忆');
+      return this._fallbackExtract(text);
+    }
+
+    const systemPrompt = `你是一个记忆提取助手。请从对话中提取值得长期保存的关键信息。
+
+提取规则：
+1. **decision** - 用户或AI做出的重要决定、选择、方案
+2. **fact** - 重要事实、数据、结论
+3. **constraint** - 约束条件、要求、限制
+4. **commitment** - 承诺、保证、约定
+5. **preference** - 用户的偏好、习惯
+
+只提取确实有长期价值的信息，忽略闲聊和临时性内容。
+
+你必须只返回纯JSON数组格式，不要包含任何其他文字：
+[
+  {"type": "decision", "content": "决定使用DuckDB作为数据仓库", "importance": "high"},
+  {"type": "fact", "content": "当前股票数据覆盖5507只股票", "importance": "normal"}
+]
+如果没有值得保存的信息，返回空数组：[]`;
+
+    try {
+      const result = await llmManager.chat({
+        messages: [{ role: "user", content: text }],
+        system: systemPrompt
+      });
+
+      const raw = result.content || "";
+      const jsonMatch = raw.match(/\[[\s\S]*\]/);
+      if (!jsonMatch) {
+        this.framework.log(`⚠️ LLM 记忆提取无法解析: ${raw.substring(0, 100)}`);
+        return;
+      }
+
+      const memories = JSON.parse(jsonMatch[0]);
+      if (!Array.isArray(memories)) {
+        return;
+      }
+
+      for (const mem of memories) {
+        if (mem.content && mem.content.trim().length > 5) {
+          await this.storeMemory(
+            mem.content.trim(),
+            mem.type || 'important_fact',
+            { source: 'conversation', importance: mem.importance || 'normal' }
+          );
+        }
+      }
+
+      this.framework.log(`🤖 LLM 提取了 ${memories.length} 条记忆`);
+    } catch (error) {
+      this.framework.log(`❌ LLM 记忆提取失败: ${error.message}`);
+      return this._fallbackExtract(text);
+    }
+  }
+
+  /**
+   * 关键词回退提取
+   */
+  async _fallbackExtract(text) {
     const patterns = {
       decision: /(决定|选择|采用|使用)/,
       fact: /(因为|由于|数据显示|根据)/,
@@ -91,14 +156,11 @@ class MemoryManager {
       commitment: /(会|将|承诺|保证)/
     };
 
-    const text = userMessage + ' ' + (response.message || response);
-    
     for (const [type, pattern] of Object.entries(patterns)) {
       if (pattern.test(text)) {
-        // 提取包含关键词的句子
         const sentences = text.split(/[。！？]/);
         for (const sentence of sentences) {
-          if (pattern.test(sentence)) {
+          if (pattern.test(sentence) && sentence.trim().length > 5) {
             await this.storeMemory(sentence.trim(), type, {
               source: 'conversation',
               importance: 'normal'

@@ -13,6 +13,14 @@ class AgentTaskFramework {
     this.config = this.mergeConfig(config);
     this.modules = {};
     this.initialized = false;
+    this.pendingCreations = [];      // 待用户确认创建的任务
+    this.pendingCompletions = [];    // 待用户确认完成的任务
+    this.lastFocusTaskId = null;     // 上次聚焦的任务ID（用于检测切换）
+    this.heartbeatTimer = null;      // 心跳定时器
+    this.currentHeartbeatTaskId = null; // 当前正在心跳的任务
+    this.localCache = this._loadLocalCache(); // 本地缓存（熔断时使用）
+    this.health = 'healthy';         // healthy / degraded / failed
+    this.failCount = 0;              // API 失败计数
   }
 
   /**
@@ -168,10 +176,38 @@ class AgentTaskFramework {
    */
   async processMessage(userMessage, conversationHistory = []) {
     const startTime = Date.now();
+
+    // === 前置检查 1：用户是否确认了待创建的任务 ===
+    const confirmedCreations = await this._checkTaskCreationConfirmation(userMessage);
+    let preMessage = '';
+    if (confirmedCreations.length > 0) {
+      preMessage = confirmedCreations.map(c => `✅ 已创建任务：${c.title}`).join('\n') + '\n\n';
+    }
+
+    // === 前置检查 2：用户是否确认了待完成的任务 ===
+    const confirmedCompletions = await this._checkTaskCompletionConfirmation(userMessage);
+    if (confirmedCompletions.length > 0) {
+      preMessage += confirmedCompletions.map(c => `✅ 任务已完成：${c.title}`).join('\n') + '\n\n';
+    }
+    
+    // === 前置检查 3：聚焦任务是否切换 ===
+    const focusChangeInfo = await this._checkFocusChange();
     
     const context = await this.prepareContext();
     const enhancedPrompt = await this.buildEnhancedPrompt(userMessage, context);
-    const response = await this.generateResponse(enhancedPrompt, conversationHistory);
+    let response = await this.generateResponse(enhancedPrompt, conversationHistory);
+
+    // 追加前置消息
+    if (preMessage) {
+      response.message = preMessage + response.message;
+    }
+    // 追加聚焦切换通知
+    if (focusChangeInfo) {
+      response.message = focusChangeInfo + '\n\n' + response.message;
+    }
+    
+    // 保存对话上下文到 TODO Server
+    await this._saveConversationContext(userMessage, response.message);
     
     await this.postProcess(response, userMessage);
     
@@ -209,6 +245,12 @@ class AgentTaskFramework {
       context.features.memory = await this.modules.memoryManager.getRecentMemory();
     }
 
+    // 注入当前聚焦任务信息
+    const focusTask = await this.getCurrentFocusTask();
+    if (focusTask) {
+      context.features.focusTask = focusTask;
+    }
+
     return context;
   }
 
@@ -237,6 +279,19 @@ ${taskInfo.priorityTasks.map((t, i) => `${i + 1}. [${t.priority.toUpperCase()}] 
 
 ${taskInfo.blockedTasks.length > 0 ? `🚧 被阻塞的任务:
 ${taskInfo.blockedTasks.map(t => `- ${t.title} (等待: ${t.waitingOn.join(', ')})`).join('\n')}` : ''}`);
+    }
+
+    // 注入聚焦任务详细信息
+    if (context.features.focusTask) {
+      const ft = context.features.focusTask;
+      promptParts.push(`=== 📋 当前聚焦任务 ===
+任务：${ft.title}
+状态：${ft.status}
+优先级：${ft.priority}
+${ft.description ? `描述：${ft.description}` : ''}
+${ft.acceptance_criteria ? `验收标准：\n${ft.acceptance_criteria}` : ''}
+${ft.heartbeat_progress > 0 ? `进度：${Math.round(ft.heartbeat_progress * 100)}%` : ''}
+${ft.heartbeat_step ? `当前步骤：${ft.heartbeat_step}` : ''}`);
     }
 
     if (this.config.features.promptManagement.addChecklist) {
@@ -375,11 +430,11 @@ const config = {
    */
   async postProcess(response, userMessage) {
     if (this.modules.taskManager && this.config.features.taskManagement.autoUpdateStatus) {
-      await this.modules.taskManager.analyzeAndUpdate(response);
+      await this.modules.taskManager.analyzeAndUpdate(response, userMessage);
     }
 
     if (this.modules.memoryManager && this.config.features.memoryManagement.autoSummarize) {
-      await this.modules.memoryManager.extractAndStore(response, userMessage);
+      await this.memoryManager.extractAndStore(response, userMessage);
     }
 
     if (this.modules.proactiveManager) {
@@ -388,6 +443,521 @@ const config = {
         response.reminder = reminder;
       }
     }
+
+    // 新增：LLM 语义偏离检测 + 纠偏提示
+    if (this.modules.proactiveManager && this.config.features.proactiveInteraction.blockOffTopic) {
+      try {
+        const currentTask = await this.getCurrentFocusTask();
+        if (currentTask) {
+          const drift = await this.modules.proactiveManager.detectDrift(
+            userMessage,
+            response.message,
+            currentTask
+          );
+
+          if (drift.is_drifted && drift.drift_score >= 0.6) {
+            const alert = this.modules.proactiveManager.getDriftAlert(drift, currentTask);
+            if (alert) {
+              response.drift_alert = alert;
+              response.message += '\n\n---\n' + alert.content;
+              this.log(`🚨 检测到对话偏离（${Math.round(drift.drift_score * 100)}%）：${currentTask.title}`);
+            }
+          }
+        }
+      } catch (error) {
+        this.log(`⚠️ 偏离检测失败: ${error.message}`);
+      }
+    }
+
+    // 新增：任务完成确认提议（如果智能体判断可能完成）
+    if (this.modules.taskManager && this.config.features.taskManagement.autoUpdateStatus) {
+      try {
+        const currentTask = await this.getCurrentFocusTask();
+        if (currentTask && currentTask.status === 'in_progress') {
+          const shouldPropose = await this._shouldProposeCompletion(userMessage, response.message, currentTask);
+          if (shouldPropose) {
+            this._proposeTaskCompletion(response, currentTask);
+            // 启动心跳（如果还没启动）
+            this._startHeartbeat(currentTask.id);
+          }
+        }
+      } catch (error) {
+        this.log(`⚠️ 完成确认提议失败: ${error.message}`);
+      }
+    }
+
+    // 新增：主动发现新任务（需用户确认）
+    if (this.modules.taskManager && this.config.features.taskManagement.autoCreateTasks) {
+      try {
+        const conversationText = userMessage + '\n' + (response.message || '');
+        const candidates = await this.modules.taskManager.discoverNewTasks(conversationText);
+        if (candidates.length > 0) {
+          this._proposeTaskCreations(response, candidates);
+        }
+      } catch (error) {
+        this.log(`⚠️ 任务发现失败: ${error.message}`);
+      }
+    }
+  }
+
+  /**
+   * 获取当前聚焦任务
+   */
+  async getCurrentFocusTask() {
+    try {
+      if (this.modules.taskManager && this.modules.taskManager.todo) {
+        const focusResult = await this.modules.taskManager.todo.getFocus();
+        if (focusResult.data && focusResult.data.current_task) {
+          return focusResult.data.current_task;
+        }
+      }
+    } catch (error) {
+      // Focus API 可能不可用，静默忽略
+    }
+    return null;
+  }
+
+  // ==================== P0-2: 验收标准确认流程 ====================
+
+  /**
+   * 为任务生成验收标准（LLM 驱动）
+   */
+  async _generateAcceptanceCriteria(taskTitle, taskDescription, context) {
+    const llmManager = this.modules.llmManager;
+    if (!llmManager || !llmManager.hasProvider()) {
+      return '';
+    }
+
+    const prompt = `请为以下任务生成具体的、可验证的验收标准：
+
+任务：${taskTitle}
+描述：${taskDescription || '无'}
+上下文：${context || '无'}
+
+要求：
+1. 每条标准必须是可验证的（能明确判断是否达成）
+2. 使用编号列表格式
+3. 包含数量、时间、质量等可量化指标
+4. 不要写模糊的要求如"做好"、"完善"
+
+只返回验收标准文本，不要包含其他内容。`;
+
+    try {
+      const result = await llmManager.chat({
+        messages: [{ role: 'user', content: prompt }]
+      });
+      return result.content || '';
+    } catch (error) {
+      this.log(`⚠️ 生成验收标准失败: ${error.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * 向用户展示验收标准并请求确认
+   */
+  _proposeAcceptanceCriteria(response, task, criteria) {
+    const proposal = `\n\n---\n📋 **验收标准确认**
+
+任务：${task.title}
+
+建议的验收标准：
+${criteria}
+
+请确认以上验收标准是否合适。
+回复「确认」开始执行，或告诉我需要修改的地方。`;
+
+    response.message += proposal;
+    // 标记此任务正在等待验收标准确认
+    task._awaitingCriteriaConfirmation = true;
+    task._proposedCriteria = criteria;
+  }
+
+  // ==================== P0-3: 显式确认完成任务 ====================
+
+  /**
+   * 检查用户是否确认了待完成的任务
+   */
+  async _checkTaskCompletionConfirmation(userMessage) {
+    if (this.pendingCompletions.length === 0) return [];
+
+    const msg = userMessage.toLowerCase().trim();
+    const confirmed = [];
+    const remaining = [];
+
+    for (const pending of this.pendingCompletions) {
+      let shouldComplete = false;
+
+      if (msg.includes('确认') || msg.includes('完成') || msg.includes('是的') || msg.includes('没错')) {
+        shouldComplete = true;
+      } else if (msg.includes('标记完成') || msg.includes('done')) {
+        shouldComplete = true;
+      }
+
+      if (shouldComplete) {
+        try {
+          await this.modules.taskManager.todo.completeTodoWithConfirm(pending.id);
+          confirmed.push(pending);
+          this.log(`✅ 用户确认完成任务: ${pending.title}`);
+          // 停止心跳
+          this._stopHeartbeat();
+        } catch (error) {
+          this.log(`❌ 完成任务失败: ${error.message}`);
+          remaining.push(pending);
+        }
+      } else if (msg.includes('还没') || msg.includes('没有') || msg.includes('继续') || msg.includes('不对')) {
+        // 用户说还没完成，取消 pending
+        this.log(`📝 用户表示任务未完成，继续执行: ${pending.title}`);
+        // 记录一次失败尝试
+        try {
+          await this.modules.taskManager.todo.recordAttempt(pending.id, {
+            success: false,
+            reason: '用户确认尚未完成',
+            output: msg
+          });
+        } catch (e) {
+          // ignore
+        }
+      } else {
+        remaining.push(pending);
+      }
+    }
+
+    this.pendingCompletions = remaining;
+    return confirmed;
+  }
+
+  /**
+   * 判断是否应该提议完成任务
+   */
+  async _shouldProposeCompletion(userMessage, assistantReply, currentTask) {
+    // 如果任务已经有待确认完成，不再提议
+    if (this.pendingCompletions.some(p => p.id === currentTask.id)) {
+      return false;
+    }
+
+    // 如果没有验收标准，不提议完成
+    if (!currentTask.acceptance_criteria) {
+      return false;
+    }
+
+    const llmManager = this.modules.llmManager;
+    if (!llmManager || !llmManager.hasProvider()) {
+      // 回退：检查对话中是否有完成关键词
+      const text = (userMessage + ' ' + assistantReply).toLowerCase();
+      return /完成|搞定|done|finished/.test(text);
+    }
+
+    const prompt = `分析以下对话，判断任务是否已经完成。
+
+任务：${currentTask.title}
+验收标准：
+${currentTask.acceptance_criteria}
+
+对话：
+用户：${userMessage}
+助手：${assistantReply}
+
+请判断是否所有验收标准都已达成。
+只返回 JSON：{"completed": true/false, "confidence": 0.0-1.0, "checklist": [{"item": "标准内容", "passed": true/false}]}`;
+
+    try {
+      const result = await llmManager.chat({
+        messages: [{ role: 'user', content: prompt }]
+      });
+      const raw = result.content || '';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) return false;
+      const analysis = JSON.parse(jsonMatch[0]);
+      return analysis.completed === true && analysis.confidence >= 0.7;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  /**
+   * 向用户提议完成任务
+   */
+  _proposeTaskCompletion(response, task) {
+    let checklist = '';
+    if (task.acceptance_criteria) {
+      const items = task.acceptance_criteria.split('\n').filter(line => line.trim());
+      checklist = items.map((item, i) => `${i + 1}. ${item.trim()}`).join('\n');
+    }
+
+    const proposal = `\n\n---\n✅ **任务完成确认**
+
+我判断「${task.title}」可能已完成。
+
+${checklist ? `验收标准：\n${checklist}\n` : ''}
+请回复「确认」标记任务完成。
+如果还没完成，请告诉我哪里还需要继续。`;
+
+    response.message += proposal;
+    this.pendingCompletions.push({
+      id: task.id,
+      title: task.title
+    });
+  }
+
+  // ==================== P1-4: 子任务切换感知 ====================
+
+  /**
+   * 检查聚焦任务是否切换
+   */
+  async _checkFocusChange() {
+    const currentTask = await this.getCurrentFocusTask();
+    if (!currentTask) {
+      this.lastFocusTaskId = null;
+      return null;
+    }
+
+    // 首次聚焦
+    if (!this.lastFocusTaskId) {
+      this.lastFocusTaskId = currentTask.id;
+      return `📋 当前聚焦任务：${currentTask.title}\n${currentTask.acceptance_criteria ? '验收标准：\n' + currentTask.acceptance_criteria : ''}`;
+    }
+
+    // 聚焦切换
+    if (this.lastFocusTaskId !== currentTask.id) {
+      const prevTaskId = this.lastFocusTaskId;
+      this.lastFocusTaskId = currentTask.id;
+
+      // 获取上一个任务信息（用于显示"已完成"）
+      let prevTaskTitle = '';
+      try {
+        const prev = await this.modules.taskManager.getTask(prevTaskId);
+        if (prev) prevTaskTitle = prev.title;
+      } catch (e) {
+        // ignore
+      }
+
+      return `=== 子任务切换 ===\n${prevTaskTitle ? '已完成：' + prevTaskTitle + ' ✅\n' : ''}当前聚焦：${currentTask.title}\n${currentTask.acceptance_criteria ? '验收标准：\n' + currentTask.acceptance_criteria : ''}`;
+    }
+
+    return null;
+  }
+
+  // ==================== P1-5: 熔断 + 本地缓存 ====================
+
+  /**
+   * 带熔断的 API 调用
+   */
+  async _callWithCircuitBreaker(apiCall, fallbackValue = null) {
+    if (this.health === 'failed') {
+      return fallbackValue;
+    }
+
+    try {
+      const result = await apiCall();
+      this.failCount = 0;
+      if (this.health === 'degraded') {
+        this.health = 'healthy';
+        this.log('✅ TODO Server 恢复，熔断解除');
+      }
+      return result;
+    } catch (error) {
+      this.failCount++;
+      if (this.failCount >= 3) {
+        this.health = 'failed';
+        this.log('🚨 TODO Server 连续失败，进入熔断模式');
+        // 保存当前状态到本地缓存
+        this._saveLocalCache();
+      } else if (this.failCount >= 2) {
+        this.health = 'degraded';
+        this.log('⚠️ TODO Server 响应异常，进入降级模式');
+      }
+      return fallbackValue;
+    }
+  }
+
+  /**
+   * 加载本地缓存
+   */
+  _loadLocalCache() {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const cachePath = path.join(
+        require('os').homedir(),
+        '.hermes', 'skills', 'todo', 'cache',
+        `${this.config.base.agentId || 'default'}.json`
+      );
+      if (fs.existsSync(cachePath)) {
+        const data = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
+        this.log('💾 已加载本地缓存');
+        return data;
+      }
+    } catch (error) {
+      this.log('⚠️ 加载本地缓存失败');
+    }
+    return { focus: null, context: null, tasks: [] };
+  }
+
+  /**
+   * 保存本地缓存
+   */
+  _saveLocalCache() {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const cachePath = path.join(
+        require('os').homedir(),
+        '.hermes', 'skills', 'todo', 'cache',
+        `${this.config.base.agentId || 'default'}.json`
+      );
+      const dir = path.dirname(cachePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(cachePath, JSON.stringify(this.localCache, null, 2), 'utf-8');
+    } catch (error) {
+      this.log('⚠️ 保存本地缓存失败');
+    }
+  }
+
+  // ==================== P1-7: 对话上下文外置存储 ====================
+
+  /**
+   * 保存对话上下文到 TODO Server
+   */
+  async _saveConversationContext(userMessage, assistantReply) {
+    if (!this.modules.taskManager || !this.modules.taskManager.todo) return;
+
+    const sessionId = this._getSessionId();
+    try {
+      await this.modules.taskManager.todo.saveContext(sessionId, 'user', userMessage, {});
+      await this.modules.taskManager.todo.saveContext(sessionId, 'assistant', assistantReply, {});
+    } catch (error) {
+      // 静默忽略，对话存储不是关键路径
+    }
+  }
+
+  _getSessionId() {
+    // 使用日期作为 session ID（每天一个 session）
+    return new Date().toISOString().split('T')[0];
+  }
+
+  // ==================== P1-8: 心跳机制 ====================
+
+  /**
+   * 启动心跳
+   */
+  _startHeartbeat(taskId) {
+    if (this.heartbeatTimer) {
+      if (this.currentHeartbeatTaskId === taskId) {
+        return; // 已经在心跳同一个任务
+      }
+      this._stopHeartbeat();
+    }
+
+    this.currentHeartbeatTaskId = taskId;
+    this.heartbeatTimer = setInterval(() => {
+      this._sendHeartbeat(taskId);
+    }, 300000); // 每 5 分钟
+
+    this.log(`💓 启动心跳监控：任务 ${taskId}`);
+    // 立即发送一次心跳
+    this._sendHeartbeat(taskId);
+  }
+
+  /**
+   * 停止心跳
+   */
+  _stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+      this.currentHeartbeatTaskId = null;
+      this.log('🛑 停止心跳监控');
+    }
+  }
+
+  /**
+   * 发送心跳
+   */
+  async _sendHeartbeat(taskId) {
+    try {
+      if (this.modules.taskManager && this.modules.taskManager.todo) {
+        await this.modules.taskManager.todo.updateHeartbeat(taskId, {
+          progress: 0.5, // 可以由外部更新，这里用默认值
+          step: '执行中',
+          blockers: []
+        });
+      }
+    } catch (error) {
+      // 静默忽略
+    }
+  }
+
+  // ==================== P0-2 延续: 任务创建确认 ====================
+
+  /**
+   * 检查用户是否确认了待创建的任务
+   */
+  async _checkTaskCreationConfirmation(userMessage) {
+    if (this.pendingCreations.length === 0) return [];
+
+    const msg = userMessage.toLowerCase().trim();
+    const confirmed = [];
+    const remaining = [];
+
+    for (const pending of this.pendingCreations) {
+      let shouldCreate = false;
+
+      // 确认关键词
+      if (msg.includes('全部创建') || msg.includes('全部') || msg.includes('创建全部')) {
+        shouldCreate = true;
+      } else if (msg.includes(`创建${pending.index}`) || msg.includes(`确认${pending.index}`)) {
+        shouldCreate = true;
+      } else if (msg.includes('创建') && msg.includes(pending.title.substring(0, 6))) {
+        shouldCreate = true;
+      } else if (msg === '创建' && this.pendingCreations.length === 1) {
+        shouldCreate = true;
+      }
+
+      if (shouldCreate) {
+        try {
+          await this.modules.taskManager.createTask({
+            title: pending.title,
+            priority: pending.priority || 'medium',
+            context: pending.context || '',
+            tags: pending.tags || [],
+            acceptanceCriteria: pending.acceptance_criteria || ''
+          });
+          confirmed.push(pending);
+          this.log(`✅ 用户确认创建任务: ${pending.title}`);
+        } catch (error) {
+          this.log(`❌ 创建任务失败: ${error.message}`);
+          remaining.push(pending);
+        }
+      } else {
+        remaining.push(pending);
+      }
+    }
+
+    this.pendingCreations = remaining;
+    return confirmed;
+  }
+
+  /**
+   * 向用户提议创建新任务
+   */
+  _proposeTaskCreations(response, candidates) {
+    if (candidates.length === 0) return;
+
+    this.pendingCreations = candidates.map((c, i) => ({ ...c, index: i + 1 }));
+
+    let proposal = '\n\n---\n💡 **任务发现**\n\n我注意到你可能有以下新任务：\n';
+    candidates.forEach((task, i) => {
+      proposal += `${i + 1}. **${task.title}**`;
+      if (task.priority) proposal += ` (${task.priority})`;
+      if (task.context) proposal += ` — ${task.context}`;
+      proposal += '\n';
+    });
+
+    proposal += '\n需要我创建吗？回复「创建1」「创建2」或「全部创建」。不需要请忽略。';
+    response.message += proposal;
   }
 
   /**

@@ -4,7 +4,7 @@ const { getDb } = require('../db');
 class Todo {
   static create(agentId, data) {
     const db = getDb();
-    const id = uuidv4();
+    const id = data.id || uuidv4();
     const {
       title,
       description = '',
@@ -13,15 +13,29 @@ class Todo {
       tags = [],
       dependencies = [],
       projectId = null,
-      position = 0
+      parentId = null,
+      position = 0,
+      acceptanceCriteria = '',
+      criteriaConfirmed = false,
+      maxAttempts = 3
     } = data;
 
     const stmt = db.prepare(`
-      INSERT INTO todos (id, agent_id, project_id, title, description, priority, context, tags, dependencies, position)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO todos (
+        id, agent_id, project_id, parent_id, title, description, priority,
+        context, tags, dependencies, position,
+        acceptance_criteria, criteria_confirmed, max_attempts,
+        origin_agent_id
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
-    stmt.run(id, agentId, projectId, title, description, priority, context, JSON.stringify(tags), JSON.stringify(dependencies), position);
+    stmt.run(
+      id, agentId, projectId, parentId, title, description, priority,
+      context, JSON.stringify(tags), JSON.stringify(dependencies), position,
+      acceptanceCriteria, criteriaConfirmed ? 1 : 0, maxAttempts,
+      agentId
+    );
 
     return this.findById(agentId, id);
   }
@@ -34,6 +48,8 @@ class Todo {
     if (todo) {
       todo.tags = JSON.parse(todo.tags || '[]');
       todo.dependencies = JSON.parse(todo.dependencies || '[]');
+      todo.attempt_log = JSON.parse(todo.attempt_log || '[]');
+      todo.heartbeat_blockers = JSON.parse(todo.heartbeat_blockers || '[]');
     }
 
     return todo;
@@ -77,7 +93,9 @@ class Todo {
     return todos.map(todo => ({
       ...todo,
       tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]')
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
     }));
   }
 
@@ -92,7 +110,17 @@ class Todo {
       tags,
       dependencies,
       projectId,
-      position
+      parentId,
+      position,
+      acceptanceCriteria,
+      criteriaConfirmed,
+      maxAttempts,
+      attemptCount,
+      attemptLog,
+      lastHeartbeat,
+      heartbeatProgress,
+      heartbeatStep,
+      heartbeatBlockers
     } = data;
 
     const updates = [];
@@ -144,9 +172,59 @@ class Todo {
       values.push(projectId);
     }
 
+    if (parentId !== undefined) {
+      updates.push('parent_id = ?');
+      values.push(parentId);
+    }
+
     if (position !== undefined) {
       updates.push('position = ?');
       values.push(position);
+    }
+
+    if (acceptanceCriteria !== undefined) {
+      updates.push('acceptance_criteria = ?');
+      values.push(acceptanceCriteria);
+    }
+
+    if (criteriaConfirmed !== undefined) {
+      updates.push('criteria_confirmed = ?');
+      values.push(criteriaConfirmed ? 1 : 0);
+    }
+
+    if (maxAttempts !== undefined) {
+      updates.push('max_attempts = ?');
+      values.push(maxAttempts);
+    }
+
+    if (attemptCount !== undefined) {
+      updates.push('attempt_count = ?');
+      values.push(attemptCount);
+    }
+
+    if (attemptLog !== undefined) {
+      updates.push('attempt_log = ?');
+      values.push(JSON.stringify(attemptLog));
+    }
+
+    if (lastHeartbeat !== undefined) {
+      updates.push('last_heartbeat = ?');
+      values.push(lastHeartbeat);
+    }
+
+    if (heartbeatProgress !== undefined) {
+      updates.push('heartbeat_progress = ?');
+      values.push(heartbeatProgress);
+    }
+
+    if (heartbeatStep !== undefined) {
+      updates.push('heartbeat_step = ?');
+      values.push(heartbeatStep);
+    }
+
+    if (heartbeatBlockers !== undefined) {
+      updates.push('heartbeat_blockers = ?');
+      values.push(JSON.stringify(heartbeatBlockers));
     }
 
     if (updates.length === 0) {
@@ -288,9 +366,10 @@ class Todo {
   }
 
   static removeDependency(agentId, todoId, dependencyId) {
+    // Idempotent: return null if todo already gone
     const todo = this.findById(agentId, todoId);
     if (!todo) {
-      throw new Error('Todo not found');
+      return null;
     }
 
     const dependencies = todo.dependencies.filter(id => id !== dependencyId);
@@ -495,6 +574,186 @@ class Todo {
     }
 
     return suggestions.sort((a, b) => a.priority - b.priority);
+  }
+
+  static updateHeartbeat(agentId, id, heartbeatData) {
+    const db = getDb();
+    const todo = this.findById(agentId, id);
+    if (!todo) return null;
+
+    const updates = ['last_heartbeat = CURRENT_TIMESTAMP'];
+    const values = [];
+
+    if (heartbeatData.progress !== undefined) {
+      updates.push('heartbeat_progress = ?');
+      values.push(heartbeatData.progress);
+    }
+    if (heartbeatData.step !== undefined) {
+      updates.push('heartbeat_step = ?');
+      values.push(heartbeatData.step);
+    }
+    if (heartbeatData.blockers !== undefined) {
+      updates.push('heartbeat_blockers = ?');
+      values.push(JSON.stringify(heartbeatData.blockers));
+    }
+
+    values.push(id, agentId);
+
+    const stmt = db.prepare(`
+      UPDATE todos SET ${updates.join(', ')}
+      WHERE id = ? AND agent_id = ?
+    `);
+    stmt.run(...values);
+    return this.findById(agentId, id);
+  }
+
+  static recordAttempt(agentId, id, attemptResult) {
+    const db = getDb();
+    const todo = this.findById(agentId, id);
+    if (!todo) return null;
+
+    const logEntry = {
+      timestamp: new Date().toISOString(),
+      success: attemptResult.success,
+      reason: attemptResult.reason || '',
+      output: attemptResult.output || ''
+    };
+
+    const newLog = [...todo.attempt_log, logEntry];
+    const newCount = todo.attempt_count + 1;
+
+    let newStatus = todo.status;
+    if (!attemptResult.success && newCount >= todo.max_attempts) {
+      newStatus = 'blocked';
+    }
+
+    return this.update(agentId, id, {
+      attemptCount: newCount,
+      attemptLog: newLog,
+      status: newStatus
+    });
+  }
+
+  static findSubtasks(agentId, parentId) {
+    const db = getDb();
+    const stmt = db.prepare('SELECT * FROM todos WHERE agent_id = ? AND parent_id = ? ORDER BY position ASC');
+    const todos = stmt.all(agentId, parentId);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static checkAndCompleteParent(agentId, childId) {
+    const db = getDb();
+    const child = this.findById(agentId, childId);
+    if (!child || !child.parent_id) return false;
+
+    const parent = this.findById(agentId, child.parent_id);
+    if (!parent || parent.status === 'completed') return false;
+
+    const subtasks = this.findSubtasks(agentId, parent.id);
+    const allCompleted = subtasks.length > 0 && subtasks.every(t => t.status === 'completed');
+
+    if (allCompleted) {
+      this.update(agentId, parent.id, { status: 'completed' });
+      console.log(`[Todo] Parent task auto-completed: ${parent.title}`);
+      return true;
+    }
+
+    return false;
+  }
+
+  static findStuckTasks(agentId, maxIdleMinutes = 30) {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - maxIdleMinutes * 60 * 1000).toISOString();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ? AND status = 'in_progress'
+        AND (last_heartbeat IS NULL OR last_heartbeat < ?)
+    `);
+    const todos = stmt.all(agentId, cutoff);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  // ==================== 多智能体协作方法 ====================
+
+  static assign(agentId, todoId, assignedAgentId, note = '') {
+    const db = getDb();
+    const todo = this.findById(agentId, todoId);
+    if (!todo) throw new Error('Todo not found');
+
+    const stmt = db.prepare(`
+      UPDATE todos SET
+        assigned_agent_id = ?,
+        assignment_note = ?,
+        assigned_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND agent_id = ?
+    `);
+    stmt.run(assignedAgentId, note, todoId, agentId);
+    return this.findById(agentId, todoId);
+  }
+
+  static findAssignedToMe(agentId) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE assigned_agent_id = ? AND status != 'completed' AND status != 'cancelled'
+      ORDER BY CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+        created_at DESC
+    `);
+    const todos = stmt.all(agentId);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static findCreatedByMe(agentId) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE origin_agent_id = ?
+      ORDER BY created_at DESC
+    `);
+    const todos = stmt.all(agentId);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static transfer(agentId, todoId, newAssignedAgentId, reason = '') {
+    const db = getDb();
+    const todo = this.findById(agentId, todoId);
+    if (!todo) throw new Error('Todo not found');
+
+    const stmt = db.prepare(`
+      UPDATE todos SET
+        assigned_agent_id = ?,
+        transferred_from = ?,
+        assignment_note = ?,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND agent_id = ?
+    `);
+    stmt.run(newAssignedAgentId, todo.assigned_agent_id, reason, todoId, agentId);
+    return this.findById(agentId, todoId);
   }
 }
 

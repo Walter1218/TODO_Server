@@ -1,0 +1,64 @@
+{
+  "server": {
+    "url": "http://localhost:3000"
+  },
+  "llm": {
+    "provider": "minimax",
+    "minimax": {
+      "apiKey": "",
+      "groupId": "",
+      "model": "MiniMax-Text-01",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+    "openai": {
+      "apiKey": "",
+      "model": "gpt-3.5-turbo",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+    "anthropic": {
+      "apiKey": "",
+      "model": "claude-3-5-haiku-20241022",
+      "temperature": 0.7,
+      "maxTokens": 1024
+    }
+  },
+  "agent": {
+    "id": "f6782f01-a158-42cf-a236-88f9b7afc3d6",
+    "name": "我的智能体"
+  },
+  "features": {
+    "taskManagement": {
+      "enabled": true,
+      "autoCreateTasks": false,
+      "autoUpdateStatus": false,
+      "priority": "medium"
+    },
+    "contextManagement": {
+      "enabled": true,
+      "injectInterval": "every_turn",
+      "maxContextLength": 2000,
+      "prioritizeBy": "priority"
+    },
+    "memoryManagement": {
+      "enabled": false,
+      "memoryRetention": 7
+    },
+    "promptManagement": {
+      "enabled": true,
+      "autoEnhance": true,
+      "addChecklist": true,
+      "addProgress": true
+    },
+    "proactiveInteraction": {
+      "enabled": true,
+      "remindInterval": 5,
+      "suggestOnIdle": true
+    },
+    "dependencyManagement": {
+      "enabled": true,
+      "showBlockers": true
+    }
+  }
+}

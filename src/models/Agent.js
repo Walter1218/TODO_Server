@@ -4,26 +4,38 @@ const { getDb } = require('../db');
 class Agent {
   static create(data) {
     const db = getDb();
-    const id = uuidv4();
+    const id = data.id || uuidv4();
     const { name, metadata = {} } = data;
+    const secret_key = require('crypto').randomBytes(16).toString('hex').toUpperCase();
 
     const stmt = db.prepare(`
-      INSERT INTO agents (id, name, metadata)
-      VALUES (?, ?, ?)
+      INSERT INTO agents (id, name, metadata, secret_key)
+      VALUES (?, ?, ?, ?)
     `);
 
-    stmt.run(id, name, JSON.stringify(metadata));
+    stmt.run(id, name, JSON.stringify(metadata), secret_key);
 
-    return this.findById(id);
+    // Return with secret_key ONCE on creation
+    return this.findById(id, true);
   }
 
-  static findById(id) {
+  static getSecretKey(agentId) {
+    const db = getDb();
+    const stmt = db.prepare('SELECT secret_key FROM agents WHERE id = ?');
+    const row = stmt.get(agentId);
+    return row ? row.secret_key : null;
+  }
+
+  static findById(id, includeSecret = false) {
     const db = getDb();
     const stmt = db.prepare('SELECT * FROM agents WHERE id = ?');
     const agent = stmt.get(id);
 
     if (agent) {
       agent.metadata = JSON.parse(agent.metadata || '{}');
+      if (!includeSecret) {
+        delete agent.secret_key;
+      }
     }
 
     return agent;

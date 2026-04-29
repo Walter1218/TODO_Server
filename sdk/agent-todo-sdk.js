@@ -4,19 +4,26 @@
  */
 
 class AgentTODOSDK {
-  constructor(baseUrl, agentId) {
+  constructor(baseUrl, agentId, secretKey) {
     this.baseUrl = baseUrl.replace(/\/$/, '');
     this.agentId = agentId;
+    this.secretKey = secretKey;
   }
 
   async _request(method, endpoint, data = null) {
     const url = `${this.baseUrl}/api/agents/${this.agentId}${endpoint}`;
 
+    const headers = {
+      'Content-Type': 'application/json',
+    };
+
+    if (this.secretKey) {
+      headers['X-Agent-Secret'] = this.secretKey;
+    }
+
     const options = {
       method,
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers,
     };
 
     if (data) {
@@ -28,7 +35,7 @@ class AgentTODOSDK {
       const result = await response.json();
 
       if (!response.ok) {
-        throw new Error(result.message || 'Request failed');
+        throw new Error(result.message || `Request failed (${response.status})`);
       }
 
       return result;
@@ -223,6 +230,134 @@ class AgentTODOSDK {
     }
 
     return results;
+  }
+
+  // ==================== 聚焦管理（Focus Engine）====================
+
+  async getFocus() {
+    return this._request('GET', '/focus');
+  }
+
+  async setFocus(taskId, options = {}) {
+    return this._request('PUT', '/focus', {
+      taskId,
+      focusMode: options.focusMode || 'manual',
+      contextWindowSize: options.contextWindowSize || 10
+    });
+  }
+
+  async autoFocus() {
+    return this._request('POST', '/focus/auto');
+  }
+
+  // ==================== 心跳与重试管理 ====================
+
+  async updateHeartbeat(todoId, heartbeatData) {
+    return this._request('POST', `/todos/${todoId}/heartbeat`, heartbeatData);
+  }
+
+  async recordAttempt(todoId, attemptResult) {
+    return this._request('POST', `/todos/${todoId}/attempt`, attemptResult);
+  }
+
+  async getSubtasks(todoId) {
+    return this._request('GET', `/todos/${todoId}/subtasks`);
+  }
+
+  async getStuckTasks(maxIdleMinutes = 30) {
+    return this._request('GET', `/todos/stuck/list?maxIdleMinutes=${maxIdleMinutes}`);
+  }
+
+  // ==================== 对话上下文管理 ====================
+
+  async saveContext(sessionId, role, content, metadata) {
+    return this._request('POST', '/contexts', {
+      sessionId,
+      role,
+      content,
+      metadata
+    });
+  }
+
+  async getContexts(sessionId, limit = 100) {
+    const query = sessionId
+      ? `/contexts?sessionId=${encodeURIComponent(sessionId)}&limit=${limit}`
+      : `/contexts?limit=${limit}`;
+    return this._request('GET', query);
+  }
+
+  async getSessionSummary(sessionId) {
+    return this._request('GET', `/contexts/summary?sessionId=${encodeURIComponent(sessionId)}`);
+  }
+
+  async deleteContexts(sessionId) {
+    return this._request('DELETE', `/contexts?sessionId=${encodeURIComponent(sessionId)}`);
+  }
+
+  async pruneOldContexts(maxAgeDays = 30) {
+    return this._request('DELETE', `/contexts?maxAgeDays=${maxAgeDays}`);
+  }
+
+  // ==================== 增强便捷方法 ====================
+
+  async completeTodoWithConfirm(todoId) {
+    const result = await this._request('PATCH', `/todos/${todoId}/complete`);
+    if (result.parent_auto_completed) {
+      console.log('✅ 父任务已自动完成');
+    }
+    return result;
+  }
+
+  // ==================== 多智能体协作 ====================
+
+  async assignTask(todoId, targetAgentId, options = {}) {
+    return this._request('POST', `/todos/${todoId}/assign`, {
+      targetAgentId,
+      note: options.note || '',
+      preserveContext: options.preserveContext || false,
+      transferFiles: options.transferFiles || []
+    });
+  }
+
+  async transferTask(todoId, targetAgentId, options = {}) {
+    return this._request('POST', `/todos/${todoId}/transfer`, {
+      targetAgentId,
+      note: options.note || '',
+      preserveContext: options.preserveContext || false,
+      transferFiles: options.transferFiles || []
+    });
+  }
+
+  async getAssignedTasks(filters = {}) {
+    const queryParams = new URLSearchParams(filters).toString();
+    const endpoint = queryParams ? `/todos/assigned?${queryParams}` : '/todos/assigned';
+    return this._request('GET', endpoint);
+  }
+
+  async getCreatedTasks(filters = {}) {
+    const queryParams = new URLSearchParams(filters).toString();
+    const endpoint = queryParams ? `/todos/created?${queryParams}` : '/todos/created';
+    return this._request('GET', endpoint);
+  }
+
+  async getNotifications(unreadOnly = false) {
+    return this._request('GET', `/notifications?unreadOnly=${unreadOnly}`);
+  }
+
+  async markNotificationRead(notificationId) {
+    return this._request('POST', `/notifications/${notificationId}/read`);
+  }
+
+  async markAllNotificationsRead() {
+    return this._request('POST', '/notifications/read-all');
+  }
+
+  async deleteOldNotifications(maxAgeDays = 7) {
+    return this._request('DELETE', `/notifications?maxAgeDays=${maxAgeDays}`);
+  }
+
+  async getProjectBoard(projectId) {
+    return this._request('GET', `/projects/${projectId}/board`);
   }
 }
 

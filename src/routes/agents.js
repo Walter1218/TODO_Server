@@ -103,13 +103,7 @@ router.delete('/:id', (req, res) => {
   try {
     const { id } = req.params;
 
-    if (!Agent.exists(id)) {
-      return res.status(404).json({
-        error: 'Not found',
-        message: 'Agent not found'
-      });
-    }
-
+    // Idempotent: return success even if already deleted
     Agent.delete(id);
 
     res.json({

@@ -34,7 +34,7 @@ class ProactiveManager {
     // 周期性提醒
     this.conversationCount++;
     
-    if (this.conversationCount % config.remendInterval === 0) {
+    if (this.conversationCount % config.remindInterval === 0) {
       return this.generatePeriodicReminder();
     }
 
@@ -130,53 +130,146 @@ ${nextTask.context ? `背景：${nextTask.context.substring(0, 100)}...` : ''}`,
   }
 
   /**
-   * 检测是否偏离主题
+   * 检测是否偏离主题（LLM 语义分析版）
    */
-  detectOffTopic(message, currentTask) {
-    if (!this.framework.config.features.proactiveInteraction.blockOffTopic) {
-      return { isOffTopic: false };
+  async detectDrift(userMessage, assistantReply, currentTask) {
+    if (!currentTask) {
+      return { is_drifted: false, drift_score: 0, reason: '无聚焦任务' };
     }
 
-    // 简单的关键词检测
-    const taskKeywords = currentTask?.tags || [];
+    const llmManager = this.framework.modules.llmManager;
+    if (!llmManager || !llmManager.hasProvider()) {
+      return this._fallbackDriftDetection(userMessage, currentTask);
+    }
+
+    const fullConversation = `用户：${userMessage}\n助手：${assistantReply || ''}`;
+
+    const systemPrompt = `你是一个任务偏离度分析专家。请分析以下对话是否偏离了当前聚焦的任务。
+
+当前聚焦任务：
+标题：${currentTask.title}
+描述：${currentTask.description || '无'}
+上下文：${currentTask.context || '无'}
+验收标准：${currentTask.acceptance_criteria || '无'}
+
+偏离度评分标准：
+- 0.0-0.3：完全在任务主线上，正常讨论
+- 0.3-0.6：轻微偏离，聊到了相关话题但未跑题
+- 0.6-0.8：中度偏离，明显在聊其他事情
+- 0.8-1.0：严重偏离，完全无关
+
+请只返回纯 JSON，不要包含其他文字：
+{"drift_score": 0.0-1.0, "is_drifted": true/false, "reason": "简要说明原因", "severity": "none/mild/moderate/severe"}`;
+
+    try {
+      const result = await llmManager.chat({
+        messages: [{ role: 'user', content: fullConversation }],
+        system: systemPrompt
+      });
+
+      const raw = result.content || '';
+      const jsonMatch = raw.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        return { is_drifted: false, drift_score: 0, reason: 'LLM 返回无法解析' };
+      }
+
+      const analysis = JSON.parse(jsonMatch[0]);
+      return {
+        is_drifted: !!analysis.is_drifted,
+        drift_score: Math.min(1, Math.max(0, parseFloat(analysis.drift_score) || 0)),
+        reason: analysis.reason || '',
+        severity: analysis.severity || 'none'
+      };
+    } catch (error) {
+      this.framework.log(`⚠️ LLM 偏离检测失败: ${error.message}`);
+      return this._fallbackDriftDetection(userMessage, currentTask);
+    }
+  }
+
+  /**
+   * 生成纠偏提示
+   */
+  getDriftAlert(driftResult, currentTask) {
+    if (!driftResult.is_drifted || driftResult.drift_score < 0.6) {
+      return null;
+    }
+
+    const severity = driftResult.severity || 'moderate';
+    const icon = severity === 'severe' ? '🚨' : '⚠️';
+
+    let content = `${icon} 偏离提醒
+
+我们的对话似乎偏离了当前聚焦的任务：
+「${currentTask.title}」
+
+偏离原因：${driftResult.reason}
+偏离度：${Math.round(driftResult.drift_score * 100)}%
+
+请选择下一步：
+[A] 回到原任务继续执行
+[B] 将刚才聊的内容记录为新任务
+[C] 暂停当前任务，先处理新话题`;
+
+    if (currentTask.acceptance_criteria) {
+      content += `\n\n当前任务验收标准：\n${currentTask.acceptance_criteria}`;
+    }
+
+    return {
+      type: 'drift_alert',
+      severity,
+      content,
+      drift_score: driftResult.drift_score,
+      current_task: {
+        id: currentTask.id,
+        title: currentTask.title
+      }
+    };
+  }
+
+  /**
+   * 关键词回退偏离检测
+   */
+  _fallbackDriftDetection(message, currentTask) {
+    if (!currentTask) {
+      return { is_drifted: false, drift_score: 0, reason: '无聚焦任务' };
+    }
+
+    const taskKeywords = currentTask.tags || [];
     const messageLower = message.toLowerCase();
 
-    const hasRelevantKeyword = taskKeywords.some(keyword => 
+    const hasRelevantKeyword = taskKeywords.some(keyword =>
       messageLower.includes(keyword.toLowerCase())
     );
 
-    const detection = {
-      message,
-      hasTaskMention: false,
-      isOffTopic: false,
-      timestamp: new Date().toISOString()
-    };
-
-    // 检测消息中是否提到任务相关的内容
     const taskRelatedPatterns = [
       /任务|todo|task/,
       /完成|done|finish/,
       /工作|进展|进度/
     ];
-
-    detection.hasTaskMention = taskRelatedPatterns.some(pattern => 
+    const hasTaskMention = taskRelatedPatterns.some(pattern =>
       pattern.test(message)
     );
 
-    // 如果配置了阻止离题，且明显偏离主题
-    if (currentTask && !hasRelevantKeyword && !detection.hasTaskMention) {
-      detection.isOffTopic = true;
-      detection.suggestion = `⚠️ 您似乎在讨论与当前任务"${currentTask.title}"无关的内容。是否需要回到主线任务？`;
+    if (!hasRelevantKeyword && !hasTaskMention) {
+      return { is_drifted: true, drift_score: 0.7, reason: '关键词检测：未提及任务相关内容' };
     }
 
-    this.offTopicDetections.push(detection);
-    
-    // 保持最近10条记录
-    if (this.offTopicDetections.length > 10) {
-      this.offTopicDetections = this.offTopicDetections.slice(-10);
-    }
+    return { is_drifted: false, drift_score: 0.2, reason: '关键词检测：包含任务相关内容' };
+  }
 
-    return detection;
+  /**
+   * 旧方法保留兼容
+   */
+  detectOffTopic(message, currentTask) {
+    // 同步包装异步方法（用于不阻塞的场景）
+    const result = this._fallbackDriftDetection(message, currentTask);
+    return {
+      message,
+      hasTaskMention: !result.is_drifted,
+      isOffTopic: result.is_drifted,
+      suggestion: result.is_drifted ? `⚠️ ${result.reason}` : null,
+      timestamp: new Date().toISOString()
+    };
   }
 
   /**

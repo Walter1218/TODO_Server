@@ -27,7 +27,7 @@ class PromptManager {
    * 获取系统Prompt
    */
   async getSystemPrompt() {
-    const config = this.framework.config.features.promptManager;
+    const config = this.framework.config.features.promptManagement;
 
     // 1. 获取角色Prompt
     let prompt = await this.getRolePrompt();
@@ -493,7 +493,7 @@ ${taskInfo.inProgress > 0 ? `⚡ ${taskInfo.inProgress} 个任务进行中` : ''
 
     // 替换变量
     for (const [key, value] of Object.entries(variables)) {
-      prompt = prompt.replace(new RegExp(`{{${key}}`, 'g'), value);
+      prompt = prompt.replace(new RegExp(`{{${key}}}`, 'g'), value);
     }
 
     return prompt;

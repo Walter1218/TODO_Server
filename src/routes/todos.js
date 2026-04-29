@@ -72,7 +72,11 @@ router.post('/', (req, res) => {
       tags,
       dependencies,
       projectId,
-      position
+      parentId: req.body.parentId,
+      position,
+      acceptanceCriteria: req.body.acceptanceCriteria,
+      criteriaConfirmed: req.body.criteriaConfirmed,
+      maxAttempts: req.body.maxAttempts
     });
 
     res.status(201).json({
@@ -201,6 +205,28 @@ router.get('/ready', (req, res) => {
   }
 });
 
+// --- 多智能体协作路由：查询被指派的任务 ---
+router.get('/assigned', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const tasks = Todo.findAssignedToMe(agentId);
+    res.json({ success: true, data: tasks, count: tasks.length });
+  } catch (error) {
+    console.error('Error fetching assigned tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+// --- 多智能体协作路由：查询我创建的任务 ---
+router.get('/created', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const tasks = Todo.findCreatedByMe(agentId);
+    res.json({ success: true, data: tasks, count: tasks.length });
+  } catch (error) {
+    console.error('Error fetching created tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
 router.get('/:id', (req, res) => {
   try {
     const { agentId, id } = req.params;
@@ -230,13 +256,7 @@ router.delete('/:id', (req, res) => {
   try {
     const { agentId, id } = req.params;
 
-    if (!Todo.findById(agentId, id)) {
-      return res.status(404).json({
-        error: 'Not found',
-        message: 'TODO not found'
-      });
-    }
-
+    // Idempotent: return success even if already deleted
     Todo.delete(agentId, id);
 
     res.json({
@@ -265,9 +285,13 @@ router.patch('/:id/complete', (req, res) => {
 
     const todo = Todo.complete(agentId, id);
 
+    // Auto-complete parent if all subtasks done
+    const parentCompleted = Todo.checkAndCompleteParent(agentId, id);
+
     res.json({
       success: true,
-      data: todo
+      data: todo,
+      parent_auto_completed: parentCompleted
     });
   } catch (error) {
     console.error('Error completing TODO:', error);
@@ -352,6 +376,7 @@ router.delete('/:id/dependencies/:depId', (req, res) => {
   try {
     const { agentId, id, depId } = req.params;
 
+    // Idempotent: return success even if todo or dependency already gone
     const todo = Todo.removeDependency(agentId, id, depId);
 
     res.json({
@@ -405,11 +430,11 @@ router.put('/:id', (req, res) => {
       });
     }
 
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled'];
+    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked'];
     if (status && !validStatuses.includes(status)) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled'
+        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled, blocked'
       });
     }
 
@@ -455,7 +480,16 @@ router.put('/:id', (req, res) => {
       tags,
       dependencies,
       projectId,
-      position
+      parentId: req.body.parentId,
+      position,
+      acceptanceCriteria: req.body.acceptanceCriteria,
+      criteriaConfirmed: req.body.criteriaConfirmed,
+      maxAttempts: req.body.maxAttempts,
+      attemptCount: req.body.attemptCount,
+      attemptLog: req.body.attemptLog,
+      heartbeatProgress: req.body.heartbeatProgress,
+      heartbeatStep: req.body.heartbeatStep,
+      heartbeatBlockers: req.body.heartbeatBlockers
     });
 
     res.json({
@@ -470,5 +504,140 @@ router.put('/:id', (req, res) => {
     });
   }
 });
+
+// --- 新增路由：心跳更新 ---
+router.post('/:id/heartbeat', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { progress, step, blockers } = req.body;
+
+    if (!Todo.findById(agentId, id)) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const todo = Todo.updateHeartbeat(agentId, id, { progress, step, blockers });
+    res.json({ success: true, data: todo });
+  } catch (error) {
+    console.error('Error updating heartbeat:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 新增路由：记录尝试 ---
+router.post('/:id/attempt', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { success, reason, output } = req.body;
+
+    if (!Todo.findById(agentId, id)) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const todo = Todo.recordAttempt(agentId, id, { success, reason, output });
+
+    // If blocked after max attempts, include that info
+    const isBlocked = todo.status === 'blocked';
+
+    res.json({
+      success: true,
+      data: todo,
+      blocked: isBlocked,
+      message: isBlocked ? '任务已达到最大重试次数，已标记为阻塞' : undefined
+    });
+  } catch (error) {
+    console.error('Error recording attempt:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 新增路由：获取子任务 ---
+router.get('/:id/subtasks', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const subtasks = Todo.findSubtasks(agentId, id);
+    res.json({ success: true, data: subtasks, count: subtasks.length });
+  } catch (error) {
+    console.error('Error fetching subtasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 新增路由：获取卡住的任务（无心跳超时） ---
+router.get('/stuck/list', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const maxIdleMinutes = parseInt(req.query.maxIdleMinutes) || 30;
+    const stuckTasks = Todo.findStuckTasks(agentId, maxIdleMinutes);
+    res.json({ success: true, data: stuckTasks, count: stuckTasks.length });
+  } catch (error) {
+    console.error('Error fetching stuck tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 多智能体协作路由：指派任务 ---
+router.post('/:id/assign', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { assignedAgentId, targetAgentId, note } = req.body;
+    const targetId = assignedAgentId || targetAgentId;
+
+    if (!targetId) {
+      return res.status(400).json({ error: 'Validation error', message: 'assignedAgentId or targetAgentId is required' });
+    }
+
+    // Auto-create target agent if not exists
+    if (!Agent.exists(targetId)) {
+      Agent.create({ id: targetId, name: targetId, metadata: { auto_created: true } });
+    }
+
+    const todo = Todo.assign(agentId, id, targetId, note || '');
+
+    // 创建通知给被指派的 agent
+    const Notification = require('../models/Notification');
+    Notification.create(targetId, id, 'assigned',
+      `你被指派了任务：${todo.title}${note ? ' — ' + note : ''}`
+    );
+
+    res.json({ success: true, data: todo, message: '任务已指派' });
+  } catch (error) {
+    console.error('Error assigning task:', error);
+    res.status(400).json({ error: 'Validation error', message: error.message });
+  }
+});
+
+// --- 多智能体协作路由：转交任务 ---
+router.post('/:id/transfer', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { newAssignedAgentId, targetAgentId, note, reason } = req.body;
+    const targetId = newAssignedAgentId || targetAgentId;
+    const transferNote = note || reason || '';
+
+    if (!targetId) {
+      return res.status(400).json({ error: 'Validation error', message: 'newAssignedAgentId or targetAgentId is required' });
+    }
+
+    // Auto-create target agent if not exists
+    if (!Agent.exists(targetId)) {
+      Agent.create({ id: targetId, name: targetId, metadata: { auto_created: true } });
+    }
+
+    const todo = Todo.transfer(agentId, id, targetId, transferNote);
+
+    // 创建通知
+    const Notification = require('../models/Notification');
+    Notification.create(targetId, id, 'transferred',
+      `任务「${todo.title}」被转交给你${transferNote ? '，原因：' + transferNote : ''}`
+    );
+
+    res.json({ success: true, data: todo, message: '任务已转交' });
+  } catch (error) {
+    console.error('Error transferring task:', error);
+    res.status(400).json({ error: 'Validation error', message: error.message });
+  }
+});
+
+
 
 module.exports = router;
