@@ -174,7 +174,7 @@ class AgentTaskFramework {
   /**
    * 核心方法：处理用户消息
    */
-  async processMessage(userMessage, conversationHistory = []) {
+  async processMessage(userMessage, conversationHistory = [], options = {}) {
     const startTime = Date.now();
 
     // === 前置检查 1：用户是否确认了待创建的任务 ===
@@ -193,9 +193,26 @@ class AgentTaskFramework {
     // === 前置检查 3：聚焦任务是否切换 ===
     const focusChangeInfo = await this._checkFocusChange();
     
-    const context = await this.prepareContext();
-    const enhancedPrompt = await this.buildEnhancedPrompt(userMessage, context);
-    let response = await this.generateResponse(enhancedPrompt, conversationHistory);
+    let response;
+    if (options.executionMode) {
+      // Worker 执行模式：跳过 status-heavy 的 prompt 增强，使用执行导向的系统提示
+      const execSystemPrompt = `你是 TODO Server 的智能体工作进程。你的唯一职责是**实际执行分配给你的任务**。
+
+核心原则：
+1. 不要汇报系统状态，不要生成任务统计表格
+2. 根据任务描述，输出具体的 shell 命令来推进工作
+3. 使用 \`\`\`bash 代码块包裹每一条需要执行的命令
+4. 命令会被自动执行，执行结果会反馈给你
+5. 根据执行结果继续下一步，形成闭环
+6. 回复格式必须包含：进度: XX%、步骤: 一句话描述、下一步计划
+
+记住：你是执行者，不是汇报员。`;
+      response = await this.generateResponseRaw(userMessage, conversationHistory, execSystemPrompt);
+    } else {
+      const context = await this.prepareContext();
+      const enhancedPrompt = await this.buildEnhancedPrompt(userMessage, context);
+      response = await this.generateResponse(enhancedPrompt, conversationHistory);
+    }
 
     // 追加前置消息
     if (preMessage) {
@@ -219,7 +236,7 @@ class AgentTaskFramework {
 
     return {
       response,
-      context,
+      context: options.executionMode ? {} : await this.prepareContext(),
       metrics
     };
   }
@@ -311,9 +328,62 @@ ${context.features.memory.map(m => `- ${m.content} (${m.timestamp})`).join('\n')
   }
 
   /**
+   * 生成回复（原始模式，跳过 prompt 增强，用于 Worker 执行模式）
+   */
+  async generateResponseRaw(userMessage, conversationHistory = [], systemPrompt = '') {
+    const llmStartTime = Date.now();
+
+    if (!this.modules.llmManager.hasProvider()) {
+      return this.generateResponse(userMessage, conversationHistory);
+    }
+
+    try {
+      const messages = conversationHistory.map(msg => ({
+        role: msg.role || 'user',
+        content: msg.content || msg.message
+      }));
+
+      const result = await this.modules.llmManager.chat({
+        messages,
+        system: systemPrompt,
+        userContent: userMessage
+      });
+
+      // 记录 LLM 调用耗时到心跳
+      const llmDuration = Date.now() - llmStartTime;
+      if (this.currentHeartbeatTaskId) {
+        await this._sendHeartbeat(this.currentHeartbeatTaskId, {
+          step: `LLM 响应中 (${Math.round(llmDuration / 1000)}s)`,
+          extra: { llmDuration }
+        });
+      }
+
+      return {
+        message: result.content,
+        usage: result.usage,
+        llmDuration
+      };
+    } catch (error) {
+      this.log(`❌ LLM生成失败: ${error.message}`);
+      if (this.currentHeartbeatTaskId) {
+        await this._sendHeartbeat(this.currentHeartbeatTaskId, {
+          step: 'LLM 调用失败，尝试恢复中',
+          blockers: [`LLM 错误: ${error.message}`]
+        });
+      }
+      return {
+        message: `抱歉，生成回复时出现错误：${error.message}`,
+        usage: { error: true }
+      };
+    }
+  }
+
+  /**
    * 生成回复
    */
   async generateResponse(enhancedPrompt, conversationHistory = []) {
+    const llmStartTime = Date.now();
+
     if (!this.modules.llmManager.hasProvider()) {
       this.log('🤖 使用模拟模式（无LLM配置）');
       
@@ -386,12 +456,29 @@ const config = {
         userContent: userContent
       });
 
+      // 记录 LLM 调用耗时到心跳（帮助识别 LLM 卡顿）
+      const llmDuration = Date.now() - llmStartTime;
+      if (this.currentHeartbeatTaskId) {
+        await this._sendHeartbeat(this.currentHeartbeatTaskId, {
+          step: `LLM 响应中 (${Math.round(llmDuration / 1000)}s)`,
+          extra: { llmDuration }
+        });
+      }
+
       return {
         message: result.content,
-        usage: result.usage
+        usage: result.usage,
+        llmDuration
       };
     } catch (error) {
       this.log(`❌ LLM生成失败: ${error.message}`);
+      // LLM 调用失败时上报阻塞原因
+      if (this.currentHeartbeatTaskId) {
+        await this._sendHeartbeat(this.currentHeartbeatTaskId, {
+          step: 'LLM 调用失败，尝试恢复中',
+          blockers: [`LLM 错误: ${error.message}`]
+        });
+      }
       return {
         message: `抱歉，生成回复时出现错误：${error.message}`,
         usage: { error: true }
@@ -715,6 +802,9 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
     // 首次聚焦
     if (!this.lastFocusTaskId) {
       this.lastFocusTaskId = currentTask.id;
+      if (currentTask.status === 'pending') {
+        await this._autoStartTask(currentTask);
+      }
       return `📋 当前聚焦任务：${currentTask.title}\n${currentTask.acceptance_criteria ? '验收标准：\n' + currentTask.acceptance_criteria : ''}`;
     }
 
@@ -732,10 +822,30 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
         // ignore
       }
 
+      // 自动开始新聚焦的任务
+      if (currentTask.status === 'pending') {
+        await this._autoStartTask(currentTask);
+      }
+
       return `=== 子任务切换 ===\n${prevTaskTitle ? '已完成：' + prevTaskTitle + ' ✅\n' : ''}当前聚焦：${currentTask.title}\n${currentTask.acceptance_criteria ? '验收标准：\n' + currentTask.acceptance_criteria : ''}`;
     }
 
     return null;
+  }
+
+  /**
+   * 自动开始任务：标记为 in_progress 并启动心跳
+   */
+  async _autoStartTask(task) {
+    try {
+      if (this.modules.taskManager) {
+        await this.modules.taskManager.startTask(task.id);
+        this.log(`▶️ 自动开始任务: ${task.title}`);
+      }
+      this._startHeartbeat(task.id);
+    } catch (error) {
+      this.log(`⚠️ 自动开始任务失败: ${error.message}`);
+    }
   }
 
   // ==================== P1-5: 熔断 + 本地缓存 ====================
@@ -854,7 +964,7 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
     this.currentHeartbeatTaskId = taskId;
     this.heartbeatTimer = setInterval(() => {
       this._sendHeartbeat(taskId);
-    }, 300000); // 每 5 分钟
+    }, 60000); // 每 1 分钟
 
     this.log(`💓 启动心跳监控：任务 ${taskId}`);
     // 立即发送一次心跳
@@ -876,14 +986,34 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
   /**
    * 发送心跳
    */
-  async _sendHeartbeat(taskId) {
+  async _sendHeartbeat(taskId, override = null) {
     try {
       if (this.modules.taskManager && this.modules.taskManager.todo) {
-        await this.modules.taskManager.todo.updateHeartbeat(taskId, {
-          progress: 0.5, // 可以由外部更新，这里用默认值
+        let payload = override;
+        if (!payload) {
+          // 无覆盖时读取当前任务状态，避免覆盖 Worker 解析的进度
+          try {
+            const taskResult = await this.modules.taskManager.todo.getTodo(taskId);
+            const task = taskResult.data || taskResult;
+            if (task) {
+              payload = {
+                progress: task.heartbeat_progress || 0,
+                step: task.heartbeat_step || '执行中',
+                blockers: Array.isArray(task.heartbeat_blockers)
+                  ? task.heartbeat_blockers
+                  : JSON.parse(task.heartbeat_blockers || '[]')
+              };
+            }
+          } catch (e) {
+            // 读取失败时使用默认值
+          }
+        }
+        payload = payload || {
+          progress: 0.5,
           step: '执行中',
           blockers: []
-        });
+        };
+        await this.modules.taskManager.todo.updateHeartbeat(taskId, payload);
       }
     } catch (error) {
       // 静默忽略
@@ -899,7 +1029,7 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
     if (this.pendingCreations.length === 0) return [];
 
     const msg = userMessage.toLowerCase().trim();
-    const confirmed = [];
+    const toCreate = [];
     const remaining = [];
 
     for (const pending of this.pendingCreations) {
@@ -917,21 +1047,54 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
       }
 
       if (shouldCreate) {
-        try {
-          await this.modules.taskManager.createTask({
-            title: pending.title,
-            priority: pending.priority || 'medium',
-            context: pending.context || '',
-            tags: pending.tags || [],
-            acceptanceCriteria: pending.acceptance_criteria || ''
-          });
-          confirmed.push(pending);
-          this.log(`✅ 用户确认创建任务: ${pending.title}`);
-        } catch (error) {
-          this.log(`❌ 创建任务失败: ${error.message}`);
-          remaining.push(pending);
-        }
+        toCreate.push(pending);
       } else {
+        remaining.push(pending);
+      }
+    }
+
+    // 分离父任务和子任务
+    const parentTasks = toCreate.filter(t => !t.parentTitle);
+    const childTasks = toCreate.filter(t => t.parentTitle);
+    const confirmed = [];
+    const parentIdMap = new Map();
+
+    // 第一步：创建所有父任务
+    for (const pending of parentTasks) {
+      try {
+        const result = await this.modules.taskManager.createTask({
+          title: pending.title,
+          priority: pending.priority || 'medium',
+          context: pending.context || '',
+          tags: pending.tags || [],
+          acceptanceCriteria: pending.acceptance_criteria || ''
+        });
+        confirmed.push(pending);
+        if (result && result.id) {
+          parentIdMap.set(pending.title, result.id);
+        }
+        this.log(`✅ 用户确认创建父任务: ${pending.title}`);
+      } catch (error) {
+        this.log(`❌ 创建父任务失败: ${error.message}`);
+        remaining.push(pending);
+      }
+    }
+
+    // 第二步：创建子任务（关联 parentId）
+    for (const pending of childTasks) {
+      try {
+        const parentId = parentIdMap.get(pending.parentTitle);
+        await this.modules.taskManager.createTask({
+          title: pending.title,
+          priority: pending.priority || 'medium',
+          context: pending.context || '',
+          tags: pending.tags || [],
+          parentId: parentId || undefined
+        });
+        confirmed.push(pending);
+        this.log(`✅ 用户确认创建子任务: ${pending.title}${parentId ? ' (parent: ' + pending.parentTitle + ')' : ''}`);
+      } catch (error) {
+        this.log(`❌ 创建子任务失败: ${error.message}`);
         remaining.push(pending);
       }
     }

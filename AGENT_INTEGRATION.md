@@ -45,6 +45,10 @@ console.log('当前聚焦任务:', data?.task?.title || '无');
 // 或让聚焦引擎自动选择最优任务
 const result = await sdk.autoFocus();
 console.log('自动聚焦到:', result.data.task.title);
+
+// Hermes 内置 tool 的 focus action 支持 auto_switch（默认 true）
+// 当当前聚焦任务已完成时，会自动调用 auto-focus 推进到下一个任务
+agent_todo_tool(action="focus", auto_switch=true)
 ```
 
 ---
@@ -131,6 +135,15 @@ await sdk.updateHeartbeat(taskId, {
 - 建议每 5 分钟上报一次
 - 超过 30 分钟无心跳 → 任务自动标记为 stuck
 - 可通过 `getStuckTasks(30)` 查询卡住的任务
+
+**用 blockers 暂停任务（话题切换场景）**：
+```javascript
+// 当用户切换话题时，用 blockers 标记当前任务被暂停
+await sdk.updateHeartbeat(taskId, {
+  step: '用户切换话题: 查询天气',
+  blockers: ['用户主动切换话题']
+});
+```
 
 ### 重试管理
 
@@ -316,6 +329,7 @@ const sdk = new AgentTODOSDK(
 | `getFocus()` | 获取当前聚焦 |
 | `setFocus(taskId, options)` | 手动设置聚焦 |
 | `autoFocus()` | 自动聚焦 |
+| `focus(auto_switch)` | 获取聚焦摘要，支持自动推进已完成任务 |
 
 ### 心跳与重试
 
@@ -337,6 +351,13 @@ const sdk = new AgentTODOSDK(
 | `markNotificationRead(id)` | 标记已读 |
 | `markAllNotificationsRead()` | 全部已读 |
 | `getProjectBoard(projectId)` | 项目看板 |
+
+### 任务归档与清理
+
+| 方法 | 说明 |
+|------|------|
+| `archiveOldCompleted(days)` | 归档超过 N 天的 completed/cancelled 任务（软删除） |
+| `purgeArchived()` | 物理删除已归档的任务（谨慎使用） |
 
 ### 上下文存储
 
@@ -398,3 +419,4 @@ python3 ~/.hermes/skills/hermes-todo-skill/todo_skill.py notifications
 3. **完成重要任务后**及时调用 `doneTask()` 或 `completeTodo()`
 4. **遇到阻塞**时检查是否有前置任务未完成，或上报 blockers
 5. **跨 agent 指派**前确保目标 agent 已在 TODO Server 中注册
+6. **用户切换话题时**用 `heartbeat(blockers=[...])` 暂停当前任务，响应新需求

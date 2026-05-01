@@ -13,6 +13,8 @@
 | 验收标准 + 显式确认 | ✅ | ✅ | ✅ |
 | 漂移检测 | ✅ | ✅ | ✅ |
 | 任务自动发现 + 确认创建 | ✅ | ✅ | ✅ |
+| 自动聚焦推进（auto-switch） | ✅ | ✅ | ✅ |
+| 话题切换规则 + 用户意图优先 | ✅ | ✅ | ✅ |
 | 多智能体协作（指派/转交/通知） | ✅ | ✅ | ✅ |
 | 项目全局看板 | ✅ | ✅ | ✅ |
 | 对话上下文存储 | ✅ | ✅ | ✅ |
@@ -323,6 +325,25 @@ class FocusEngine {
 }
 ```
 
+#### Auto-Switch 自动推进
+
+Hermes 侧在每次对话前调用 `agent_todo focus` 时，如果检测到当前聚焦任务已完成（`completed`/`cancelled`），自动触发 `POST /focus/auto` 选择下一个最优任务：
+
+```python
+def agent_todo_focus(auto_switch: bool = True):
+    focus_result = _do("GET", "/focus")
+    focus_task = focus_result.get("data", {}).get("current_task")
+    
+    # 当前聚焦已完成 → 自动推进
+    if (not focus_task or focus_task.get("status") in ("completed", "cancelled")) and auto_switch:
+        auto_result = _do("POST", "/focus/auto", {})
+        focus_task = auto_result.get("data", {}).get("task")
+    
+    return focus_task
+```
+
+配合**话题切换规则**，当用户主动切换话题时，LLM 通过 `heartbeat(blockers=[...])` 暂停当前任务，下次 `auto_switch` 会跳过被 block 的任务，自动聚焦到其他就绪任务。
+
 ---
 
 ## 四、MVP 实现步骤（以 hermes-default 为范例）
@@ -403,6 +424,11 @@ class FocusEngine {
 
 3. **同步到所有 profile**
    - ✅ default / ops / coder 都已挂载
+
+4. **自动聚焦推进**
+   - ✅ `agent_todo focus` 支持 `auto_switch` 参数
+   - ✅ 任务完成后自动调用 `/focus/auto` 推进
+   - ✅ 话题切换规则注入 Prompt 约束
 
 ### 阶段 5：剩余工作（可选增强）
 

@@ -17,24 +17,37 @@ class Todo {
       position = 0,
       acceptanceCriteria = '',
       criteriaConfirmed = false,
-      maxAttempts = 3
+      maxAttempts = 3,
+      schedule = null,
+      isTemplate = false,
+      assignedAgentId = null
     } = data;
+
+    // Auto-set isTemplate=true if schedule is provided but isTemplate not explicitly set
+    // This prevents LLM from forgetting to mark scheduled tasks as templates
+    let finalIsTemplate = isTemplate;
+    if (schedule && data.isTemplate === undefined) {
+      finalIsTemplate = true;
+    }
+
+    // Compute next due date for scheduled tasks
+    const nextDueAt = schedule ? this.computeNextDueAt(schedule, new Date()) : null;
 
     const stmt = db.prepare(`
       INSERT INTO todos (
         id, agent_id, project_id, parent_id, title, description, priority,
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
-        origin_agent_id
+        origin_agent_id, assigned_agent_id, schedule, is_template, next_due_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
       id, agentId, projectId, parentId, title, description, priority,
       context, JSON.stringify(tags), JSON.stringify(dependencies), position,
       acceptanceCriteria, criteriaConfirmed ? 1 : 0, maxAttempts,
-      agentId
+      agentId, assignedAgentId, schedule, finalIsTemplate ? 1 : 0, nextDueAt
     );
 
     return this.findById(agentId, id);
@@ -57,7 +70,7 @@ class Todo {
 
   static findAllByAgent(agentId, filters = {}) {
     const db = getDb();
-    const { status, priority, tags, projectId, limit = 100, offset = 0 } = filters;
+    const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0 } = filters;
 
     let query = 'SELECT * FROM todos WHERE agent_id = ?';
     const params = [agentId];
@@ -77,10 +90,24 @@ class Todo {
       params.push(projectId);
     }
 
+    if (isTemplate !== undefined) {
+      query += ' AND is_template = ?';
+      params.push(isTemplate ? 1 : 0);
+    }
+
     if (tags && tags.length > 0) {
       const tagConditions = tags.map(() => 'tags LIKE ?').join(' OR ');
       query += ` AND (${tagConditions})`;
       tags.forEach(tag => params.push(`%"${tag}"%`));
+    }
+
+    if (title) {
+      query += ' AND title LIKE ?';
+      params.push(`%${title}%`);
+    }
+
+    if (!includeArchived) {
+      query += ' AND (archived = 0 OR archived IS NULL)';
     }
 
     query += ' ORDER BY CASE priority WHEN \'critical\' THEN 1 WHEN \'high\' THEN 2 WHEN \'medium\' THEN 3 ELSE 4 END, created_at DESC';
@@ -120,7 +147,10 @@ class Todo {
       lastHeartbeat,
       heartbeatProgress,
       heartbeatStep,
-      heartbeatBlockers
+      heartbeatBlockers,
+      schedule,
+      isTemplate,
+      expectedDurationMinutes
     } = data;
 
     const updates = [];
@@ -227,6 +257,40 @@ class Todo {
       values.push(JSON.stringify(heartbeatBlockers));
     }
 
+    if (expectedDurationMinutes !== undefined) {
+      updates.push('expected_duration_minutes = ?');
+      values.push(expectedDurationMinutes);
+    }
+
+    if (schedule !== undefined) {
+      updates.push('schedule = ?');
+      values.push(schedule);
+      // Recompute next_due_at when schedule changes
+      if (schedule) {
+        updates.push('next_due_at = ?');
+        values.push(this.computeNextDueAt(schedule, new Date()));
+      } else {
+        updates.push('next_due_at = NULL');
+        // Also clear template flag when schedule is removed
+        updates.push('is_template = 0');
+      }
+    }
+
+    if (isTemplate !== undefined) {
+      updates.push('is_template = ?');
+      values.push(isTemplate ? 1 : 0);
+    }
+
+    if (data.nextDueAt !== undefined) {
+      updates.push('next_due_at = ?');
+      values.push(data.nextDueAt);
+    }
+
+    if (data.lastSpawnedAt !== undefined) {
+      updates.push('last_spawned_at = ?');
+      values.push(data.lastSpawnedAt);
+    }
+
     if (updates.length === 0) {
       return this.findById(agentId, id);
     }
@@ -255,7 +319,9 @@ class Todo {
   static complete(agentId, id) {
     return this.update(agentId, id, {
       status: 'completed',
-      completed_at: new Date().toISOString()
+      completed_at: new Date().toISOString(),
+      heartbeatStep: '已完成',
+      heartbeatBlockers: []
     });
   }
 
@@ -273,6 +339,7 @@ class Todo {
         SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
         SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
         SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
+        SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked,
         SUM(CASE WHEN priority = 'critical' AND status != 'completed' AND status != 'cancelled' THEN 1 ELSE 0 END) as critical_pending,
         SUM(CASE WHEN priority = 'high' AND status != 'completed' AND status != 'cancelled' THEN 1 ELSE 0 END) as high_pending
       FROM todos
@@ -477,7 +544,7 @@ class Todo {
           id: t.id,
           title: t.title,
           priority: t.priority,
-          progress: t.status
+          progress: t.heartbeat_progress || 0
         }))
       },
       priority_tasks: readyTasks
@@ -581,7 +648,7 @@ class Todo {
     const todo = this.findById(agentId, id);
     if (!todo) return null;
 
-    const updates = ['last_heartbeat = CURRENT_TIMESTAMP'];
+    const updates = ['last_heartbeat = CURRENT_TIMESTAMP', 'updated_at = CURRENT_TIMESTAMP'];
     const values = [];
 
     if (heartbeatData.progress !== undefined) {
@@ -685,6 +752,45 @@ class Todo {
     }));
   }
 
+  /**
+   * 查找所有 in_progress 任务（用于动态阈值检测）
+   */
+  static findAllInProgress(agentId) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ? AND status = 'in_progress'
+    `);
+    const todos = stmt.all(agentId);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static findProgressStalledTasks(agentId, stallMinutes = 15) {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - stallMinutes * 60 * 1000).toISOString();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ? AND status = 'in_progress'
+        AND last_heartbeat IS NOT NULL
+        AND last_heartbeat < ?
+        AND (updated_at IS NULL OR updated_at < ?)
+    `);
+    const todos = stmt.all(agentId, cutoff, cutoff);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
   // ==================== 多智能体协作方法 ====================
 
   static assign(agentId, todoId, assignedAgentId, note = '') {
@@ -754,6 +860,158 @@ class Todo {
     `);
     stmt.run(newAssignedAgentId, todo.assigned_agent_id, reason, todoId, agentId);
     return this.findById(agentId, todoId);
+  }
+
+  // 归档超过 N 天的 completed/cancelled 任务（soft delete）
+  static archiveOldCompleted(agentId, daysOld = 30) {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - daysOld * 24 * 60 * 60 * 1000).toISOString();
+    const stmt = db.prepare(`
+      UPDATE todos SET archived = 1, updated_at = CURRENT_TIMESTAMP
+      WHERE agent_id = ? AND status IN ('completed', 'cancelled')
+        AND completed_at < ? AND (archived = 0 OR archived IS NULL)
+    `);
+    const result = stmt.run(agentId, cutoff);
+    return result.changes;
+  }
+
+  // 物理删除已归档的任务（谨慎使用）
+  static purgeArchived(agentId) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      DELETE FROM todos
+      WHERE agent_id = ? AND archived = 1
+    `);
+    const result = stmt.run(agentId);
+    return result.changes;
+  }
+
+  // ==================== 定时调度任务方法 ====================
+
+  static findTemplates(agentId) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ? AND is_template = 1
+      ORDER BY next_due_at ASC, created_at DESC
+    `);
+    const todos = stmt.all(agentId);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static findDueTemplates(agentId) {
+    const db = getDb();
+    const now = new Date().toISOString();
+    const stmt = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ? AND is_template = 1
+        AND next_due_at IS NOT NULL AND next_due_at <= ?
+    `);
+    const todos = stmt.all(agentId, now);
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
+  }
+
+  static spawnFromTemplate(agentId, templateId) {
+    const db = getDb();
+    const template = this.findById(agentId, templateId);
+    if (!template) throw new Error('Template not found');
+    if (!template.is_template) throw new Error('Task is not a template');
+
+    const newId = uuidv4();
+    const stmt = db.prepare(`
+      INSERT INTO todos (
+        id, agent_id, project_id, parent_id, title, description, priority,
+        context, tags, dependencies, position,
+        acceptance_criteria, criteria_confirmed, max_attempts,
+        origin_agent_id, assigned_agent_id, schedule, is_template, status, created_at, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `);
+
+    stmt.run(
+      newId, agentId, template.project_id, template.parent_id,
+      template.title, template.description || '', template.priority,
+      template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
+      template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
+      agentId, template.assigned_agent_id || null, null, 0, 'pending'
+    );
+
+    // Update template: last_spawned_at and next_due_at
+    const nextDueAt = template.schedule
+      ? this.computeNextDueAt(template.schedule, new Date())
+      : null;
+
+    const updateStmt = db.prepare(`
+      UPDATE todos SET last_spawned_at = CURRENT_TIMESTAMP, next_due_at = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND agent_id = ?
+    `);
+    updateStmt.run(nextDueAt, templateId, agentId);
+
+    return this.findById(agentId, newId);
+  }
+
+  static computeNextDueAt(schedule, fromTime) {
+    if (!schedule) return null;
+
+    const from = new Date(fromTime);
+
+    // daily: next occurrence is exactly 24h later
+    if (schedule === 'daily') {
+      const next = new Date(from);
+      next.setDate(next.getDate() + 1);
+      return next.toISOString();
+    }
+
+    // weekly:mon,tue,wed — comma-separated day abbreviations
+    if (schedule.startsWith('weekly:')) {
+      const daysPart = schedule.slice(7);
+      const dayMap = { sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6 };
+      const targetDays = daysPart.split(',').map(d => dayMap[d.trim().toLowerCase()]).filter(v => v !== undefined);
+      if (targetDays.length === 0) return null;
+
+      const next = new Date(from);
+      // Start checking from tomorrow
+      for (let i = 1; i <= 8; i++) {
+        next.setDate(next.getDate() + 1);
+        if (targetDays.includes(next.getDay())) {
+          return next.toISOString();
+        }
+      }
+      return null;
+    }
+
+    // cron: expression — simple parser for standard cron (minute hour day month dow)
+    // Also supports legacy raw cron expressions like "0 18 * * *"
+    const cronExpr = schedule.startsWith('cron:') ? schedule.slice(5).trim() : schedule;
+    const parts = cronExpr.split(/\s+/);
+    if (parts.length === 5) {
+      const minute = parseInt(parts[0], 10);
+      const hour = parseInt(parts[1], 10);
+      if (!isNaN(minute) && !isNaN(hour) && hour >= 0 && hour <= 23) {
+        const next = new Date(from);
+        next.setSeconds(0, 0);
+        next.setMinutes(minute);
+        next.setHours(hour);
+        if (next <= from) {
+          next.setDate(next.getDate() + 1);
+        }
+        return next.toISOString();
+      }
+    }
+
+    return null;
   }
 }
 

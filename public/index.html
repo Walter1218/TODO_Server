@@ -3,427 +3,1957 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Agent TODO Server</title>
+    <title>TODO Server Dashboard</title>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        :root {
+            --primary: #667eea;
+            --primary-dark: #5a67d8;
+            --danger: #f56565;
+            --warning: #ed8936;
+            --success: #48bb78;
+            --info: #4299e1;
+            --bg: #f7fafc;
+            --card: #ffffff;
+            --text: #2d3748;
+            --text-muted: #718096;
+            --border: #e2e8f0;
+            --shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
         }
-        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
             min-height: 100vh;
-            padding: 20px;
-            color: #333;
         }
-        
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0, 0, 0, 0.3);
-            overflow: hidden;
-        }
-        
+
+        /* Header */
         .header {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, var(--primary) 0%, #764ba2 100%);
             color: white;
-            padding: 40px;
-            text-align: center;
+            padding: 16px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: var(--shadow);
         }
-        
-        .header h1 {
-            font-size: 2.5em;
-            margin-bottom: 10px;
+        .header-left { display: flex; align-items: center; gap: 12px; }
+        .header h1 { font-size: 1.4rem; font-weight: 700; }
+        .header-status {
+            display: flex; align-items: center; gap: 6px;
+            font-size: 0.85rem; opacity: 0.9;
         }
-        
-        .header p {
-            font-size: 1.2em;
-            opacity: 0.9;
+        .status-dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--success); animation: pulse 2s infinite;
         }
-        
-        .status {
-            display: inline-block;
-            background: rgba(255, 255, 255, 0.2);
-            padding: 8px 20px;
-            border-radius: 20px;
-            margin-top: 20px;
-            font-weight: bold;
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
         }
-        
-        .content {
-            padding: 40px;
+        .header-actions { display: flex; gap: 8px; align-items: center; }
+        .btn {
+            padding: 8px 16px; border: none; border-radius: 6px;
+            cursor: pointer; font-size: 0.9rem; font-weight: 500;
+            transition: all 0.2s; display: inline-flex; align-items: center; gap: 6px;
         }
-        
-        .section {
-            margin-bottom: 40px;
+        .btn-primary { background: white; color: var(--primary); }
+        .btn-primary:hover { background: #f7fafc; }
+        .btn-ghost { background: rgba(255,255,255,0.15); color: white; }
+        .btn-ghost:hover { background: rgba(255,255,255,0.25); }
+        .btn-danger { background: var(--danger); color: white; }
+        .btn-sm { padding: 6px 12px; font-size: 0.8rem; }
+
+        /* Login Panel */
+        .login-panel {
+            max-width: 480px; margin: 80px auto; padding: 32px;
+            background: var(--card); border-radius: 12px; box-shadow: var(--shadow);
         }
-        
-        .section h2 {
-            color: #667eea;
-            font-size: 1.8em;
-            margin-bottom: 20px;
-            border-bottom: 3px solid #667eea;
-            padding-bottom: 10px;
+        .login-panel h2 { margin-bottom: 8px; font-size: 1.3rem; }
+        .login-panel p { color: var(--text-muted); margin-bottom: 24px; font-size: 0.9rem; }
+        .form-group { margin-bottom: 16px; }
+        .form-group label {
+            display: block; margin-bottom: 6px; font-size: 0.85rem;
+            font-weight: 600; color: var(--text-muted);
         }
-        
-        .endpoint-group {
-            background: #f8f9fa;
-            padding: 20px;
-            border-radius: 10px;
-            margin-bottom: 20px;
+        .form-group input, .form-group select {
+            width: 100%; padding: 10px 12px; border: 1px solid var(--border);
+            border-radius: 6px; font-size: 0.95rem; background: var(--card);
         }
-        
-        .endpoint-group h3 {
-            color: #764ba2;
-            margin-bottom: 15px;
-            font-size: 1.3em;
+        .form-group input:focus, .form-group select:focus {
+            outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(102,126,234,0.15);
         }
-        
-        .endpoint {
-            background: white;
-            padding: 15px;
-            margin: 10px 0;
-            border-radius: 8px;
-            border-left: 4px solid #667eea;
+        .login-error {
+            color: var(--danger); font-size: 0.85rem; margin-top: 12px; display: none;
         }
-        
-        .method {
-            display: inline-block;
-            padding: 4px 12px;
-            border-radius: 4px;
-            font-weight: bold;
-            font-size: 0.9em;
-            margin-right: 10px;
+
+        /* Main Content */
+        .main { padding: 24px; max-width: 1400px; margin: 0 auto; }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+            gap: 16px; margin-bottom: 24px;
         }
-        
-        .method.get { background: #61affe; color: white; }
-        .method.post { background: #49cc90; color: white; }
-        .method.put { background: #fca130; color: white; }
-        .method.patch { background: #50e3c2; color: white; }
-        .method.delete { background: #f93e3e; color: white; }
-        
-        .url {
-            font-family: 'Courier New', monospace;
-            color: #333;
-            font-size: 0.95em;
-        }
-        
-        .description {
-            margin-top: 8px;
-            color: #666;
-            font-size: 0.9em;
-        }
-        
-        .example {
-            background: #2d3748;
-            color: #e2e8f0;
-            padding: 20px;
-            border-radius: 10px;
-            margin: 20px 0;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-            overflow-x: auto;
-        }
-        
-        .example pre {
-            margin: 0;
-            white-space: pre-wrap;
-            word-wrap: break-word;
-        }
-        
-        .example .comment {
-            color: #68d391;
-        }
-        
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
-        }
-        
         .stat-card {
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white;
-            padding: 25px;
-            border-radius: 10px;
-            text-align: center;
+            background: var(--card); padding: 20px; border-radius: 10px;
+            box-shadow: var(--shadow); text-align: center; cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s; border-top: 3px solid var(--primary);
         }
-        
-        .stat-number {
-            font-size: 2.5em;
-            font-weight: bold;
-            margin-bottom: 5px;
+        .stat-card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+        .stat-card.danger { border-top-color: var(--danger); }
+        .stat-card.warning { border-top-color: var(--warning); }
+        .stat-card.success { border-top-color: var(--success); }
+        .stat-card.info { border-top-color: var(--info); }
+        .stat-value { font-size: 2rem; font-weight: 700; color: var(--text); }
+        .stat-label { font-size: 0.8rem; color: var(--text-muted); margin-top: 4px; }
+        .stat-delta { font-size: 0.75rem; margin-top: 4px; }
+
+        /* Section */
+        .section { margin-bottom: 24px; }
+        .section-header {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 16px;
         }
-        
-        .stat-label {
-            font-size: 0.9em;
-            opacity: 0.9;
+        .section-title {
+            font-size: 1.1rem; font-weight: 700; display: flex; align-items: center; gap: 8px;
         }
-        
-        .tip {
-            background: #fffbeb;
-            border-left: 4px solid #f59e0b;
+        .section-title .badge {
+            background: var(--danger); color: white; font-size: 0.7rem;
+            padding: 2px 8px; border-radius: 10px; font-weight: 600;
+        }
+
+        /* Agent Panels */
+        .agent-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 16px; margin-bottom: 24px;
+        }
+        .agent-card {
+            background: var(--card); border-radius: 10px; box-shadow: var(--shadow);
+            padding: 20px; position: relative; overflow: hidden;
+        }
+        .agent-card::before {
+            content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+            background: linear-gradient(90deg, var(--primary), #764ba2);
+        }
+        .agent-card.offline::before { background: var(--text-muted); }
+        .agent-card.blocked::before { background: var(--danger); }
+        .agent-header {
+            display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px;
+        }
+        .agent-name { font-weight: 700; font-size: 1rem; }
+        .agent-focus {
+            font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px;
+            line-height: 1.5;
+        }
+        .agent-focus strong { color: var(--text); }
+        .agent-meta {
+            display: flex; gap: 12px; font-size: 0.8rem; color: var(--text-muted);
+        }
+        .agent-meta span { display: flex; align-items: center; gap: 4px; }
+        .progress-bar {
+            height: 6px; background: var(--border); border-radius: 3px;
+            margin: 10px 0; overflow: hidden;
+        }
+        .progress-fill {
+            height: 100%; background: linear-gradient(90deg, var(--primary), #764ba2);
+            border-radius: 3px; transition: width 0.5s ease;
+        }
+        .progress-fill.danger { background: var(--danger); }
+        .progress-fill.warning { background: var(--warning); }
+        .progress-fill.success { background: var(--success); }
+
+        /* Filters */
+        .filters {
+            display: flex; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; align-items: center;
+        }
+        .filters select, .filters input {
+            padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px;
+            font-size: 0.9rem; background: var(--card);
+        }
+        .filters input { min-width: 200px; }
+
+        /* Task List */
+        .task-list { display: flex; flex-direction: column; gap: 10px; }
+        .task-item {
+            background: var(--card); border-radius: 8px; box-shadow: var(--shadow);
+            overflow: hidden; transition: all 0.2s;
+        }
+        .task-item:hover { box-shadow: 0 8px 12px -2px rgba(0,0,0,0.1); }
+        .task-main {
+            padding: 14px 18px; display: flex; align-items: center; gap: 12px;
+            cursor: pointer; user-select: none;
+        }
+        .task-expand {
+            width: 20px; height: 20px; display: flex; align-items: center;
+            justify-content: center; color: var(--text-muted); font-size: 0.8rem;
+            transition: transform 0.2s;
+        }
+        .task-expand.open { transform: rotate(90deg); }
+        .task-status {
+            width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+        }
+        .status-pending { background: var(--text-muted); }
+        .status-in_progress { background: var(--info); animation: pulse 2s infinite; }
+        .status-completed { background: var(--success); }
+        .status-cancelled { background: var(--text-muted); }
+        .status-blocked { background: var(--danger); animation: pulse 1.5s infinite; }
+        .task-info { flex: 1; min-width: 0; }
+        .task-title {
+            font-weight: 600; font-size: 0.95rem; margin-bottom: 2px;
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .task-subtitle {
+            font-size: 0.8rem; color: var(--text-muted);
+            white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .task-tags {
+            display: flex; gap: 4px; flex-wrap: wrap;
+        }
+        .tag {
+            font-size: 0.7rem; padding: 2px 8px; border-radius: 4px;
+            background: var(--bg); color: var(--text-muted); font-weight: 500;
+        }
+        .tag.critical { background: #fed7d7; color: #c53030; }
+        .tag.high { background: #feebc8; color: #c05621; }
+        .tag.blocked { background: #fed7d7; color: #c53030; }
+        .task-right {
+            display: flex; align-items: center; gap: 16px; flex-shrink: 0;
+        }
+        .task-progress {
+            text-align: right; min-width: 60px;
+        }
+        .task-progress-value {
+            font-weight: 700; font-size: 0.9rem;
+        }
+        .task-progress-time {
+            font-size: 0.7rem; color: var(--text-muted);
+        }
+        .task-agent {
+            font-size: 0.8rem; color: var(--text-muted); min-width: 80px; text-align: right;
+        }
+        .task-detail {
+            padding: 0 18px 14px 50px; display: none;
+            border-top: 1px solid var(--border); background: var(--bg);
+        }
+        .task-detail.open { display: block; }
+        .detail-row {
+            display: flex; gap: 24px; margin-top: 12px; flex-wrap: wrap;
+        }
+        .detail-col { flex: 1; min-width: 200px; }
+        .detail-label {
+            font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase;
+            letter-spacing: 0.5px; margin-bottom: 6px; font-weight: 600;
+        }
+        .detail-value { font-size: 0.85rem; line-height: 1.5; }
+        .subtask-list { margin-top: 8px; }
+        .subtask-item {
+            display: flex; align-items: center; gap: 8px; padding: 6px 0;
+            font-size: 0.85rem; border-bottom: 1px solid var(--border);
+        }
+        .subtask-item:last-child { border-bottom: none; }
+        .subtask-status { width: 8px; height: 8px; border-radius: 50%; }
+        .blocker-alert {
+            background: #fff5f5; border: 1px solid #fed7d7; border-radius: 6px;
+            padding: 10px 14px; margin-top: 10px; color: #c53030; font-size: 0.85rem;
+        }
+        .attempt-log {
+            margin-top: 8px;
+        }
+        .attempt-item {
+            display: flex; gap: 12px; padding: 6px 0; font-size: 0.8rem;
+            border-bottom: 1px solid var(--border);
+        }
+        .attempt-item:last-child { border-bottom: none; }
+        .attempt-time { color: var(--text-muted); min-width: 140px; }
+        .attempt-success { color: var(--success); }
+        .attempt-fail { color: var(--danger); }
+
+        /* Work Status Badges */
+        .work-status {
+            display: inline-flex; align-items: center; gap: 4px;
+            font-size: 0.72rem; padding: 2px 8px; border-radius: 4px;
+            font-weight: 600; margin-left: 4px;
+        }
+        .work-active { background: #c6f6d5; color: #22543d; }
+        .work-idle { background: #e2e8f0; color: #4a5568; }
+        .work-blocked { background: #fed7d7; color: #c53030; }
+        .work-blocked-active { background: #fefcbf; color: #744210; }
+        .work-stuck { background: #feebc8; color: #c05621; }
+        .work-stalled { background: #e9d8fd; color: #553c9a; }
+
+        /* Step badge */
+        .step-badge {
+            display: inline-flex; align-items: center; gap: 4px;
+            font-size: 0.78rem; color: var(--primary); font-weight: 600;
+            background: rgba(102,126,234,0.08); padding: 1px 8px; border-radius: 4px;
+        }
+
+        /* List blocker hint */
+        .list-blocker-hint {
+            font-size: 0.75rem; color: #c53030; margin-top: 2px;
+        }
+
+        /* Child count */
+        .child-count {
+            font-size: 0.75rem; color: var(--text-muted); margin-left: 4px;
+        }
+
+        /* Task card highlights */
+        .task-item.task-blocked { border-left: 3px solid var(--danger); }
+        .task-item.task-stuck { border-left: 3px solid var(--warning); }
+
+        /* Progress bar in task list */
+        .task-progress-bar-wrap {
+            width: 80px; height: 5px; background: var(--border); border-radius: 3px;
+            overflow: hidden; margin-bottom: 3px;
+        }
+        .task-progress-bar {
+            height: 100%; background: linear-gradient(90deg, var(--primary), #764ba2);
+            border-radius: 3px; transition: width 0.5s ease;
+        }
+        .task-progress-meta {
+            display: flex; align-items: center; gap: 8px;
+            font-size: 0.75rem;
+        }
+        .progress-value { font-weight: 700; min-width: 32px; }
+        .active-time { color: var(--text-muted); }
+        .active-time.stuck { color: var(--danger); font-weight: 600; }
+        .active-time.stalled { color: var(--warning); font-weight: 600; }
+
+        /* Attempt Timeline */
+        .attempt-timeline {
+            position: relative; margin-top: 12px; padding-left: 20px;
+        }
+        .attempt-timeline::before {
+            content: ''; position: absolute; left: 6px; top: 0; bottom: 0;
+            width: 2px; background: var(--border);
+        }
+        .timeline-item {
+            position: relative; padding-bottom: 16px;
+        }
+        .timeline-item:last-child { padding-bottom: 0; }
+        .timeline-dot {
+            position: absolute; left: -17px; top: 4px; width: 10px; height: 10px;
+            border-radius: 50%; background: var(--border); border: 2px solid var(--card);
+        }
+        .timeline-item.success .timeline-dot { background: var(--success); }
+        .timeline-item.fail .timeline-dot { background: var(--danger); }
+        .timeline-item.auto-recovery .timeline-dot { background: #ed8936; }
+        .timeline-item.manual-drive .timeline-dot { background: #4299e1; }
+        .timeline-content { background: var(--card); padding: 10px 14px; border-radius: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid var(--border);
+        }
+        .timeline-header {
+            display: flex; align-items: center; gap: 10px; margin-bottom: 6px;
+        }
+        .timeline-time { font-size: 0.75rem; color: var(--text-muted); }
+        .timeline-badge {
+            font-size: 0.7rem; padding: 1px 6px; border-radius: 3px; font-weight: 600;
+        }
+        .badge-success { background: #c6f6d5; color: #22543d; }
+        .badge-fail { background: #fed7d7; color: #c53030; }
+        .badge-warning { background: #feebc8; color: #c05621; }
+        .badge-primary { background: #bee3f8; color: #2b6cb0; }
+        .timeline-reason { font-size: 0.85rem; font-weight: 500; }
+        .timeline-output { font-size: 0.78rem; color: var(--text-muted); margin-top: 4px;
+            padding-top: 4px; border-top: 1px dashed var(--border);
+        }
+
+        /* Agent work status in card */
+        .agent-work-status {
+            display: inline-flex; align-items: center; gap: 4px;
+            font-size: 0.75rem; padding: 2px 8px; border-radius: 4px;
+            font-weight: 600; margin-top: 6px;
+        }
+
+        /* Context chat messages */
+        .context-chat {
+            display: flex; flex-direction: column; gap: 6px;
+            max-height: 200px; overflow-y: auto;
+            padding: 8px; background: #f8fafc; border-radius: 6px;
+        }
+        .chat-msg {
+            display: flex; gap: 8px; align-items: flex-start;
+            font-size: 0.8rem; line-height: 1.4;
+        }
+        .chat-msg .chat-role {
+            flex-shrink: 0; font-size: 0.9rem;
+        }
+        .chat-msg .chat-content {
+            flex: 1; word-break: break-word;
+        }
+        .chat-msg.user .chat-content { color: #2b6cb0; }
+        .chat-msg.assistant .chat-content { color: #276749; }
+        .chat-msg.system .chat-content { color: var(--text-muted); font-style: italic; }
+
+        /* Tag success variant */
+        .tag.success { background: #c6f6d5; color: #22543d; }
+
+        /* Stuck Alert */
+        .stuck-banner {
+            background: linear-gradient(90deg, #fff5f5, #fff);
+            border: 1px solid var(--danger); border-radius: 8px;
+            padding: 12px 16px; margin-bottom: 16px; display: flex;
+            align-items: center; gap: 12px; color: #c53030;
+        }
+        .stuck-banner-icon { font-size: 1.2rem; }
+
+        /* Notification Panel */
+        .notif-list { display: flex; flex-direction: column; gap: 8px; }
+        .notif-item {
+            background: var(--card); padding: 12px 16px; border-radius: 8px;
+            box-shadow: var(--shadow); display: flex; align-items: flex-start; gap: 12px;
+            font-size: 0.9rem; cursor: pointer; transition: all 0.15s;
+        }
+        .notif-item:hover { background: var(--bg); }
+        .notif-item.unread { border-left: 3px solid var(--danger); }
+        .notif-item.read { border-left: 3px solid var(--border); opacity: 0.7; }
+        .notif-content { flex: 1; }
+        .notif-time { font-size: 0.75rem; color: var(--text-muted); margin-top: 4px; }
+
+        /* Project Board */
+        .project-grid {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 16px;
+        }
+        .project-card {
+            background: var(--card); border-radius: 10px; box-shadow: var(--shadow);
             padding: 20px;
-            margin: 20px 0;
-            border-radius: 8px;
         }
-        
-        .tip h4 {
-            color: #f59e0b;
-            margin-bottom: 10px;
+        .project-header {
+            display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
         }
-        
-        .footer {
-            background: #f8f9fa;
-            padding: 20px;
-            text-align: center;
-            color: #666;
-            font-size: 0.9em;
+        .project-color {
+            width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0;
         }
-        
-        .refresh-btn {
-            background: #667eea;
-            color: white;
-            border: none;
-            padding: 12px 30px;
-            border-radius: 8px;
-            font-size: 1em;
-            cursor: pointer;
-            margin-top: 20px;
-            transition: background 0.3s;
+        .project-name { font-weight: 700; font-size: 1rem; }
+        .project-stats {
+            display: flex; gap: 16px; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 12px;
         }
-        
-        .refresh-btn:hover {
-            background: #764ba2;
+        .project-bar {
+            height: 8px; background: var(--border); border-radius: 4px; overflow: hidden;
         }
+        .project-bar-fill { height: 100%; border-radius: 4px; transition: width 0.5s; }
+        .project-agents {
+            margin-top: 12px; font-size: 0.8rem; color: var(--text-muted);
+        }
+
+        /* Empty State */
+        .empty-state {
+            text-align: center; padding: 40px; color: var(--text-muted);
+        }
+        .empty-state-icon { font-size: 3rem; margin-bottom: 12px; }
+
+        /* Loading */
+        .loading {
+            display: flex; align-items: center; justify-content: center; padding: 40px;
+            color: var(--text-muted); gap: 8px;
+        }
+        .spinner {
+            width: 20px; height: 20px; border: 2px solid var(--border);
+            border-top-color: var(--primary); border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* Layout: two column for tasks + notifications */
+        .dashboard-layout {
+            display: grid; grid-template-columns: 1fr 340px; gap: 24px;
+        }
+        @media (max-width: 1100px) {
+            .dashboard-layout { grid-template-columns: 1fr; }
+            .agent-grid { grid-template-columns: 1fr; }
+        }
+
+        .hidden { display: none !important; }
+
+        /* Parent-Child Task Hierarchy */
+        .parent-expand {
+            width: 20px; height: 20px; display: flex; align-items: center;
+            justify-content: center; color: var(--primary); font-size: 0.75rem;
+            transition: transform 0.2s; cursor: pointer; flex-shrink: 0;
+            font-weight: bold; margin-right: 4px;
+        }
+        .parent-expand.open { transform: rotate(90deg); }
+        .parent-expand:hover { color: var(--primary-dark); }
+
+        .task-children {
+            margin-left: 24px;
+            border-left: 2px solid var(--border);
+            padding-left: 8px;
+            margin-top: 4px;
+            margin-bottom: 8px;
+        }
+        /* Parent task styling */
+        .task-parent { border-left: 3px solid var(--accent) !important; }
+        .parent-icon { margin-right: 6px; font-size: 0.9rem; }
+        .parent-toggle {
+            width: 20px; height: 20px; flex-shrink: 0;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 0.75rem; color: var(--text-muted);
+            cursor: pointer; transition: transform 0.2s, color 0.2s;
+            border-radius: 4px;
+        }
+        .parent-toggle:hover { color: var(--accent); background: rgba(99,102,241,0.08); }
+        .parent-toggle.open { transform: rotate(90deg); }
+        /* Child task tree styling */
+        .task-children {
+            margin-left: 28px;
+            border-left: 2px solid #e2e8f0;
+            padding-left: 12px;
+            margin-top: 4px;
+        }
+        .task-children .task-item.child-task {
+            margin-top: 4px;
+            box-shadow: none;
+            border: 1px solid #edf2f7;
+            background: #f8fafc;
+            border-radius: 6px;
+        }
+        .task-children .task-item.child-task .task-main {
+            padding: 8px 12px;
+        }
+        .task-children .task-item.child-task .task-detail {
+            background: transparent;
+            border-top: none;
+            padding: 0 12px 8px 40px;
+        }
+        /* ── Agent Activity Panel ── */
+        .activities { display: flex; flex-direction: column; gap: 0; }
+        .activity-item {
+            display: flex; align-items: flex-start; gap: 10px;
+            padding: 10px 12px; border-bottom: 1px solid var(--border);
+            font-size: 0.82rem; line-height: 1.45;
+            animation: fadeIn 0.3s ease;
+        }
+        .activity-item:last-child { border-bottom: none; }
+        .activity-item:hover { background: rgba(99,102,241,0.04); }
+        .activity-icon { font-size: 1rem; flex-shrink: 0; margin-top: 1px; }
+        .activity-body { flex: 1; min-width: 0; }
+        .activity-header { display: flex; gap: 8px; align-items: center; margin-bottom: 3px; flex-wrap: wrap; }
+        .activity-type {
+            font-weight: 600; color: var(--accent); font-size: 0.78rem;
+            background: rgba(99,102,241,0.08); padding: 1px 7px; border-radius: 4px;
+        }
+        .activity-agent { color: var(--text-sec); font-size: 0.76rem; }
+        .activity-time { color: var(--text-sec); font-size: 0.72rem; margin-left: auto; }
+        .activity-content { color: var(--text); font-size: 0.8rem; word-break: break-all; }
+        @keyframes fadeIn { from { opacity:0; transform: translateY(-4px); } to { opacity:1; } }
+        /* ── Activity Status Indicator ── */
+        .activity-status { padding: 8px 12px; margin-bottom: 8px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; }
+        .activity-status.status-active { background: rgba(72,187,120,0.1); color: #276749; border: 1px solid rgba(72,187,120,0.2); }
+        .activity-status.status-idle { background: rgba(237,137,54,0.1); color: #c05621; border: 1px solid rgba(237,137,54,0.2); }
+        .activity-status.status-stopped { background: rgba(229,62,62,0.08); color: #c53030; border: 1px solid rgba(229,62,62,0.15); }
+        /* ── Drive Button ── */
+        .drive-btn {
+            background: rgba(99,102,241,0.1); border: 1px solid rgba(99,102,241,0.3);
+            border-radius: 6px; padding: 4px 8px; font-size: 0.9rem; cursor: pointer;
+            transition: all 0.2s; margin-left: 6px; flex-shrink: 0;
+        }
+        .drive-btn:hover { background: var(--accent); color: #fff; border-color: var(--accent); }
+        .drive-btn:active { transform: scale(0.95); }
+        /* ── Work Snapshots ── */
+        .snapshot-list { display: flex; flex-direction: column; gap: 0; }
+        .snapshot-item {
+            display: flex; align-items: flex-start; gap: 10px;
+            padding: 10px 12px; border-bottom: 1px solid var(--border);
+            font-size: 0.82rem; line-height: 1.45;
+            transition: background 0.15s;
+        }
+        .snapshot-item:last-child { border-bottom: none; }
+        .snapshot-item:hover { background: rgba(99,102,241,0.03); }
+        .snapshot-time { font-size: 0.72rem; color: var(--text-muted); white-space: nowrap; width: 56px; flex-shrink: 0; padding-top: 2px; }
+        .snapshot-body { flex: 1; min-width: 0; }
+        .snapshot-header { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+        .snapshot-agent { font-weight: 600; color: var(--accent); font-size: 0.78rem; }
+        .snapshot-title { color: var(--text); font-weight: 500; font-size: 0.82rem; }
+        .snapshot-progress { display: flex; align-items: center; gap: 8px; }
+        .snapshot-progress-track {
+            height: 6px; background: rgba(99,102,241,0.12); border-radius: 3px;
+            min-width: 60px; max-width: 120px; flex: 1; overflow: hidden;
+        }
+        .snapshot-progress-bar {
+            height: 100%; background: linear-gradient(90deg, var(--accent), #a5b4fc);
+            border-radius: 3px; transition: width 0.3s ease;
+        }
+        .snapshot-progress-text { font-size: 0.72rem; color: var(--text-muted); min-width: 28px; }
+        .snapshot-step { font-size: 0.72rem; color: var(--text-sec); background: #f1f5f9; padding: 1px 6px; border-radius: 4px; }
+        .snapshot-blockers { font-size: 0.72rem; color: #c53030; background: #fff5f5; padding: 1px 6px; border-radius: 4px; }
+        .snapshot-count { font-size: 0.72rem; color: var(--text-muted); }
+        .snapshot-delta { font-size: 0.72rem; font-weight: 700; margin-left: 4px; }
+        .snapshot-delta.up { color: #48bb78; }
+        .snapshot-delta.down { color: #e53e3e; }
+        .snapshot-delta.same { color: var(--text-muted); }
+        /* ── Scheduled Templates ── */
+        .template-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 12px; }
+        .template-card {
+            background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+            padding: 14px; transition: all 0.2s; position: relative;
+        }
+        .template-card:hover { border-color: var(--accent); box-shadow: 0 2px 8px rgba(99,102,241,0.08); }
+        .template-card.due { border-left: 3px solid var(--danger); }
+        .template-header { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; margin-bottom: 8px; }
+        .template-title { font-weight: 600; font-size: 0.9rem; color: var(--text); word-break: break-all; }
+        .template-schedule {
+            font-size: 0.72rem; font-weight: 600; color: var(--accent);
+            background: rgba(99,102,241,0.08); padding: 2px 8px; border-radius: 4px; white-space: nowrap;
+        }
+        .template-meta { display: flex; gap: 12px; font-size: 0.78rem; color: var(--text-sec); margin-bottom: 6px; flex-wrap: wrap; }
+        .template-agent { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 10px; }
+        .template-actions { display: flex; gap: 8px; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🤖 Agent TODO Server</h1>
-            <p>AI 智能体任务管理服务 - 减少上下文膨胀与任务发散</p>
-            <div class="status" id="status">⚡ 运行中</div>
-        </div>
-        
-        <div class="content">
-            <div class="section">
-                <h2>📊 服务状态</h2>
-                <div class="stats" id="stats">
-                    <div class="stat-card">
-                        <div class="stat-number" id="uptime">-</div>
-                        <div class="stat-label">运行时长</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="totalTodos">-</div>
-                        <div class="stat-label">总任务数</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="pendingTodos">-</div>
-                        <div class="stat-label">待处理</div>
-                    </div>
-                    <div class="stat-card">
-                        <div class="stat-number" id="completedTodos">-</div>
-                        <div class="stat-label">已完成</div>
-                    </div>
-                </div>
-                <button class="refresh-btn" onclick="loadStats()">🔄 刷新状态</button>
-            </div>
-            
-            <div class="section">
-                <h2>🚀 快速开始</h2>
-                <div class="tip">
-                    <h4>💡 快速入门指南</h4>
-                    <p>1. 首先创建一个智能体（Agent）</p>
-                    <p>2. 为该智能体添加 TODO 任务</p>
-                    <p>3. 通过 API 管理任务生命周期</p>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>📡 API 端点</h2>
-                
-                <div class="endpoint-group">
-                    <h3>👤 智能体管理</h3>
-                    <div class="endpoint">
-                        <span class="method post">POST</span>
-                        <span class="url">/api/agents</span>
-                        <div class="description">注册新智能体</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method get">GET</span>
-                        <span class="url">/api/agents</span>
-                        <div class="description">获取所有智能体</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method get">GET</span>
-                        <span class="url">/api/agents/:id</span>
-                        <div class="description">获取特定智能体</div>
-                    </div>
-                </div>
-                
-                <div class="endpoint-group">
-                    <h3>✅ TODO 任务管理</h3>
-                    <div class="endpoint">
-                        <span class="method post">POST</span>
-                        <span class="url">/api/agents/:agentId/todos</span>
-                        <div class="description">创建新任务</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method get">GET</span>
-                        <span class="url">/api/agents/:agentId/todos</span>
-                        <div class="description">获取所有任务（支持筛选）</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method get">GET</span>
-                        <span class="url">/api/agents/:agentId/todos/stats</span>
-                        <div class="description">获取统计信息</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method get">GET</span>
-                        <span class="url">/api/agents/:agentId/todos/search?q=keyword</span>
-                        <div class="description">搜索任务</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method put">PUT</span>
-                        <span class="url">/api/agents/:agentId/todos/:id</span>
-                        <div class="description">更新任务</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method patch">PATCH</span>
-                        <span class="url">/api/agents/:agentId/todos/:id/status</span>
-                        <div class="description">更新任务状态</div>
-                    </div>
-                    <div class="endpoint">
-                        <span class="method delete">DELETE</span>
-                        <span class="url">/api/agents/:agentId/todos/:id</span>
-                        <div class="description">删除任务</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>💻 使用示例</h2>
-                
-                <h3>创建智能体</h3>
-                <div class="example">
-<pre>
-<span class="comment"># cURL 示例</span>
-curl -X POST http://localhost:3000/api/agents \
-  -H "Content-Type: application/json" \
-  -d '{
-    "name": "claude-agent",
-    "metadata": {
-      "model": "claude-3",
-      "version": "1.0"
-    }
-  }'
-</pre>
-                </div>
-                
-                <h3>创建任务</h3>
-                <div class="example">
-<pre>
-<span class="comment"># cURL 示例</span>
-curl -X POST http://localhost:3000/api/agents/{agent_id}/todos \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "分析用户需求",
-    "description": "分析并整理用户反馈",
-    "priority": "high",
-    "context": "这是Q2季度的核心功能",
-    "tags": ["需求分析", "核心功能"]
-  }'
-</pre>
-                </div>
-                
-                <h3>查询任务（按优先级筛选）</h3>
-                <div class="example">
-<pre>
-<span class="comment"># 获取所有高优先级任务</span>
-curl "http://localhost:3000/api/agents/{agent_id}/todos?priority=high"
-</pre>
-                </div>
-            </div>
-            
-            <div class="section">
-                <h2>🎯 核心特性</h2>
-                <div class="endpoint-group">
-                    <div class="endpoint">
-                        <strong>🔢 优先级系统</strong>
-                        <div class="description">支持 4 个优先级：critical（紧急）、high（高）、medium（中）、low（低）</div>
-                    </div>
-                    <div class="endpoint">
-                        <strong>🏷️ 标签管理</strong>
-                        <div class="description">为任务添加多个标签，方便分类和筛选</div>
-                    </div>
-                    <div class="endpoint">
-                        <strong>📝 上下文追踪</strong>
-                        <div class="description">记录任务背景和来源，减少长距离复杂任务中的遗忘</div>
-                    </div>
-                    <div class="endpoint">
-                        <strong>🔍 全文搜索</strong>
-                        <div class="description">支持在标题、描述、上下文中搜索关键词</div>
-                    </div>
-                    <div class="endpoint">
-                        <strong>📊 统计报表</strong>
-                        <div class="description">实时统计任务状态分布，监控任务进度</div>
-                    </div>
-                </div>
+    <!-- Header -->
+    <div class="header">
+        <div class="header-left">
+            <h1>🤖 TODO Server Dashboard</h1>
+            <div class="header-status">
+                <span class="status-dot" id="connDot"></span>
+                <span id="connText">连接中...</span>
             </div>
         </div>
-        
-        <div class="footer">
-            <p>Agent TODO Server v1.0.0 | 为 AI 智能体打造的任务管理系统</p>
-            <p>减少上下文膨胀 | 防止任务发散 | 提升任务聚焦度</p>
+        <div class="header-actions" id="headerActions">
+            <button class="btn btn-ghost btn-sm" onclick="app.refresh()">🔄 刷新</button>
+            <button class="btn btn-ghost btn-sm" onclick="app.logout()">退出</button>
         </div>
     </div>
-    
+
+    <!-- Login Panel -->
+    <div class="main" id="loginPanel">
+        <div class="login-panel">
+            <h2>🔐 连接到 TODO Server</h2>
+            <p>选择一个智能体并输入 Secret Key 以查看 Dashboard</p>
+            <div class="form-group">
+                <label>智能体 (Agent)</label>
+                <select id="loginAgent">
+                    <option value="">加载中...</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>Secret Key</label>
+                <input type="password" id="loginSecret" placeholder="输入该智能体的 Secret Key">
+            </div>
+            <button class="btn btn-primary" style="width:100%;justify-content:center;" onclick="app.login()">连接 Dashboard</button>
+            <div class="login-error" id="loginError"></div>
+            <p style="margin-top:16px;font-size:0.8rem;color:var(--text-muted);">
+                💡 提示：任意已知 Agent 的 Secret Key 都可以查看所有 Agent 的数据（跨 Agent 协作权限）。Key 保存在 <code>~/.hermes/skills/hermes-todo-skill/agents.yaml</code>
+            </p>
+        </div>
+    </div>
+
+    <!-- Dashboard -->
+    <div class="main hidden" id="dashboard">
+        <!-- Stats -->
+        <div class="stats-grid" id="statsGrid"></div>
+
+        <!-- Stuck Alert -->
+        <div id="stuckBanner"></div>
+
+        <!-- Agent Work Panels -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">🎯 Agent 工作面板</div>
+            </div>
+            <div class="agent-grid" id="agentGrid"></div>
+        </div>
+
+        <!-- Agent Activity Stream -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">📡 智能体活动流</div>
+            </div>
+            <div id="activityStream"></div>
+        </div>
+
+        <!-- Work Snapshots -->
+        <div class="section">
+            <div class="section-header">
+                <div class="section-title">📊 工作快照 <span style="font-size:0.75rem;color:var(--text-muted);font-weight:400;">每30秒采集</span></div>
+            </div>
+            <div class="snapshot-list" id="snapshotList"></div>
+        </div>
+
+        <!-- Main Content: Tasks + Notifications -->
+        <div class="dashboard-layout">
+            <div>
+                <!-- Task List -->
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">📋 任务列表 <span class="badge" id="taskCountBadge"></span></div>
+                    </div>
+                    <div class="filters">
+                        <select id="filterStatus" onchange="app.filterTasks()">
+                            <option value="">全部状态</option>
+                            <option value="in_progress">进行中</option>
+                            <option value="pending">待处理</option>
+                            <option value="completed">已完成</option>
+                            <option value="blocked">已卡住</option>
+                            <option value="cancelled">已取消</option>
+                        </select>
+                        <select id="filterPriority" onchange="app.filterTasks()">
+                            <option value="">全部优先级</option>
+                            <option value="critical">紧急</option>
+                            <option value="high">高</option>
+                            <option value="medium">中</option>
+                            <option value="low">低</option>
+                        </select>
+                        <input type="text" id="filterSearch" placeholder="🔍 搜索任务标题..." oninput="app.filterTasks()">
+                    </div>
+                    <div class="task-list" id="taskList"></div>
+                </div>
+
+                <!-- Projects -->
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">📁 项目看板</div>
+                    </div>
+                    <div class="project-grid" id="projectGrid"></div>
+                </div>
+
+                <!-- Scheduled Templates -->
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">📅 定时任务</div>
+                    </div>
+                    <div class="template-grid" id="templateGrid"></div>
+                </div>
+            </div>
+
+            <!-- Notifications Sidebar -->
+            <div>
+                <div class="section">
+                    <div class="section-header">
+                        <div class="section-title">🔔 通知中心 <span class="badge" id="notifBadge"></span></div>
+                        <button class="btn btn-sm" style="background:var(--bg);color:var(--text-muted);border:1px solid var(--border);" onclick="app.markAllRead()">全部已读</button>
+                    </div>
+                    <div class="notif-list" id="notifList"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script>
-        function formatUptime(seconds) {
-            const days = Math.floor(seconds / 86400);
-            const hours = Math.floor((seconds % 86400) / 3600);
-            const minutes = Math.floor((seconds % 3600) / 60);
-            
-            if (days > 0) return `${days}天 ${hours}小时`;
-            if (hours > 0) return `${hours}小时 ${minutes}分钟`;
-            return `${minutes}分钟`;
-        }
-        
-        async function loadStats() {
+    const app = {
+        agents: [],
+        agentData: {}, // agentId -> { stats, focus, tasks, stuck, notifications, projects }
+        allTasks: [],
+        allNotifications: [],
+        selectedAgentId: null,
+        secretKey: null,
+        pollInterval: null,
+        expandedTasks: new Set(),
+        expandedParents: new Set(),
+
+        async init() {
+            // Try auto-login from localStorage
+            const savedAgent = localStorage.getItem('todo_dashboard_agent');
+            const savedSecret = localStorage.getItem('todo_dashboard_secret');
+
+            // Load agents list first
+            await this.loadAgents();
+
+            if (savedAgent && savedSecret) {
+                this.selectedAgentId = savedAgent;
+                this.secretKey = savedSecret;
+                const ok = await this.verifyAuth();
+                if (ok) {
+                    this.showDashboard();
+                    this.refresh();
+                    return;
+                }
+            }
+            this.showLogin();
+        },
+
+        async loadAgents() {
             try {
-                const response = await fetch('/health');
-                const data = await response.json();
-                
-                document.getElementById('uptime').textContent = formatUptime(data.uptime);
-                
-                // 尝试加载第一个智能体的统计
-                const agentsResponse = await fetch('/api/agents');
-                const agentsData = await agentsResponse.json();
-                
-                if (agentsData.data && agentsData.data.length > 0) {
-                    const firstAgent = agentsData.data[0];
-                    const statsResponse = await fetch(`/api/agents/${firstAgent.id}/todos/stats`);
-                    const statsData = await statsResponse.json();
-                    
-                    if (statsData.success) {
-                        document.getElementById('totalTodos').textContent = statsData.data.total || 0;
-                        document.getElementById('pendingTodos').textContent = statsData.data.pending || 0;
-                        document.getElementById('completedTodos').textContent = statsData.data.completed || 0;
+                const res = await fetch('/api/agents');
+                const data = await res.json();
+                this.agents = data.data || [];
+
+                const select = document.getElementById('loginAgent');
+                select.innerHTML = '<option value="">请选择智能体...</option>' +
+                    this.agents.map(a => `<option value="${a.id}">${a.name} (${a.id.slice(0,8)}...)</option>`).join('');
+            } catch (e) {
+                document.getElementById('loginAgent').innerHTML = '<option value="">无法连接到 TODO Server</option>';
+            }
+        },
+
+        async verifyAuth() {
+            try {
+                const res = await fetch(`/api/agents/${this.selectedAgentId}/todos/stats`, {
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                return res.ok;
+            } catch (e) {
+                return false;
+            }
+        },
+
+        async login() {
+            const agentId = document.getElementById('loginAgent').value;
+            const secret = document.getElementById('loginSecret').value.trim();
+            const errorEl = document.getElementById('loginError');
+
+            if (!agentId) { errorEl.textContent = '请选择一个智能体'; errorEl.style.display = 'block'; return; }
+            if (!secret) { errorEl.textContent = '请输入 Secret Key'; errorEl.style.display = 'block'; return; }
+
+            this.selectedAgentId = agentId;
+            this.secretKey = secret;
+
+            const ok = await this.verifyAuth();
+            if (!ok) {
+                errorEl.textContent = '认证失败：Secret Key 不正确或 TODO Server 未运行';
+                errorEl.style.display = 'block';
+                this.selectedAgentId = null;
+                this.secretKey = null;
+                return;
+            }
+
+            localStorage.setItem('todo_dashboard_agent', agentId);
+            localStorage.setItem('todo_dashboard_secret', secret);
+            errorEl.style.display = 'none';
+            this.showDashboard();
+            this.refresh();
+        },
+
+        logout() {
+            localStorage.removeItem('todo_dashboard_agent');
+            localStorage.removeItem('todo_dashboard_secret');
+            this.selectedAgentId = null;
+            this.secretKey = null;
+            this.agentData = {};
+            this.allTasks = [];
+            this.allNotifications = [];
+            if (this.pollInterval) { clearInterval(this.pollInterval); this.pollInterval = null; }
+            this.showLogin();
+        },
+
+        showLogin() {
+            document.getElementById('loginPanel').classList.remove('hidden');
+            document.getElementById('dashboard').classList.add('hidden');
+            document.getElementById('headerActions').classList.add('hidden');
+            document.getElementById('connDot').style.background = '#a0aec0';
+            document.getElementById('connText').textContent = '未连接';
+        },
+
+        showDashboard() {
+            document.getElementById('loginPanel').classList.add('hidden');
+            document.getElementById('dashboard').classList.remove('hidden');
+            document.getElementById('headerActions').classList.remove('hidden');
+            document.getElementById('connDot').style.background = '#48bb78';
+            document.getElementById('connText').textContent = '已连接';
+
+            // Start polling
+            if (!this.pollInterval) {
+                this.pollInterval = setInterval(() => this.refresh(), 2000);
+            }
+        },
+
+        async fetchWithAuth(path) {
+            const res = await fetch(path, {
+                headers: { 'X-Agent-Secret': this.secretKey }
+            });
+            if (!res.ok) return { success: false, error: res.status };
+            return res.json();
+        },
+
+        async refresh() {
+            if (!this.selectedAgentId || !this.secretKey) return;
+
+            document.getElementById('connText').textContent = '刷新中...';
+
+            // Sync server time to avoid browser clock drift
+            try {
+                const health = await fetch('/health').then(r => r.json());
+                this.serverNow = new Date(health.timestamp);
+            } catch (e) {
+                this.serverNow = new Date();
+            }
+
+            // Fetch all data for all agents in parallel
+            const promises = this.agents.map(async agent => {
+                const [stats, focus, tasks, stuck, notifications, projects, activities, templates, snapshots] = await Promise.all([
+                    this.fetchWithAuth(`/api/agents/${agent.id}/todos/stats`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/focus`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/todos?limit=200`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/todos/stuck/list?maxIdleMinutes=30`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/notifications`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/projects`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/contexts?limit=20`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/todos/templates`),
+                    this.fetchWithAuth(`/api/agents/${agent.id}/contexts?sessionId=work-snapshot&limit=20`),
+                ]);
+                return { agent, stats, focus, tasks, stuck, notifications, projects, activities, templates, snapshots };
+            });
+
+            const results = await Promise.all(promises);
+
+            this.agentData = {};
+            this.allTasks = [];
+            this.allNotifications = [];
+
+            for (const r of results) {
+                this.agentData[r.agent.id] = r;
+                if (r.tasks.success) {
+                    r.tasks.data.forEach(t => {
+                        t._agentId = r.agent.id;
+                        t._agentName = r.agent.name;
+                    });
+                    this.allTasks.push(...r.tasks.data);
+                }
+                // 将 focus 数据中的上下文绑定到对应任务
+                if (r.focus?.success && r.focus.data?.current_task) {
+                    const focusTaskId = r.focus.data.current_task.id;
+                    const focusTask = r.tasks.data?.find(t => t.id === focusTaskId);
+                    if (focusTask) {
+                        focusTask._focusData = r.focus.data;
                     }
                 }
-            } catch (error) {
-                console.error('加载统计信息失败:', error);
+                if (r.notifications.success) {
+                    r.notifications.data.forEach(n => {
+                        n._agentId = r.agent.id;
+                        n._agentName = r.agent.name;
+                    });
+                    this.allNotifications.push(...r.notifications.data);
+                }
             }
-        }
-        
-        // 页面加载时自动获取统计
-        window.addEventListener('load', loadStats);
+
+            this.renderStats();
+            this.renderStuckBanner();
+            this.renderAgents();
+            this.renderAgentActivities();
+            this.renderWorkSnapshots();
+            this.renderTemplates();
+            this.filterTasks();
+            this.renderNotifications();
+            this.renderProjects();
+
+            document.getElementById('connText').textContent = '已连接 · ' + new Date().toLocaleTimeString();
+        },
+
+        renderStats() {
+            let total = 0, pending = 0, inProgress = 0, completed = 0, blocked = 0, stuck = 0, unread = 0;
+
+            for (const r of Object.values(this.agentData)) {
+                if (r.stats.success) {
+                    const s = r.stats.data;
+                    total += s.total || 0;
+                    pending += s.pending || 0;
+                    inProgress += s.in_progress || 0;
+                    completed += s.completed || 0;
+                    blocked += s.blocked || 0;
+                }
+                if (r.stuck.success) stuck += r.stuck.data.length || 0;
+                if (r.notifications.success) {
+                    unread += (r.notifications.data || []).filter(n => !n.read).length;
+                }
+            }
+
+            const stats = [
+                { value: total, label: '总任务', cls: '' },
+                { value: inProgress, label: '进行中', cls: 'info' },
+                { value: pending, label: '待处理', cls: 'warning' },
+                { value: blocked, label: '已卡住', cls: 'danger' },
+                { value: stuck, label: '无心跳', cls: 'danger' },
+                { value: unread, label: '未读通知', cls: 'info' },
+            ];
+
+            document.getElementById('statsGrid').innerHTML = stats.map(s => `
+                <div class="stat-card ${s.cls}">
+                    <div class="stat-value">${s.value}</div>
+                    <div class="stat-label">${s.label}</div>
+                </div>
+            `).join('');
+        },
+
+        renderStuckBanner() {
+            const stuckTasks = [];
+            for (const r of Object.values(this.agentData)) {
+                if (r.stuck.success && r.stuck.data.length > 0) {
+                    r.stuck.data.forEach(t => stuckTasks.push({ ...t, agentName: r.agent.name }));
+                }
+            }
+
+            const el = document.getElementById('stuckBanner');
+            if (stuckTasks.length === 0) {
+                el.innerHTML = '';
+                return;
+            }
+
+            el.innerHTML = `
+                <div class="stuck-banner">
+                    <span class="stuck-banner-icon">⚠️</span>
+                    <div>
+                        <strong>发现 ${stuckTasks.length} 个任务超过 15 分钟无心跳</strong>
+                        <div style="font-size:0.85rem;margin-top:4px;">
+                            ${stuckTasks.map(t => `${t.agentName}: ${t.title}`).join('、')}
+                        </div>
+                    </div>
+                </div>
+            `;
+        },
+
+        renderAgents() {
+            const html = this.agents.map(agent => {
+                const d = this.agentData[agent.id] || {};
+                const focus = d.focus?.success ? d.focus.data : null;
+                const stats = d.stats?.success ? d.stats.data : {};
+                const inProgressTasks = (d.tasks?.success ? d.tasks.data : [])
+                    .filter(t => t.status === 'in_progress');
+                const blockedTasks = (d.tasks?.success ? d.tasks.data : [])
+                    .filter(t => t.status === 'blocked');
+
+                // Focus task info
+                let focusTitle = '无聚焦任务';
+                let focusProgress = 0;
+                let focusStep = '';
+                let focusStatus = 'idle';
+                let lastHeartbeat = '';
+                let attemptCount = 0;
+                let maxAttempts = 3;
+                let workAnalysis = null;
+
+                if (focus && focus.current_task) {
+                    focusTitle = focus.current_task.title;
+                    focusProgress = focus.current_task.heartbeat_progress || 0;
+                    focusStep = focus.current_task.heartbeat_step || '';
+                    focusStatus = focus.current_task.status;
+                    lastHeartbeat = focus.current_task.last_heartbeat;
+                    attemptCount = focus.current_task.attempt_count || 0;
+                    maxAttempts = focus.current_task.max_attempts || 3;
+                    workAnalysis = focus.work_analysis || null;
+                } else if (inProgressTasks.length > 0) {
+                    const t = inProgressTasks[0];
+                    focusTitle = t.title;
+                    focusProgress = t.heartbeat_progress || 0;
+                    focusStep = t.heartbeat_step || '';
+                    focusStatus = t.status;
+                    lastHeartbeat = t.last_heartbeat;
+                    attemptCount = t.attempt_count || 0;
+                    maxAttempts = t.max_attempts || 3;
+                }
+
+                // 获取阻塞信息
+                let blockers = [];
+                if (focus && focus.current_task && focus.current_task.heartbeat_blockers) {
+                    blockers = focus.current_task.heartbeat_blockers;
+                } else if (inProgressTasks.length > 0 && inProgressTasks[0].heartbeat_blockers) {
+                    blockers = inProgressTasks[0].heartbeat_blockers;
+                }
+
+                const idleMinutes = lastHeartbeat ? Math.floor(((this.serverNow || new Date()).getTime() - this.parseTime(lastHeartbeat).getTime()) / 60000) : null;
+                const isStuck = idleMinutes !== null && idleMinutes > 15;
+                const isStalled = idleMinutes !== null && idleMinutes > 5 && idleMinutes <= 15;
+                const cardClass = isStuck ? 'blocked' : (isStalled ? 'warning' : (focusStatus === 'in_progress' ? '' : 'offline'));
+
+                const progressClass = focusProgress >= 80 ? 'success' : (focusProgress >= 40 ? '' : (focusProgress > 0 ? 'warning' : ''));
+                const heartbeatInfo = lastHeartbeat ? this.formatDuration(idleMinutes) : '从未心跳';
+                const heartbeatColor = isStuck ? 'color:#c53030;' : (isStalled ? 'color:#ed8936;' : '');
+
+                // 智能体工作状态标签
+                let agentWorkStatusHtml = '';
+                if (workAnalysis) {
+                    const ws = workAnalysis;
+                    const wsClass = {
+                        'active': 'work-active',
+                        'idle': 'work-idle',
+                        'blocked': 'work-blocked',
+                        'blocked_with_recovery': 'work-blocked-active',
+                        'stuck': 'work-stuck',
+                        'stalled': 'work-stalled',
+                        'unknown': ''
+                    }[ws.status] || '';
+                    agentWorkStatusHtml = `<span class="agent-work-status ${wsClass}">${ws.status_label}</span>`;
+                } else if (focusStatus === 'blocked') {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-blocked">🔴 已阻塞 · ${attemptCount}/${maxAttempts}</span>`;
+                } else if (isStuck) {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-stuck">⚠️ 可能卡住</span>`;
+                } else if (isStalled) {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-stalled">⏱️ 进展缓慢</span>`;
+                } else if (blockers.length > 0) {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-blocked-active">🚧 有阻塞项</span>`;
+                } else if (focusStatus === 'in_progress' && idleMinutes !== null && idleMinutes <= 2) {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-active">⚡ 活跃工作中</span>`;
+                } else if (focusStatus === 'in_progress') {
+                    agentWorkStatusHtml = `<span class="agent-work-status work-idle">💤 空闲等待</span>`;
+                } else if (focusStatus === 'pending') {
+                    agentWorkStatusHtml = `<span class="agent-work-status">⏳ 待执行</span>`;
+                }
+
+                // 健康度
+                const healthScore = workAnalysis ? workAnalysis.health_score : 100;
+                const healthColor = healthScore >= 80 ? '#48bb78' : (healthScore >= 50 ? '#ed8936' : '#f56565');
+
+                const blockersHtml = blockers.length > 0 ? `
+                    <div style="font-size:0.8rem;color:#c53030;margin-top:6px;background:#fff5f5;padding:6px 10px;border-radius:4px;">
+                        🚧 阻塞: ${blockers.join('、')}
+                    </div>
+                ` : '';
+
+                // blocked 任务统计
+                const blockedHint = blockedTasks.length > 0
+                    ? `<span style="color:#c53030;font-weight:600;">🔴 ${blockedTasks.length} 个阻塞任务</span>`
+                    : '';
+
+                return `
+                    <div class="agent-card ${cardClass}">
+                        <div class="agent-header">
+                            <div class="agent-name">🤖 ${agent.name}</div>
+                            <span class="tag ${focusStatus === 'in_progress' ? '' : 'blocked'}">${this.statusLabel(focusStatus)}</span>
+                        </div>
+                        <div class="agent-focus">
+                            <strong>${focusTitle}</strong>
+                            ${agentWorkStatusHtml}
+                            ${workAnalysis && workAnalysis.current_action ? `<div style="margin-top:4px;font-size:0.78rem;color:var(--text-sec);">🔧 当前: ${this.escape(workAnalysis.current_action)}</div>` : ''}
+                            ${focusStep ? `<div style="margin-top:4px;font-size:0.8rem;">📝 ${focusStep}</div>` : ''}
+                            ${blockersHtml}
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill ${progressClass}" style="width:${focusProgress}%"></div>
+                        </div>
+                        <div class="agent-meta">
+                            <span>📊 ${stats.in_progress || 0} 进行中 / ${stats.total || 0} 总任务${blockedHint ? ' · ' + blockedHint : ''}</span>
+                            <span style="${heartbeatColor}">💓 ${heartbeatInfo}</span>
+                        </div>
+                        <div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:0.75rem;">
+                            <span style="color:${healthColor};font-weight:600;">❤️ 健康度 ${Math.round(healthScore)}%</span>
+                            ${workAnalysis && workAnalysis.attempts_remaining < (workAnalysis.max_attempts || 3) ?
+                                `<span style="color:var(--text-muted);">剩余重试: ${workAnalysis.attempts_remaining}</span>` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('agentGrid').innerHTML = html || '<div class="empty-state">暂无智能体</div>';
+        },
+
+        filterTasks() {
+            const status = document.getElementById('filterStatus').value;
+            const priority = document.getElementById('filterPriority').value;
+            const search = document.getElementById('filterSearch').value.trim().toLowerCase();
+
+            // 1. 对所有任务应用过滤
+            let matched = [...this.allTasks];
+            // 过滤掉模板任务（它们在"定时任务"面板单独展示）
+            matched = matched.filter(t => !t.is_template);
+            if (status) matched = matched.filter(t => t.status === status);
+            if (priority) matched = matched.filter(t => t.priority === priority);
+            if (search) matched = matched.filter(t =>
+                t.title.toLowerCase().includes(search) ||
+                (t.description && t.description.toLowerCase().includes(search))
+            );
+
+            // 2. 分离顶层任务和子任务
+            const matchedTop = matched.filter(t => !t.parent_id);
+            const matchedChildren = matched.filter(t => t.parent_id);
+
+            // 3. 需要显示的顶层任务 = 直接匹配的 + 包含匹配子任务的父任务
+            const displayTopMap = new Map();
+            for (const t of matchedTop) displayTopMap.set(t.id, t);
+            for (const c of matchedChildren) {
+                if (!displayTopMap.has(c.parent_id)) {
+                    const parent = this.allTasks.find(t => t.id === c.parent_id);
+                    if (parent) displayTopMap.set(parent.id, parent);
+                }
+            }
+
+            // 4. 排序顶层任务
+            const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+            const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
+            const displayTop = Array.from(displayTopMap.values()).sort((a, b) => {
+                const sa = statusOrder[a.status] || 99;
+                const sb = statusOrder[b.status] || 99;
+                if (sa !== sb) return sa - sb;
+                const pa = priorityOrder[a.priority] || 99;
+                const pb = priorityOrder[b.priority] || 99;
+                return pa - pb;
+            });
+
+            // 5. 统计总数（顶层 + 可见子任务）
+            let totalCount = displayTop.length;
+            for (const c of matchedChildren) {
+                if (displayTopMap.has(c.parent_id) && this.expandedParents.has(c.parent_id)) {
+                    totalCount++;
+                }
+            }
+            document.getElementById('taskCountBadge').textContent = totalCount;
+
+            // 6. 渲染：只渲染顶层任务，子任务由 renderTask 内部处理
+            const html = displayTop.map(t => this.renderTask(t)).join('');
+            document.getElementById('taskList').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">📭</div>没有符合条件的任务</div>';
+        },
+
+        renderTask(t) {
+            const isExpanded = this.expandedTasks.has(t.id);
+            const progress = t.heartbeat_progress || 0;
+            const idleMinutes = t.last_heartbeat ? Math.floor(((this.serverNow || new Date()).getTime() - this.parseTime(t.last_heartbeat).getTime()) / 60000) : null;
+            const isStuck = t.status === 'in_progress' && idleMinutes !== null && idleMinutes > 30;
+            const isStalled = t.status === 'in_progress' && idleMinutes !== null && idleMinutes > 15 && idleMinutes <= 30;
+            const hasBlockers = t.heartbeat_blockers && t.heartbeat_blockers.length > 0;
+
+            // 父子任务相关
+            const children = this.allTasks.filter(c => c.parent_id === t.id);
+            const hasChildren = children.length > 0;
+            const isParentExpanded = this.expandedParents.has(t.id);
+
+            const statusColors = {
+                pending: 'status-pending',
+                in_progress: 'status-in_progress',
+                completed: 'status-completed',
+                cancelled: 'status-cancelled',
+                blocked: 'status-blocked',
+            };
+
+            const priorityTag = t.priority ? `<span class="tag ${t.priority}">${t.priority}</span>` : '';
+            const statusTag = `<span class="tag ${t.status === 'blocked' ? 'blocked' : ''}">${this.statusLabel(t.status)}</span>`;
+
+            // 工作状态标签
+            let workStatusHtml = '';
+            if (t.status === 'blocked') {
+                workStatusHtml = `<span class="work-status work-blocked">🔴 已阻塞 · ${t.attempt_count || 0}/${t.max_attempts || 3} 次尝试</span>`;
+            } else if (isStuck) {
+                workStatusHtml = `<span class="work-status work-stuck">⚠️ 30分钟无响应 · 可能卡住</span>`;
+            } else if (isStalled) {
+                workStatusHtml = `<span class="work-status work-stalled">⏱️ ${idleMinutes}分钟无进展</span>`;
+            } else if (hasBlockers) {
+                workStatusHtml = `<span class="work-status work-blocked-active">🚧 有阻塞项 · 运行中</span>`;
+            } else if (t.status === 'in_progress' && idleMinutes !== null && idleMinutes <= 2) {
+                workStatusHtml = `<span class="work-status work-active">⚡ 活跃工作中</span>`;
+            } else if (t.status === 'in_progress') {
+                workStatusHtml = `<span class="work-status work-idle">💤 等待中</span>`;
+            }
+
+            // 列表级阻塞提示
+            const listBlockerHtml = hasBlockers
+                ? `<div class="list-blocker-hint">🚧 ${t.heartbeat_blockers.join('、')}</div>` : '';
+
+            const blockersHtml = hasBlockers
+                ? `<div class="blocker-alert">🚧 阻塞项：${t.heartbeat_blockers.join('、')}</div>` : '';
+
+            // 活跃时间友好显示
+            const activeTimeHtml = idleMinutes !== null
+                ? `<span class="active-time ${isStuck ? 'stuck' : (isStalled ? 'stalled' : '')}">💓 ${this.formatDuration(idleMinutes)}</span>`
+                : '<span class="active-time">💓 从未活跃</span>';
+
+            // 父任务展开/收拢按钮
+            const parentExpandHtml = hasChildren ? `
+                <div class="parent-toggle ${isParentExpanded ? 'open' : ''}"
+                     onclick="event.stopPropagation(); app.toggleParent('${t.id}')"
+                     title="${children.length} 个子任务">▶</div>
+            ` : '<div style="width:20px;flex-shrink:0;"></div>';
+
+            // 父任务标识
+            const parentIconHtml = hasChildren ? '<span class="parent-icon">📁</span>' : '';
+
+            // 子任务嵌套渲染
+            const childrenHtml = (hasChildren && isParentExpanded) ? `
+                <div class="task-children">
+                    ${children.map(c => this.renderChildTask(c)).join('')}
+                </div>
+            ` : '';
+
+            return `
+                <div class="task-item ${hasChildren ? 'task-parent' : ''} ${t.status === 'blocked' ? 'task-blocked' : ''} ${isStuck ? 'task-stuck' : ''}">
+                    <div class="task-main" onclick="app.toggleTask('${t.id}', '${t._agentId}')">
+                        ${parentExpandHtml}
+                        <div class="task-expand ${isExpanded ? 'open' : ''}">▶</div>
+                        <div class="task-status ${statusColors[t.status] || ''}"></div>
+                        <div class="task-info">
+                            <div class="task-title">${parentIconHtml}${this.escape(t.title)}</div>
+                            <div class="task-subtitle">
+                                ${t.heartbeat_step ? `<span class="step-badge">📝 ${this.escape(t.heartbeat_step)}</span>` : ''}
+                                ${workStatusHtml}
+                                ${listBlockerHtml}
+                                ${hasChildren && !isParentExpanded ? `<span class="child-count">📎 ${children.length} 个子任务</span>` : ''}
+                            </div>
+                        </div>
+                        <div class="task-tags">${priorityTag}${statusTag}</div>
+                        <div class="task-right">
+                            <div class="task-progress-bar-wrap">
+                                <div class="task-progress-bar" style="width:${progress}%"></div>
+                            </div>
+                            <div class="task-progress-meta">
+                                <span class="progress-value">${Math.round(progress)}%</span>
+                                ${activeTimeHtml}
+                            </div>
+                            <div class="task-agent">${t._agentName}</div>
+                            ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') ? `
+                                <button class="drive-btn" id="drive-btn-${t.id}" title="强行驱动执行" onclick="event.stopPropagation(); app.driveTask('${t._agentId}', '${t.id}')">🚀</button>
+                            ` : ''}
+                        </div>
+                    </div>
+                    <div class="task-detail ${isExpanded ? 'open' : ''}" id="detail-${t.id}">
+                        ${blockersHtml}
+                        <div class="detail-row">
+                            <div class="detail-col">
+                                <div class="detail-label">任务详情</div>
+                                <div class="detail-value">
+                                    <div>ID: <code>${t.id}</code></div>
+                                    <div>状态: ${this.statusLabel(t.status)}</div>
+                                    <div>优先级: ${t.priority || 'medium'}</div>
+                                    <div>创建时间: ${this.formatDate(t.created_at)}</div>
+                                    ${t.completed_at ? `<div>完成时间: ${this.formatDate(t.completed_at)}</div>` : ''}
+                                    ${t.last_heartbeat ? `<div>最后心跳: ${this.formatDate(t.last_heartbeat)} · ${this.formatDuration(idleMinutes)}</div>` : ''}
+                                ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') ? `
+                                    <div style="margin-top:10px;">
+                                        <button class="btn btn-primary" onclick="event.stopPropagation(); app.driveTask('${t._agentId}', '${t.id}')">🚀 强行驱动执行</button>
+                                    </div>
+                                ` : ''}
+                                    ${t.max_attempts ? `<div>最大重试: ${t.max_attempts} · 已尝试: ${t.attempt_count || 0} · 剩余: ${(t.max_attempts || 3) - (t.attempt_count || 0)}</div>` : ''}
+                                    ${t.description ? `<div style="margin-top:8px;padding:8px;background:#f8fafc;border-radius:4px;"><strong>描述:</strong> ${this.escape(t.description)}</div>` : ''}
+                                </div>
+                            </div>
+                            <div class="detail-col">
+                                <div class="detail-label">上下文</div>
+                                ${t._focusData ? `
+                                    <div class="detail-value">
+                                        ${t.context ? `<div style="margin-bottom:8px;padding:8px;background:#f8fafc;border-radius:4px;">${this.escape(t.context)}</div>` : ''}
+                                        ${t._focusData.work_analysis ? `
+                                            <div style="margin-bottom:10px;">
+                                                <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px;">工作状态分析</div>
+                                                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                                    <span class="tag ${t._focusData.work_analysis.status === 'active' ? 'success' : (t._focusData.work_analysis.status === 'blocked' ? 'blocked' : '')}">${t._focusData.work_analysis.status_label}</span>
+                                                    <span class="tag">进度 ${Math.round(t._focusData.work_analysis.progress)}%</span>
+                                                    <span class="tag">健康度 ${Math.round(t._focusData.work_analysis.health_score)}%</span>
+                                                    ${t._focusData.work_analysis.blocker_count > 0 ? `<span class="tag blocked">${t._focusData.work_analysis.blocker_count} 个阻塞项</span>` : ''}
+                                                </div>
+                                                <div style="margin-top:6px;font-size:0.8rem;color:var(--text-muted);">
+                                                    当前步骤: ${this.escape(t._focusData.work_analysis.current_step)}<br>
+                                                    ${t._focusData.work_analysis.idle_minutes > 0 ? `最后活跃: ${this.formatDuration(t._focusData.work_analysis.idle_minutes)}` : ''}
+                                                </div>
+                                            </div>
+                                        ` : ''}
+                                        ${t._focusData.recent_contexts && t._focusData.recent_contexts.length > 0 ? `
+                                            <div>
+                                                <div style="font-size:0.75rem;color:var(--text-muted);margin-bottom:4px;">最近对话 (${t._focusData.recent_contexts.length} 条)</div>
+                                                <div class="context-chat">
+                                                    ${t._focusData.recent_contexts.map(c => `
+                                                        <div class="chat-msg ${c.role}">
+                                                            <span class="chat-role">${c.role === 'user' ? '👤' : (c.role === 'assistant' ? '🤖' : '⚙️')}</span>
+                                                            <span class="chat-content">${this.escape(c.content.substring(0, 120))}${c.content.length > 120 ? '...' : ''}</span>
+                                                        </div>
+                                                    `).join('')}
+                                                </div>
+                                            </div>
+                                        ` : '<div style="font-size:0.8rem;color:var(--text-muted);">暂无对话记录</div>'}
+                                    </div>
+                                ` : `
+                                    <div class="detail-value">${this.escape(t.context || '无')}</div>
+                                `}
+                                ${t.tags && t.tags.length > 0 ? `<div style="margin-top:8px;">🏷️ ${t.tags.map(tag => `<span class="tag">${this.escape(tag)}</span>`).join('')}</div>` : ''}
+                            </div>
+                        </div>
+                        ${t.acceptance_criteria ? `
+                        <div class="detail-row">
+                            <div class="detail-col">
+                                <div class="detail-label">验收标准 ${t.criteria_confirmed ? '✅ 已确认' : '⏳ 待确认'}</div>
+                                <div class="detail-value">${this.escape(t.acceptance_criteria)}</div>
+                            </div>
+                        </div>
+                        ` : ''}
+                        <div id="subtasks-${t.id}"></div>
+                        ${(t.attempt_log && t.attempt_log.length > 0) ? `
+                        <div class="detail-row">
+                            <div class="detail-col" style="flex:2">
+                                <div class="detail-label">执行记录 (${t.attempt_log.length} 次)</div>
+                                <div class="attempt-timeline">
+                                    ${t.attempt_log.slice().reverse().map((a, i, arr) => {
+                                        const reason = a.reason || '';
+                                        let itemClass = a.success ? 'success' : 'fail';
+                                        let badgeClass = a.success ? 'badge-success' : 'badge-fail';
+                                        let badgeText = a.success ? '✅ 成功' : '❌ 失败';
+                                        if (reason.includes('手动驱动')) {
+                                            itemClass = 'manual-drive';
+                                            badgeClass = 'badge-primary';
+                                            badgeText = '🚀 手动驱动';
+                                        } else if (reason.includes('自动恢复') || reason.includes('StuckTaskMonitor')) {
+                                            itemClass = 'auto-recovery';
+                                            badgeClass = 'badge-warning';
+                                            badgeText = '🔄 自动恢复';
+                                        }
+                                        return `
+                                        <div class="timeline-item ${itemClass}">
+                                            <div class="timeline-dot"></div>
+                                            <div class="timeline-content">
+                                                <div class="timeline-header">
+                                                    <span class="timeline-time">${this.formatDate(a.timestamp)}</span>
+                                                    <span class="timeline-badge ${badgeClass}">${badgeText}</span>
+                                                </div>
+                                                <div class="timeline-reason">${this.escape(reason)}</div>
+                                                ${a.output ? `<div class="timeline-output">${this.escape(a.output)}</div>` : ''}
+                                            </div>
+                                        </div>
+                                        `;
+                                    }).join('')}
+                                </div>
+                            </div>
+                        </div>
+                        ` : ''}
+                    </div>
+                    ${childrenHtml}
+                </div>
+            `;
+        },
+
+        renderChildTask(t) {
+            const isExpanded = this.expandedTasks.has(t.id);
+            const progress = t.heartbeat_progress || 0;
+            const statusColors = {
+                pending: 'status-pending',
+                in_progress: 'status-in_progress',
+                completed: 'status-completed',
+                cancelled: 'status-cancelled',
+                blocked: 'status-blocked',
+            };
+            const statusTag = `<span class="tag ${t.status === 'blocked' ? 'blocked' : ''}" style="font-size:0.65rem;padding:1px 6px;">${this.statusLabel(t.status)}</span>`;
+
+            return `
+                <div class="task-item child-task">
+                    <div class="task-main" onclick="app.toggleTask('${t.id}', '${t._agentId}')">
+                        <div style="width:20px;flex-shrink:0;"></div>
+                        <div class="task-expand ${isExpanded ? 'open' : ''}" style="font-size:0.7rem;width:16px;height:16px;">▶</div>
+                        <div class="task-status ${statusColors[t.status] || ''}" style="width:8px;height:8px;"></div>
+                        <div class="task-info">
+                            <div class="task-title" style="font-size:0.88rem;">${this.escape(t.title)}</div>
+                            <div class="task-subtitle" style="font-size:0.78rem;">
+                                ${t.heartbeat_step ? `📝 ${this.escape(t.heartbeat_step)} · ` : ''}
+                                ${progress > 0 ? `${Math.round(progress)}% · ` : ''}
+                                ${this.statusLabel(t.status)}
+                            </div>
+                        </div>
+                        <div class="task-tags">${statusTag}</div>
+                    </div>
+                    <div class="task-detail ${isExpanded ? 'open' : ''}" id="detail-${t.id}" style="padding:0 12px 10px 44px;background:transparent;border:none;">
+                        ${t.description ? `<div style="font-size:0.82rem;color:var(--text-muted);margin-bottom:6px;">${this.escape(t.description)}</div>` : ''}
+                        ${t.acceptance_criteria ? `
+                        <div style="font-size:0.8rem;margin-bottom:6px;">
+                            <strong>验收标准</strong> ${t.criteria_confirmed ? '✅' : '⏳'}<br>
+                            ${this.escape(t.acceptance_criteria)}
+                        </div>` : ''}
+                        ${(t.attempt_log && t.attempt_log.length > 0) ? `
+                        <div style="font-size:0.75rem;color:var(--text-muted);">
+                            尝试: ${t.attempt_count || 0}/${t.max_attempts || 3}
+                        </div>` : ''}
+                    </div>
+                </div>
+            `;
+        },
+
+        toggleParent(taskId) {
+            if (this.expandedParents.has(taskId)) {
+                this.expandedParents.delete(taskId);
+            } else {
+                this.expandedParents.add(taskId);
+            }
+            this.filterTasks();
+        },
+
+        async toggleTask(taskId, agentId) {
+            const detailEl = document.getElementById(`detail-${taskId}`);
+            const isOpen = detailEl.classList.contains('open');
+
+            if (isOpen) {
+                this.expandedTasks.delete(taskId);
+                detailEl.classList.remove('open');
+            } else {
+                this.expandedTasks.add(taskId);
+                detailEl.classList.add('open');
+                // Load subtasks on demand
+                await this.loadSubtasks(taskId, agentId);
+            }
+
+            // Update expand arrow
+            const item = detailEl.closest('.task-item');
+            if (item) {
+                const arrow = item.querySelector('.task-expand');
+                if (arrow) arrow.classList.toggle('open', !isOpen);
+            }
+        },
+
+        async loadSubtasks(taskId, agentId) {
+            const container = document.getElementById(`subtasks-${taskId}`);
+            if (!container || container.dataset.loaded) return;
+
+            container.innerHTML = '<div class="loading"><div class="spinner"></div>加载子任务...</div>';
+
+            try {
+                const data = await this.fetchWithAuth(`/api/agents/${agentId}/todos/${taskId}/subtasks`);
+                container.dataset.loaded = 'true';
+
+                if (!data.success || !data.data || data.data.length === 0) {
+                    container.innerHTML = '';
+                    return;
+                }
+
+                const subtasks = data.data;
+                const completed = subtasks.filter(s => s.status === 'completed').length;
+
+                container.innerHTML = `
+                    <div class="detail-row">
+                        <div class="detail-col" style="flex:2">
+                            <div class="detail-label">子任务 (${completed}/${subtasks.length} 完成)</div>
+                            <div class="subtask-list">
+                                ${subtasks.map(s => `
+                                    <div class="subtask-item">
+                                        <div class="subtask-status ${s.status === 'completed' ? 'status-completed' : (s.status === 'in_progress' ? 'status-in_progress' : 'status-pending')}"></div>
+                                        <span>${this.escape(s.title)}</span>
+                                        <span style="margin-left:auto;font-size:0.75rem;color:var(--text-muted);">${this.statusLabel(s.status)}</span>
+                                    </div>
+                                `).join('')}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            } catch (e) {
+                container.innerHTML = '<div style="color:var(--danger);font-size:0.85rem;">加载子任务失败</div>';
+            }
+        },
+
+        renderNotifications() {
+            const unread = this.allNotifications.filter(n => !n.read);
+            document.getElementById('notifBadge').textContent = unread.length;
+
+            // Sort: unread first, then by time desc
+            const sorted = [...this.allNotifications].sort((a, b) => {
+                if (a.read !== b.read) return a.read ? 1 : -1;
+                return this.parseTime(b.created_at) - this.parseTime(a.created_at);
+            }).slice(0, 20);
+
+            const html = sorted.map(n => `
+                <div class="notif-item ${n.read ? 'read' : 'unread'}" onclick="app.markNotifRead('${n._agentId}', '${n.id}')">
+                    <div>${this.notifIcon(n.type)}</div>
+                    <div class="notif-content">
+                        <div>${this.escape(n.message)}</div>
+                        <div class="notif-time">${n._agentName} · ${this.formatDate(n.created_at)}</div>
+                    </div>
+                </div>
+            `).join('');
+
+            document.getElementById('notifList').innerHTML = html || '<div class="empty-state">暂无通知</div>';
+        },
+
+        async markNotifRead(agentId, notifId) {
+            try {
+                await fetch(`/api/agents/${agentId}/notifications/${notifId}/read`, {
+                    method: 'POST',
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                this.refresh();
+            } catch (e) {}
+        },
+
+        async markAllRead() {
+            const promises = this.agents.map(agent =>
+                fetch(`/api/agents/${agent.id}/notifications/read-all`, {
+                    method: 'POST',
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                }).catch(() => {})
+            );
+            await Promise.all(promises);
+            this.refresh();
+        },
+
+        renderProjects() {
+            // Aggregate projects from all agents
+            const projectMap = new Map();
+            for (const r of Object.values(this.agentData)) {
+                if (!r.projects?.success) continue;
+                for (const p of r.projects.data) {
+                    if (!projectMap.has(p.id)) {
+                        projectMap.set(p.id, { ...p, _agents: [] });
+                    }
+                    projectMap.get(p.id)._agents.push(r.agent.name);
+                }
+            }
+
+            const projects = Array.from(projectMap.values());
+            if (projects.length === 0) {
+                document.getElementById('projectGrid').innerHTML = '<div class="empty-state">暂无项目</div>';
+                return;
+            }
+
+            // For each project, count tasks from all agents
+            const html = projects.map(p => {
+                let total = 0, completed = 0;
+                for (const r of Object.values(this.agentData)) {
+                    if (!r.tasks?.success) continue;
+                    const projectTasks = r.tasks.data.filter(t => t.project_id === p.id);
+                    total += projectTasks.length;
+                    completed += projectTasks.filter(t => t.status === 'completed').length;
+                }
+                const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+                return `
+                    <div class="project-card">
+                        <div class="project-header">
+                            <div class="project-color" style="background:${p.color || '#667eea'}"></div>
+                            <div class="project-name">${this.escape(p.name)}</div>
+                        </div>
+                        <div class="project-stats">
+                            <span>${completed}/${total} 完成</span>
+                            <span>${pct}%</span>
+                        </div>
+                        <div class="project-bar">
+                            <div class="project-bar-fill" style="width:${pct}%;background:${p.color || '#667eea'}"></div>
+                        </div>
+                        <div class="project-agents">参与 Agent: ${[...new Set(p._agents)].join(', ')}</div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('projectGrid').innerHTML = html;
+        },
+
+        renderAgentActivities() {
+            const activities = [];
+            for (const r of Object.values(this.agentData)) {
+                if (!r.activities?.success) continue;
+                for (const a of r.activities.data) {
+                    const meta = a.metadata || {};
+                    activities.push({
+                        ...a,
+                        agentName: r.agent.name,
+                        type: meta.type || a.role || 'unknown',
+                        taskId: meta.task_id || null,
+                    });
+                }
+            }
+
+            // Sort by time desc, take latest 15
+            activities.sort((a, b) => this.parseTime(b.created_at) - this.parseTime(a.created_at));
+            const recent = activities.slice(0, 15);
+
+            if (recent.length === 0) {
+                document.getElementById('activityStream').innerHTML = '<div class="empty-state" style="padding:16px;font-size:0.85rem;">暂无智能体活动记录</div>';
+                return;
+            }
+
+            // Compute current agent status based on most recent activity
+            const now = this.serverNow || new Date();
+            let statusHtml = '';
+            if (recent.length > 0) {
+                const latest = recent[0];
+                const latestAgeMin = Math.floor((now - this.parseTime(latest.created_at)) / 60000);
+                let statusIcon = '🔴', statusText = '已停止', statusClass = 'status-stopped';
+                if (latestAgeMin < 2) {
+                    statusIcon = '🟢'; statusText = '正在工作中'; statusClass = 'status-active';
+                } else if (latestAgeMin < 10) {
+                    statusIcon = '🟡'; statusText = '可能空闲'; statusClass = 'status-idle';
+                }
+                statusHtml = `<div class="activity-status ${statusClass}">${statusIcon} ${latest.agentName} · ${statusText} · 最后活动 ${this.formatDuration(latestAgeMin)}</div>`;
+            }
+
+            const html = recent.map(a => {
+                const ageMin = Math.floor((now - this.parseTime(a.created_at)) / 60000);
+                const time = this.formatDate(a.created_at, {short:true});
+                const typeIcon = {
+                    'llm_prompt': '📤',
+                    'llm_reply': '📥',
+                    'llm_error': '❌',
+                    'task_start': '▶️',
+                    'task_recover': '🔄',
+                    'focus_switch': '🔀',
+                    'heartbeat': '💓',
+                    'auto_recover': '🔄',
+                    'user': '👤',
+                    'assistant': '🤖',
+                    'system': '⚙️',
+                }[a.type] || '📌';
+
+                const typeLabel = {
+                    'llm_prompt': '发送指令',
+                    'llm_reply': '智能体回复',
+                    'llm_error': '调用失败',
+                    'task_start': '启动任务',
+                    'task_recover': '恢复任务',
+                    'focus_switch': '切换任务',
+                    'heartbeat': '心跳更新',
+                    'auto_recover': '自动恢复',
+                    'user': '用户消息',
+                    'assistant': '智能体回复',
+                    'system': '系统消息',
+                }[a.type] || a.type;
+
+                const content = this.escape(a.content.substring(0, 120));
+                const isExpanded = content.length >= 120 ? '...' : '';
+
+                return `
+                    <div class="activity-item">
+                        <div class="activity-icon">${typeIcon}</div>
+                        <div class="activity-body">
+                            <div class="activity-header">
+                                <span class="activity-type">${typeLabel}</span>
+                                <span class="activity-agent">${a.agentName}</span>
+                                <span class="activity-time" title="${a.created_at}">${time}</span>
+                            </div>
+                            <div class="activity-content">${content}${isExpanded}</div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('activityStream').innerHTML = statusHtml + html;
+        },
+
+        renderWorkSnapshots() {
+            const snapshots = [];
+            for (const r of Object.values(this.agentData)) {
+                if (!r.snapshots?.success) continue;
+                for (const s of r.snapshots.data) {
+                    try {
+                        const payload = JSON.parse(s.content);
+                        snapshots.push({ ...payload, created_at: s.created_at, rawId: s.id });
+                    } catch (e) {}
+                }
+            }
+
+            // Sort by time desc
+            snapshots.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            const recent = snapshots.slice(0, 20);
+
+            if (recent.length === 0) {
+                document.getElementById('snapshotList').innerHTML = '<div class="empty-state" style="padding:16px;font-size:0.85rem;">暂无工作快照，等待采集...</div>';
+                return;
+            }
+
+            // Build a map of taskId -> previous progress for delta calculation
+            const prevProgress = new Map();
+            const html = recent.map((s, idx) => {
+                const time = this.formatDate(s.created_at, {short:true});
+                const focus = s.focus_task;
+                const focusTitle = focus ? this.escape(focus.title) : '无聚焦任务';
+                const progress = focus ? Math.round(focus.progress || 0) : 0;
+
+                // Calculate progress delta
+                let deltaHtml = '';
+                if (focus) {
+                    const prev = prevProgress.get(focus.id);
+                    if (prev !== undefined) {
+                        const delta = progress - prev;
+                        if (delta > 0) {
+                            deltaHtml = `<span class="snapshot-delta up">↑+${delta}%</span>`;
+                        } else if (delta < 0) {
+                            deltaHtml = `<span class="snapshot-delta down">↓${delta}%</span>`;
+                        } else {
+                            deltaHtml = `<span class="snapshot-delta same">→</span>`;
+                        }
+                    }
+                    prevProgress.set(focus.id, progress);
+                }
+
+                const stepBadge = focus && focus.step
+                    ? `<span class="snapshot-step">${this.escape(focus.step.substring(0, 30))}</span>`
+                    : '';
+                const blockersBadge = focus && focus.blockers && focus.blockers.length > 0
+                    ? `<span class="snapshot-blockers">🚧 ${focus.blockers.length} 阻塞</span>`
+                    : '';
+                const inProgressBadge = s.in_progress_count > 0
+                    ? `<span class="snapshot-count">${s.in_progress_count} 个进行中</span>`
+                    : '';
+
+                return `
+                    <div class="snapshot-item">
+                        <div class="snapshot-time">${time}</div>
+                        <div class="snapshot-body">
+                            <div class="snapshot-header">
+                                <span class="snapshot-agent">${this.escape(s.agent_name)}</span>
+                                <span class="snapshot-title">${focusTitle}</span>
+                                ${deltaHtml}
+                            </div>
+                            <div class="snapshot-progress">
+                                <div class="snapshot-progress-track">
+                                    <div class="snapshot-progress-bar" style="width:${progress}%"></div>
+                                </div>
+                                <span class="snapshot-progress-text">${progress}%</span>
+                                ${stepBadge}
+                                ${blockersBadge}
+                                ${inProgressBadge}
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('snapshotList').innerHTML = html;
+        },
+
+        renderTemplates() {
+            const allTemplates = [];
+            for (const r of Object.values(this.agentData)) {
+                if (!r.templates?.success) continue;
+                for (const t of r.templates.data) {
+                    allTemplates.push({ ...t, agentName: r.agent.name, agentId: r.agent.id });
+                }
+            }
+
+            if (allTemplates.length === 0) {
+                document.getElementById('templateGrid').innerHTML = '<div class="empty-state">暂无定时任务模板</div>';
+                return;
+            }
+
+            const html = allTemplates.map(t => {
+                const scheduleLabel = this.formatSchedule(t.schedule);
+                const nextDue = this.formatTimeUntil(t.next_due_at);
+                const lastSpawned = t.last_spawned_at ? this.formatDate(t.last_spawned_at, {short:true}) : '从未生成';
+                const isDue = t.next_due_at && this.parseTime(t.next_due_at) <= (this.serverNow || new Date());
+
+                return `
+                    <div class="template-card ${isDue ? 'due' : ''}">
+                        <div class="template-header">
+                            <div class="template-title">${this.escape(t.title)}</div>
+                            <span class="template-schedule">${scheduleLabel}</span>
+                        </div>
+                        <div class="template-meta">
+                            <span>下次: ${nextDue}</span>
+                            <span>上次: ${lastSpawned}</span>
+                        </div>
+                        <div class="template-agent">Agent: ${t.agentName}</div>
+                        <div class="template-actions">
+                            <button class="btn btn-sm" onclick="app.spawnTemplate('${t.agentId}', '${t.id}')">▶️ 立即执行</button>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            document.getElementById('templateGrid').innerHTML = html;
+        },
+
+        async spawnTemplate(agentId, templateId) {
+            if (!confirm('确定要立即执行此定时任务？')) return;
+            try {
+                const res = await fetch(`/api/agents/${agentId}/todos/${templateId}/spawn`, {
+                    method: 'POST',
+                    headers: { 'X-Agent-Secret': this.secretKey, 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                if (data.success) {
+                    alert(`已生成任务「${data.data.spawned.title}」`);
+                    this.refresh();
+                } else {
+                    alert('生成失败: ' + (data.message || '未知错误'));
+                }
+            } catch (e) {
+                alert('请求失败: ' + e.message);
+            }
+        },
+
+        async driveTask(agentId, taskId) {
+            const btn = document.getElementById(`drive-btn-${taskId}`);
+            if (btn) btn.textContent = '⏳';
+            try {
+                const res = await fetch(`/api/agents/${agentId}/todos/${taskId}/drive`, {
+                    method: 'POST',
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                const data = await res.json();
+                if (data.success) {
+                    const reply = data.data.llm_reply;
+                    const summary = reply.length > 200 ? reply.substring(0, 200) + '...' : reply;
+                    alert(`✅ 驱动成功\n\n智能体回复：\n${summary}`);
+                    this.refresh();
+                } else {
+                    alert('驱动失败: ' + (data.message || '未知错误'));
+                }
+            } catch (e) {
+                alert('请求失败: ' + e.message);
+            } finally {
+                if (btn) btn.textContent = '🚀';
+            }
+        },
+
+        formatSchedule(schedule) {
+            if (!schedule) return '—';
+            if (schedule === 'daily') return '📅 每天';
+            if (schedule.startsWith('weekly:')) {
+                const days = schedule.slice(7).split(',').map(d => ({
+                    mon: '一', tue: '二', wed: '三', thu: '四', fri: '五', sat: '六', sun: '日'
+                })[d.trim().toLowerCase()] || d).join(',');
+                return `📅 每周 ${days}`;
+            }
+            if (schedule.startsWith('cron:')) return `⏰ ${schedule.slice(5)}`;
+            // Legacy raw cron expression
+            if (/^\d+\s+\d+\s+\S+\s+\S+\s+\S+$/.test(schedule)) return `⏰ ${schedule}`;
+            return schedule;
+        },
+
+        formatTimeUntil(dateStr) {
+            if (!dateStr) return '未设置';
+            const d = this.parseTime(dateStr);
+            const now = this.serverNow || new Date();
+            const diffMs = d - now;
+            if (diffMs <= 0) return '⏰ 已到期';
+            const diffH = Math.floor(diffMs / 3600000);
+            const diffD = Math.floor(diffH / 24);
+            if (diffD === 0 && diffH < 24) return `⏰ ${diffH}小时后`;
+            if (diffD === 1) return '⏰ 明天';
+            if (diffD <= 7) return `⏰ ${diffD}天后`;
+            return `${d.getMonth()+1}/${d.getDate()} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+        },
+
+        statusLabel(status) {
+            const map = {
+                pending: '待处理',
+                in_progress: '进行中',
+                completed: '已完成',
+                cancelled: '已取消',
+                blocked: '已卡住',
+            };
+            return map[status] || status;
+        },
+
+        notifIcon(type) {
+            const map = { assigned: '📌', completed: '✅', transferred: '↗️', comment: '💬', blocked: '🚫', recovered: '🔄', stalled: '⏱️' };
+            return map[type] || '🔔';
+        },
+
+        parseTime(dateStr) {
+            if (!dateStr) return null;
+            // SQLite returns 'YYYY-MM-DD HH:MM:SS' without timezone → treat as UTC
+            if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(dateStr)) {
+                return new Date(dateStr.replace(' ', 'T') + 'Z');
+            }
+            return new Date(dateStr);
+        },
+
+        formatDate(dateStr, opts = {}) {
+            if (!dateStr) return 'N/A';
+            const d = this.parseTime(dateStr);
+            const now = this.serverNow || new Date();
+            const diff = Math.floor((now - d) / 1000);
+            const absTime = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')} ${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+            const shortTime = `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+
+            if (diff < 0) return opts.short ? '未来' : `未来 · ${absTime}`;
+            if (diff < 60) return opts.short ? '刚刚' : `刚刚 · ${shortTime}`;
+            if (diff < 3600) return opts.short ? `${Math.floor(diff/60)}分钟前` : `${Math.floor(diff/60)}分钟前 · ${shortTime}`;
+            if (diff < 86400) return opts.short ? `${Math.floor(diff/3600)}小时前` : `${Math.floor(diff/3600)}小时前 · ${shortTime}`;
+            return absTime;
+        },
+
+        formatDuration(minutes) {
+            if (minutes < 1) return '刚刚活跃';
+            if (minutes < 60) return `${minutes}分钟前活跃`;
+            const hours = Math.floor(minutes / 60);
+            const mins = minutes % 60;
+            if (hours < 24) return `${hours}小时${mins > 0 ? mins + '分钟' : ''}前活跃`;
+            const days = Math.floor(hours / 24);
+            return `${days}天前活跃`;
+        },
+
+        escape(str) {
+            if (!str) return '';
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        },
+    };
+
+    // Init on load
+    window.addEventListener('DOMContentLoaded', () => app.init());
     </script>
 </body>
 </html>

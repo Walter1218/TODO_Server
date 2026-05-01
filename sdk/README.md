@@ -209,6 +209,10 @@ if (summary.blocked > 0) {
 - `GET /api/agents/:agentId/todos/ready` - 获取可执行任务
 - `POST /api/agents/:agentId/todos/:id/dependencies` - 添加依赖
 
+### 归档与清理 API
+- `POST /api/agents/:agentId/todos/archive-old?days=30` - 归档旧任务
+- `DELETE /api/agents/:agentId/todos/archived` - 物理删除已归档任务
+
 ### 项目 API
 - `POST /api/agents/:agentId/projects` - 创建项目
 - `GET /api/agents/:agentId/projects` - 列出项目

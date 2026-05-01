@@ -69,6 +69,7 @@ function initializeSchema() {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       completed_at DATETIME,
+      expected_duration_minutes INTEGER,
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
       FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
@@ -150,6 +151,21 @@ function initializeSchema() {
     console.log('[DB] Migration: idx_todos_parent_id skipped:', err.message);
   }
 
+  // Migration: add scheduled task columns
+  const scheduledMigrations = [
+    { col: 'schedule', type: 'TEXT' },
+    { col: 'is_template', type: 'BOOLEAN DEFAULT 0' },
+  ];
+
+  for (const mig of scheduledMigrations) {
+    try {
+      database.exec(`ALTER TABLE todos ADD COLUMN ${mig.col} ${mig.type}`);
+      console.log(`[DB] Migration: todos.${mig.col} added`);
+    } catch (err) {
+      // Column already exists
+    }
+  }
+
   // Migration: add multi-agent collaboration columns
   const collaborationMigrations = [
     { col: 'origin_agent_id', type: 'TEXT' },
@@ -168,13 +184,44 @@ function initializeSchema() {
     }
   }
 
+  // Migration: add archived flag for cleanup strategy
+  try {
+    database.exec("ALTER TABLE todos ADD COLUMN archived BOOLEAN DEFAULT 0");
+    console.log('[DB] Migration: todos.archived added');
+  } catch (err) {
+    // Column already exists
+  }
+
+  // Migration: add recurring task scheduler columns
+  const schedulerMigrations = [
+    { col: 'next_due_at', type: 'DATETIME' },
+    { col: 'last_spawned_at', type: 'DATETIME' },
+  ];
+
+  for (const mig of schedulerMigrations) {
+    try {
+      database.exec(`ALTER TABLE todos ADD COLUMN ${mig.col} ${mig.type}`);
+      console.log(`[DB] Migration: todos.${mig.col} added`);
+    } catch (err) {
+      // Column already exists
+    }
+  }
+
+  // Index for efficient scheduler queries
+  try {
+    database.exec('CREATE INDEX IF NOT EXISTS idx_todos_template_due ON todos(is_template, next_due_at)');
+    console.log('[DB] Migration: idx_todos_template_due created');
+  } catch (err) {
+    console.log('[DB] Migration: idx_todos_template_due skipped:', err.message);
+  }
+
   // Create task notifications table for cross-agent collaboration
   database.exec(`
     CREATE TABLE IF NOT EXISTS task_notifications (
       id TEXT PRIMARY KEY,
       agent_id TEXT NOT NULL,
       task_id TEXT NOT NULL,
-      type TEXT CHECK(type IN ('assigned', 'completed', 'transferred', 'comment')),
+      type TEXT CHECK(type IN ('assigned', 'completed', 'transferred', 'comment', 'recovered', 'blocked', 'stalled')),
       message TEXT NOT NULL,
       read BOOLEAN DEFAULT false,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -187,6 +234,45 @@ function initializeSchema() {
 
   // Migration: update status CHECK constraint to include 'blocked'
   // SQLite doesn't support ALTER CHECK, but we can validate in application layer
+
+  // Migration: expand task_notifications type CHECK constraint to include 'recovered', 'blocked', 'stalled'
+  try {
+    const tblInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_notifications'").get();
+    if (tblInfo && tblInfo.sql && !tblInfo.sql.includes('stalled')) {
+      db.exec(`
+        PRAGMA foreign_keys=OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE task_notifications_new (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          task_id TEXT NOT NULL,
+          type TEXT CHECK(type IN ('assigned', 'completed', 'transferred', 'comment', 'recovered', 'blocked', 'stalled')),
+          message TEXT NOT NULL,
+          read BOOLEAN DEFAULT false,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+          FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
+        );
+        INSERT INTO task_notifications_new SELECT * FROM task_notifications;
+        DROP TABLE task_notifications;
+        ALTER TABLE task_notifications_new RENAME TO task_notifications;
+        CREATE INDEX IF NOT EXISTS idx_notifications_agent ON task_notifications(agent_id, read);
+        CREATE INDEX IF NOT EXISTS idx_notifications_task ON task_notifications(task_id);
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+      `);
+      console.log('[DB] Migration: task_notifications CHECK constraint updated');
+    }
+  } catch (err) {
+    console.log('[DB] Migration: task_notifications CHECK constraint skipped:', err.message);
+  }
+
+  // Migration: add expected_duration_minutes column
+  try {
+    db.prepare(`ALTER TABLE todos ADD COLUMN expected_duration_minutes INTEGER`).run();
+  } catch (e) {
+    // Column already exists, ignore
+  }
 }
 
 module.exports = { getDb };

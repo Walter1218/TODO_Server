@@ -116,6 +116,23 @@ class Context {
     const result = stmt.run(agentId, cutoff);
     return result.changes;
   }
+
+  static pruneBySession(agentId, sessionId, maxKeep = 100) {
+    const db = getDb();
+    const countStmt = db.prepare('SELECT COUNT(*) as cnt FROM contexts WHERE agent_id = ? AND session_id = ?');
+    const { cnt } = countStmt.get(agentId, sessionId);
+    if (cnt > maxKeep) {
+      const delStmt = db.prepare(`
+        DELETE FROM contexts WHERE id IN (
+          SELECT id FROM contexts WHERE agent_id = ? AND session_id = ?
+          ORDER BY created_at ASC LIMIT ?
+        )
+      `);
+      const result = delStmt.run(agentId, sessionId, cnt - maxKeep);
+      return result.changes;
+    }
+    return 0;
+  }
 }
 
 module.exports = Context;

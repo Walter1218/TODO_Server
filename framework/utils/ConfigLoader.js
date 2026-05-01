@@ -73,6 +73,7 @@ class ConfigLoader {
       base: {
         todoServerUrl: config.server?.url || 'http://localhost:3000',
         agentId: config.agent?.id || 'default-agent',
+        agentSecret: config.agent?.secretKey || null,
         enableLogging: true
       },
       features: {},
@@ -101,13 +102,29 @@ class ConfigLoader {
         provider: provider,
         apiKey: providerConfig.apiKey || null,
         groupId: providerConfig.groupId || null,
+        baseUrl: providerConfig.baseUrl || null,
         model: providerConfig.model || null,
         temperature: providerConfig.temperature ?? 0.7,
         maxTokens: providerConfig.maxTokens || 2000
       };
 
-      // 检查是否配置了 API Key
-      if (!frameworkConfig.llm.apiKey) {
+      // 拷贝 fallback 配置（如果存在）
+      if (config.llm.fallback) {
+        const fb = config.llm.fallback;
+        const fbProvider = fb.provider || 'ollama';
+        const fbProviderConfig = fb[fbProvider] || fb;
+        frameworkConfig.llm.fallback = {
+          provider: fbProvider,
+          apiKey: fbProviderConfig.apiKey || fb.apiKey || null,
+          baseUrl: fbProviderConfig.baseUrl || fb.baseUrl || null,
+          model: fbProviderConfig.model || fb.model || null,
+          temperature: fbProviderConfig.temperature ?? fb.temperature ?? 0.7,
+          maxTokens: fbProviderConfig.maxTokens || fb.maxTokens || 2000
+        };
+      }
+
+      // 检查是否配置了 API Key（ollama 等本地模型不需要 apiKey）
+      if (!frameworkConfig.llm.apiKey && provider !== 'ollama') {
         console.warn(`⚠️ LLM API Key 未配置，将使用模拟模式`);
         frameworkConfig.llm.provider = null;
       }

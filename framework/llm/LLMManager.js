@@ -10,6 +10,7 @@ class LLMManager {
   constructor(framework) {
     this.framework = framework;
     this.provider = null;
+    this.fallbackProvider = null;
     this.conversationHistory = [];
     this.maxHistoryLength = 50;
   }
@@ -19,21 +20,30 @@ class LLMManager {
    */
   async initialize() {
     const config = this.framework.config.llm;
-    
+
     if (!config || !config.provider) {
       console.warn('⚠️ LLM未配置，将使用模拟模式');
       this.provider = null;
       return;
     }
 
+    // 带超时的连接测试包装器
+    const testWithTimeout = async (provider, label, timeoutMs = 8000) => {
+      return Promise.race([
+        provider.testConnection(),
+        new Promise((_, reject) =>
+          setTimeout(() => reject(new Error('Connection test timeout')), timeoutMs)
+        )
+      ]).catch(err => ({ success: false, message: err.message }));
+    };
+
+    // 初始化主 provider
     try {
       this.provider = LLMFactory.createFromConfig(config);
-      
-      // 测试连接
-      const testResult = await this.provider.testConnection();
+
+      const testResult = await testWithTimeout(this.provider, 'primary', 8000);
       if (!testResult.success) {
-        console.warn(`⚠️ LLM连接失败: ${testResult.message}`);
-        console.warn('将使用模拟模式');
+        console.warn(`⚠️ 主 LLM (${config.provider}) 连接失败: ${testResult.message}`);
         this.provider = null;
       } else {
         this.framework.log('✅ LLM初始化成功');
@@ -41,13 +51,42 @@ class LLMManager {
         this.framework.log(`   Model: ${config.model || 'default'}`);
       }
     } catch (error) {
-      console.error(`❌ LLM初始化失败: ${error.message}`);
+      console.error(`❌ 主 LLM (${config.provider}) 初始化失败: ${error.message}`);
       this.provider = null;
+    }
+
+    // 初始化 fallback provider
+    if (config.fallback) {
+      try {
+        this.fallbackProvider = LLMFactory.createFromConfig(config.fallback);
+
+        const fallbackTest = await testWithTimeout(this.fallbackProvider, 'fallback', 15000);
+        if (!fallbackTest.success) {
+          console.warn(`⚠️ Fallback LLM (${config.fallback.provider}) 连接失败: ${fallbackTest.message}`);
+          this.fallbackProvider = null;
+        } else {
+          this.framework.log(`✅ Fallback LLM 就绪: ${config.fallback.provider} / ${config.fallback.model || 'default'}`);
+        }
+      } catch (error) {
+        console.warn(`⚠️ Fallback LLM 初始化失败: ${error.message}`);
+        this.fallbackProvider = null;
+      }
+    }
+
+    // 如果主 provider 失败但有 fallback，将 fallback 提升为主 provider
+    if (!this.provider && this.fallbackProvider) {
+      this.framework.log('🔄 主 LLM 不可用，已切换至 Fallback LLM');
+      this.provider = this.fallbackProvider;
+      this.fallbackProvider = null;
+    }
+
+    if (!this.provider && !this.fallbackProvider) {
+      console.warn('⚠️ 无可用 LLM，将使用模拟模式');
     }
   }
 
   /**
-   * 发送聊天请求
+   * 发送聊天请求（带 fallback）
    */
   async chat(params) {
     const { messages, system, userContent } = params;
@@ -72,9 +111,31 @@ class LLMManager {
         usage: result.usage,
         finishReason: result.finishReason || result.stopReason
       };
-    } catch (error) {
-      console.error(`❌ LLM请求失败: ${error.message}`);
-      throw error;
+    } catch (primaryError) {
+      console.error(`❌ 主 LLM 请求失败: ${primaryError.message}`);
+
+      // 尝试 fallback provider
+      if (this.fallbackProvider) {
+        console.log(`🔄 尝试 Fallback LLM...`);
+        try {
+          const fallbackResult = await this.fallbackProvider.chat({
+            messages,
+            system
+          });
+
+          console.log(`✅ Fallback LLM 响应成功`);
+          return {
+            content: fallbackResult.content,
+            usage: fallbackResult.usage,
+            finishReason: fallbackResult.finishReason || fallbackResult.stopReason
+          };
+        } catch (fallbackError) {
+          console.error(`❌ Fallback LLM 也失败: ${fallbackError.message}`);
+          throw fallbackError;
+        }
+      }
+
+      throw primaryError;
     }
   }
 
@@ -191,10 +252,10 @@ class LLMManager {
   }
 
   /**
-   * 是否有有效LLM
+   * 是否有有效LLM（含 fallback）
    */
   hasProvider() {
-    return this.provider !== null;
+    return this.provider !== null || this.fallbackProvider !== null;
   }
 }
 

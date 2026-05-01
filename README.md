@@ -131,6 +131,8 @@ TODO_Server/
 │       ├── todo_skill.py         # Python CLI
 │       ├── todo_skill_config.yaml
 │       └── agents.yaml           # Profile → Agent 凭证映射
+├── scripts/
+│   └── setup.js                  # 安装向导
 ├── public/                       # Web 管理界面（可选）
 ├── data/                         # SQLite 数据库（自动创建）
 ├── logs/                         # 日志目录（自动创建）
@@ -199,7 +201,12 @@ POST /api/agents/:id/contexts      # 存储消息
 GET  /api/agents/:id/contexts      # 按 session 查询
 ```
 
-### 9. 项目看板
+### 9. 自动运维监控
+- **StuckTaskMonitor**：每 5 分钟自动扫描，超过 30 分钟无心跳的 `in_progress` 任务自动标记为 `blocked`
+- **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
+- **手动管理**：`POST /archive-old?days=30` 手动归档，`DELETE /archived` 物理清理已归档任务
+
+### 10. 项目看板
 ```http
 GET /api/agents/:id/projects/:id/board
 ```
@@ -231,6 +238,8 @@ GET /api/agents/:id/projects/:id/board
 | GET | `/api/agents/:id/todos/assigned` | 指派给我的 |
 | GET | `/api/agents/:id/todos/created` | 我创建的 |
 | GET | `/api/agents/:id/todos/stuck/list` | 卡住的任务 |
+| POST | `/api/agents/:id/todos/archive-old` | 归档旧任务 |
+| DELETE | `/api/agents/:id/todos/archived` | 删除已归档任务 |
 
 ### 聚焦
 | 方法 | 路径 | 说明 |
@@ -359,6 +368,8 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 | 多智能体指派 | ✅ | ✅ | - | ✅ | 跨 agent |
 | 跨 agent 通知 | ✅ | ✅ | - | ✅ | assigned/transferred |
 | 上下文存储 | ✅ | ✅ | ✅ | ✅ | 按 session |
+| 自动 stuck 处理 | ✅ | - | - | - | 服务端定时器 |
+| 任务归档清理 | ✅ | - | - | - | 软删除 + 自动归档 |
 | 熔断 + 本地缓存 | - | - | ✅ | - | 3 次失败降级 |
 | LLM 集成 | - | - | ✅ | - | MiniMax/OpenAI/Claude |
 

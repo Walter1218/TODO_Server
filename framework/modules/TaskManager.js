@@ -19,7 +19,8 @@ class TaskManager {
     const AgentTODOSDK = require('../../sdk/agent-todo-sdk.js');
     this.todo = new AgentTODOSDK(
       this.framework.config.base.todoServerUrl,
-      this.framework.config.base.agentId
+      this.framework.config.base.agentId,
+      this.framework.config.base.agentSecret
     );
     
     this.framework.log('✅ TaskManager 模块已初始化');
@@ -77,10 +78,11 @@ class TaskManager {
         priority: options.priority || this.framework.config.features.taskManagement.priority,
         context: options.context,
         tags: options.tags,
-        projectId: options.projectId
+        projectId: options.projectId,
+        parentId: options.parentId
       });
 
-      this.framework.log(`✅ 任务已创建: ${options.title}`);
+      this.framework.log(`✅ 任务已创建: ${options.title}${options.parentId ? ' (子任务)' : ''}`);
       return result.data;
     } catch (error) {
       this.framework.log(`❌ 创建任务失败: ${error.message}`);
@@ -343,10 +345,18 @@ ${existingTitles || '（无）'}
 2. 忽略闲聊、假设性讨论、已经明确在做的任务
 3. 如果事项已经在"已有任务列表"中，不要重复提取
 4. 每个任务应该有清晰的标题和合理的优先级
+5. 如果某个任务比较复杂（需要多个步骤才能完成），请将其拆分为一个父任务和若干子任务
+
+子任务拆分规则：
+- 父任务：描述整体目标（如"完成数据同步模块"）
+- 子任务：描述具体步骤（如"编写API接口"、"编写单元测试"）
+- 子任务通过 parentTitle 字段关联到父任务的标题
 
 返回纯JSON数组：
 [
-  {"title": "任务标题", "priority": "high/medium/low", "context": "补充说明", "tags": ["标签"], "acceptance_criteria": "验收标准"}
+  {"title": "父任务标题", "priority": "high/medium/low", "context": "补充说明", "tags": ["标签"], "acceptance_criteria": "验收标准"},
+  {"title": "子任务1", "priority": "high", "context": "...", "parentTitle": "父任务标题"},
+  {"title": "子任务2", "priority": "medium", "context": "...", "parentTitle": "父任务标题"}
 ]
 没有新任务则返回空数组：[]`;
 

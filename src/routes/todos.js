@@ -1,6 +1,9 @@
 const express = require('express');
 const Agent = require('../models/Agent');
 const Todo = require('../models/Todo');
+const FocusState = require('../models/FocusState');
+const Context = require('../models/Context');
+const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
 
 const router = express.Router({ mergeParams: true });
 
@@ -17,10 +20,38 @@ router.use((req, res, next) => {
   next();
 });
 
+// Patrol task detector: force critical priority for patrol/inspection tasks
+function isPatrolTask(title, tags) {
+  if (title && title.includes('巡检')) return true;
+  if (Array.isArray(tags) && tags.some(t => t === '巡检' || t === 'patrol')) return true;
+  return false;
+}
+
+function enforcePatrolPriority(title, tags, priority) {
+  if (isPatrolTask(title, tags)) {
+    return 'critical';
+  }
+  return priority;
+}
+
+// Schedule format validator: daily | weekly:mon,tue,... | cron:expr | raw cron expr (legacy)
+function validateSchedule(schedule) {
+  if (!schedule) return null;
+  const validDaily = schedule === 'daily';
+  const validWeekly = /^weekly:(sun|mon|tue|wed|thu|fri|sat)(,(sun|mon|tue|wed|thu|fri|sat))*$/i.test(schedule);
+  const validCron = /^cron:\S+/.test(schedule);
+  // Legacy support: raw 5-part cron expression like "0 18 * * *"
+  const validLegacyCron = /^\d+\s+\d+\s+\S+\s+\S+\s+\S+$/.test(schedule);
+  if (!validDaily && !validWeekly && !validCron && !validLegacyCron) {
+    return 'Invalid schedule format. Use: "daily", "weekly:mon,fri", or "cron:0 9 * * *"';
+  }
+  return null;
+}
+
 router.post('/', (req, res) => {
   try {
     const { agentId } = req.params;
-    const { title, description, priority, context, tags, dependencies, projectId, position } = req.body;
+    const { title, description, priority, context, tags, dependencies, projectId, position, schedule, isTemplate, assignedAgentId } = req.body;
 
     if (!title) {
       return res.status(400).json({
@@ -64,10 +95,24 @@ router.post('/', (req, res) => {
       }
     }
 
+    if (schedule) {
+      const schedErr = validateSchedule(schedule);
+      if (schedErr) {
+        return res.status(400).json({ error: 'Validation error', message: schedErr });
+      }
+    }
+
+    // Auto-create target agent if assignedAgentId provided and not exists
+    if (assignedAgentId && !Agent.exists(assignedAgentId)) {
+      Agent.create({ id: assignedAgentId, name: assignedAgentId, metadata: { auto_created: true } });
+    }
+
+    const finalPriority = enforcePatrolPriority(title, tags, priority);
+
     const todo = Todo.create(agentId, {
       title,
       description,
-      priority,
+      priority: finalPriority,
       context,
       tags,
       dependencies,
@@ -76,12 +121,19 @@ router.post('/', (req, res) => {
       position,
       acceptanceCriteria: req.body.acceptanceCriteria,
       criteriaConfirmed: req.body.criteriaConfirmed,
-      maxAttempts: req.body.maxAttempts
+      maxAttempts: req.body.maxAttempts,
+      schedule,
+      isTemplate,
+      assignedAgentId
     });
+
+    // 创建任务后自动重新评估聚焦
+    const focus = FocusState.autoFocus(agentId);
 
     res.status(201).json({
       success: true,
-      data: todo
+      data: todo,
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
     console.error('Error creating TODO:', error);
@@ -95,12 +147,15 @@ router.post('/', (req, res) => {
 router.get('/', (req, res) => {
   try {
     const { agentId } = req.params;
-    const { status, priority, tags, limit, offset } = req.query;
+    const { status, priority, tags, limit, offset, projectId, isTemplate, title } = req.query;
 
     const filters = {};
     if (status) filters.status = status;
     if (priority) filters.priority = priority;
     if (tags) filters.tags = tags.split(',').map(t => t.trim());
+    if (projectId) filters.projectId = projectId;
+    if (isTemplate !== undefined) filters.isTemplate = isTemplate === 'true' || isTemplate === '1';
+    if (title) filters.title = title;
     if (limit) filters.limit = parseInt(limit);
     if (offset) filters.offset = parseInt(offset);
 
@@ -205,6 +260,18 @@ router.get('/ready', (req, res) => {
   }
 });
 
+// --- 定时调度任务路由：查询模板任务 ---
+router.get('/templates', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const templates = Todo.findTemplates(agentId);
+    res.json({ success: true, data: templates, count: templates.length });
+  } catch (error) {
+    console.error('Error fetching templates:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
 // --- 多智能体协作路由：查询被指派的任务 ---
 router.get('/assigned', (req, res) => {
   try {
@@ -259,9 +326,13 @@ router.delete('/:id', (req, res) => {
     // Idempotent: return success even if already deleted
     Todo.delete(agentId, id);
 
+    // 删除任务后自动重新评估聚焦
+    const focus = FocusState.autoFocus(agentId);
+
     res.json({
       success: true,
-      message: 'TODO deleted successfully'
+      message: 'TODO deleted successfully',
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
     console.error('Error deleting TODO:', error);
@@ -288,10 +359,14 @@ router.patch('/:id/complete', (req, res) => {
     // Auto-complete parent if all subtasks done
     const parentCompleted = Todo.checkAndCompleteParent(agentId, id);
 
+    // 完成任务后自动切换到下一个可执行任务
+    const focus = FocusState.autoFocus(agentId);
+
     res.json({
       success: true,
       data: todo,
-      parent_auto_completed: parentCompleted
+      parent_auto_completed: parentCompleted,
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
     console.error('Error completing TODO:', error);
@@ -314,11 +389,11 @@ router.patch('/:id/status', (req, res) => {
       });
     }
 
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled'];
+    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled'
+        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled, blocked'
       });
     }
 
@@ -331,9 +406,16 @@ router.patch('/:id/status', (req, res) => {
 
     const todo = Todo.updateStatus(agentId, id, status);
 
+    // 状态变更为 completed / in_progress / cancelled 时重新评估聚焦
+    let focus = null;
+    if (['completed', 'in_progress', 'cancelled'].includes(status)) {
+      focus = FocusState.autoFocus(agentId);
+    }
+
     res.json({
       success: true,
-      data: todo
+      data: todo,
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
     console.error('Error updating TODO status:', error);
@@ -421,7 +503,7 @@ router.get('/:id/dependency-tree', (req, res) => {
 router.put('/:id', (req, res) => {
   try {
     const { agentId, id } = req.params;
-    const { title, description, status, priority, context, tags, dependencies, projectId, position } = req.body;
+    const { title, description, status, priority, context, tags, dependencies, projectId, position, schedule, isTemplate } = req.body;
 
     if (!Todo.findById(agentId, id)) {
       return res.status(404).json({
@@ -471,11 +553,24 @@ router.put('/:id', (req, res) => {
       }
     }
 
+    if (schedule !== undefined) {
+      const schedErr = validateSchedule(schedule);
+      if (schedErr) {
+        return res.status(400).json({ error: 'Validation error', message: schedErr });
+      }
+    }
+
+    // For updates, check both the incoming title/tags and the existing task
+    const existingTask = Todo.findById(agentId, id);
+    const checkTitle = title !== undefined ? title : existingTask?.title;
+    const checkTags = tags !== undefined ? tags : existingTask?.tags;
+    const finalPriority = enforcePatrolPriority(checkTitle, checkTags, priority);
+
     const todo = Todo.update(agentId, id, {
       title,
       description,
       status,
-      priority,
+      priority: finalPriority,
       context,
       tags,
       dependencies,
@@ -489,18 +584,147 @@ router.put('/:id', (req, res) => {
       attemptLog: req.body.attemptLog,
       heartbeatProgress: req.body.heartbeatProgress,
       heartbeatStep: req.body.heartbeatStep,
-      heartbeatBlockers: req.body.heartbeatBlockers
+      heartbeatBlockers: req.body.heartbeatBlockers,
+      schedule,
+      isTemplate
     });
+
+    // 如果状态发生变化，重新评估聚焦
+    let focus = null;
+    if (status !== undefined) {
+      focus = FocusState.autoFocus(agentId);
+    }
 
     res.json({
       success: true,
-      data: todo
+      data: todo,
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
     console.error('Error updating TODO:', error);
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to update TODO'
+    });
+  }
+});
+
+// --- 定时调度任务路由：手动触发模板实例化 ---
+router.post('/:id/spawn', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const todo = Todo.findById(agentId, id);
+    if (!todo) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+    if (!todo.is_template) {
+      return res.status(400).json({ error: 'Validation error', message: 'Task is not a template' });
+    }
+
+    const spawned = Todo.spawnFromTemplate(agentId, id);
+
+    // Auto-focus after spawning
+    const focus = FocusState.autoFocus(agentId);
+
+    res.json({
+      success: true,
+      data: { template: todo, spawned },
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
+    });
+  } catch (error) {
+    console.error('Error spawning from template:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 手动驱动任务路由：强行触发智能体执行 ---
+router.post('/:id/drive', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const todo = Todo.findById(agentId, id);
+    if (!todo) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    if (todo.status === 'completed' || todo.status === 'cancelled') {
+      return res.status(400).json({ error: 'Validation error', message: 'Task is already completed or cancelled' });
+    }
+
+    // 1. 状态处理
+    if (todo.status === 'blocked') {
+      const maxAttempts = todo.max_attempts || 3;
+      const currentAttempts = todo.attempt_count || 0;
+      if (currentAttempts >= maxAttempts) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: `Task has reached max attempts (${maxAttempts})`
+        });
+      }
+      // 恢复为 in_progress
+      Todo.update(agentId, id, {
+        status: 'in_progress',
+        attemptCount: currentAttempts + 1,
+        attemptLog: [...(todo.attempt_log || []), {
+          timestamp: new Date().toISOString(),
+          success: true,
+          reason: '用户手动驱动恢复',
+          output: 'Manual drive recovery'
+        }]
+      });
+    } else if (todo.status === 'pending') {
+      Todo.updateStatus(agentId, id, 'in_progress');
+    }
+
+    // 2. 获取 Framework 实例
+    const framework = req.app.get('driveFramework');
+    if (!framework || !framework.initialized) {
+      return res.status(503).json({
+        error: 'Service unavailable',
+        message: 'Framework not initialized, cannot drive task'
+      });
+    }
+
+    // 3. 构建 Work Prompt
+    const refreshedTask = Todo.findById(agentId, id);
+    const workPrompt = buildDrivePrompt(refreshedTask, { isManual: true });
+
+    // 4. 调用 LLM
+    const result = await framework.processMessage(workPrompt);
+    const reply = result.response.message;
+
+    // 5. 解析回复并更新心跳
+    const parsed = parseHeartbeatReply(refreshedTask, reply);
+    if (parsed.changed) {
+      Todo.updateHeartbeat(agentId, id, {
+        progress: parsed.progress,
+        step: parsed.step,
+        blockers: parsed.blockers
+      });
+    }
+
+    // 6. 写入 contexts 记录
+    Context.create(agentId, {
+      sessionId: 'manual-drive',
+      role: 'system',
+      content: `[手动驱动] 任务「${refreshedTask.title}」被执行\n\n智能体回复:\n${reply.substring(0, 500)}`,
+      metadata: { type: 'manual_drive', task_id: id, reply_length: reply.length }
+    });
+
+    // 7. 返回结果
+    res.json({
+      success: true,
+      data: {
+        task: Todo.findById(agentId, id),
+        llm_reply: reply,
+        heartbeat_updated: parsed.changed,
+        parsed: { progress: parsed.progress, step: parsed.step, blockers: parsed.blockers }
+      }
+    });
+  } catch (error) {
+    console.error('Error driving task:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: error.message || 'Failed to drive task'
     });
   }
 });
@@ -558,6 +782,64 @@ router.get('/:id/subtasks', (req, res) => {
     res.json({ success: true, data: subtasks, count: subtasks.length });
   } catch (error) {
     console.error('Error fetching subtasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 新增路由：安全追加子任务（方案重构时拆分工作项） ---
+router.post('/:id/sub-tasks', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { title, description, priority, context, tags, assignedAgentId } = req.body;
+
+    // 验证父任务存在
+    const parent = Todo.findById(agentId, id);
+    if (!parent) {
+      return res.status(404).json({ error: 'Not found', message: 'Parent TODO not found' });
+    }
+
+    if (!title) {
+      return res.status(400).json({ error: 'Validation error', message: 'Sub-task title is required' });
+    }
+
+    const validPriorities = ['low', 'medium', 'high', 'critical'];
+    if (priority && !validPriorities.includes(priority)) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'Invalid priority. Must be one of: low, medium, high, critical'
+      });
+    }
+
+    // 自动创建目标 agent（如果指定了且不存在）
+    if (assignedAgentId && !Agent.exists(assignedAgentId)) {
+      Agent.create({ id: assignedAgentId, name: assignedAgentId, metadata: { auto_created: true } });
+    }
+
+    // 子任务继承父任务的项目ID，优先级默认与父任务相同
+    const subtask = Todo.create(agentId, {
+      title,
+      description,
+      priority: priority || parent.priority || 'medium',
+      context,
+      tags: tags || [],
+      parentId: id,
+      projectId: parent.project_id,
+      assignedAgentId
+    });
+
+    // 更新父任务心跳，记录新增了子任务
+    Todo.updateHeartbeat(agentId, id, {
+      step: parent.heartbeat_step || '进行中',
+      blockers: [...(parent.heartbeat_blockers || []), `新增子任务: ${title}`]
+    });
+
+    res.status(201).json({
+      success: true,
+      data: subtask,
+      message: '子任务已创建'
+    });
+  } catch (error) {
+    console.error('Error creating sub-task:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
@@ -639,5 +921,30 @@ router.post('/:id/transfer', (req, res) => {
 });
 
 
+
+// --- 管理路由：手动归档旧任务 ---
+router.post('/archive-old', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const daysOld = parseInt(req.query.days) || 30;
+    const archived = Todo.archiveOldCompleted(agentId, daysOld);
+    res.json({ success: true, archived, message: `已归档 ${archived} 个超过 ${daysOld} 天的旧任务` });
+  } catch (error) {
+    console.error('Error archiving old tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 管理路由：物理删除已归档任务 ---
+router.delete('/archived', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const deleted = Todo.purgeArchived(agentId);
+    res.json({ success: true, deleted, message: `已删除 ${deleted} 个已归档任务` });
+  } catch (error) {
+    console.error('Error purging archived tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
 
 module.exports = router;

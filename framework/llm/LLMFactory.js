@@ -7,6 +7,7 @@
 const OpenAIProvider = require('./OpenAIProvider');
 const AnthropicProvider = require('./AnthropicProvider');
 const MiniMaxProvider = require('./MiniMaxProvider');
+const OllamaProvider = require('./OllamaProvider');
 
 class LLMFactory {
   /**
@@ -26,8 +27,11 @@ class LLMFactory {
       case 'minimax':
         return new MiniMaxProvider(config);
 
+      case 'ollama':
+        return new OllamaProvider(config);
+
       default:
-        throw new Error(`Unknown LLM provider: ${provider}. Supported providers: openai, anthropic, minimax`);
+        throw new Error(`Unknown LLM provider: ${provider}. Supported providers: openai, anthropic, minimax, ollama`);
     }
   }
 
@@ -48,7 +52,7 @@ class LLMFactory {
    * 获取支持的提供者列表
    */
   static getSupportedProviders() {
-    return ['openai', 'anthropic', 'minimax'];
+    return ['openai', 'anthropic', 'minimax', 'ollama'];
   }
 
   /**
@@ -76,6 +80,15 @@ class LLMFactory {
         return {
           provider: 'minimax',
           model: 'MiniMax-Text-01',
+          temperature: 0.7,
+          maxTokens: 2000
+        };
+
+      case 'ollama':
+        return {
+          provider: 'ollama',
+          model: 'Qwen3.5_9b_f16:latest',
+          baseUrl: 'http://localhost:11434/v1',
           temperature: 0.7,
           maxTokens: 2000
         };

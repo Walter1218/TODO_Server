@@ -60,15 +60,27 @@ class FocusState {
   static autoFocus(agentId) {
     const db = getDb();
 
-    // Get all non-completed todos for this agent
+    // Get tasks for this agent:
+    // 1. Own tasks that are unassigned (assigned_agent_id IS NULL)
+    // 2. Own tasks assigned to self (assigned_agent_id = agentId)
+    // 3. Tasks assigned to this agent by others (assigned_agent_id = agentId)
+    // Include blocked tasks that still have retry attempts remaining
     const stmt = db.prepare(`
       SELECT * FROM todos
-      WHERE agent_id = ? AND status IN ('pending', 'in_progress')
+      WHERE (
+          (agent_id = ? AND (assigned_agent_id IS NULL OR assigned_agent_id = ?))
+          OR assigned_agent_id = ?
+        )
+        AND (
+          status IN ('pending', 'in_progress')
+          OR (status = 'blocked' AND attempt_count < max_attempts)
+        )
+        AND (is_template = 0 OR is_template IS NULL)
       ORDER BY
         CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
         created_at ASC
     `);
-    const todos = stmt.all(agentId);
+    const todos = stmt.all(agentId, agentId, agentId);
 
     if (todos.length === 0) {
       return null;
@@ -155,14 +167,42 @@ class FocusState {
   }
 
   static getFocusContext(agentId) {
-    const state = this.findByAgent(agentId);
+    let state = this.findByAgent(agentId);
+
+    // 没有聚焦记录时自动尝试聚焦，保证前后端行为一致
     if (!state || !state.current_task_id) {
-      return null;
+      const reevaluated = this.autoFocus(agentId);
+      if (!reevaluated) {
+        return null;
+      }
+      state = this.findByAgent(agentId);
+      if (!state) return null;
     }
 
-    const currentTask = Todo.findById(agentId, state.current_task_id);
+    let currentTask = Todo.findById(agentId, state.current_task_id);
     if (!currentTask) {
-      return null;
+      // 当前聚焦的任务已不存在（被删除或归档），清理并尝试自动重新聚焦
+      this.createOrUpdate(agentId, { currentTaskId: null });
+      const reevaluated = this.autoFocus(agentId);
+      if (reevaluated) {
+        currentTask = reevaluated;
+        state = this.findByAgent(agentId);
+      } else {
+        return null;
+      }
+    }
+
+    // If current focus is a template task, re-evaluate via autoFocus
+    if (currentTask.is_template === 1) {
+      const reevaluated = this.autoFocus(agentId);
+      if (reevaluated) {
+        currentTask = reevaluated;
+        state = this.findByAgent(agentId);
+      } else {
+        // No eligible task found — clear the invalid focus
+        this.createOrUpdate(agentId, { currentTaskId: null });
+        return null;
+      }
     }
 
     // Get parent task if exists
