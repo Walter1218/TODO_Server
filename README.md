@@ -94,37 +94,44 @@ curl http://localhost:3000/health
 ```
 TODO_Server/
 ├── src/                          # TODO Server API
-│   ├── server.js                 # Express 服务器入口
-│   ├── db.js                     # SQLite 数据库（WAL 模式）
-│   ├── middleware/
-│   │   └── auth.js               # Agent 认证中间件
+│   ├── server.js                 # Express 服务器入口 + 认证中间件
+│   ├── db.js                     # SQLite 数据库（WAL 模式 + 自动迁移）
 │   ├── models/                   # 数据模型
 │   │   ├── Agent.js              # 智能体 CRUD + secret_key
-│   │   ├── Todo.js               # 任务 CRUD + 协作方法
+│   │   ├── Todo.js               # 任务 CRUD + 协作 + 调度 + 归档
 │   │   ├── Project.js            # 项目 CRUD
 │   │   ├── FocusState.js         # 聚焦状态管理
 │   │   ├── Context.js            # 对话上下文存储
 │   │   └── Notification.js       # 跨 agent 通知
-│   └── routes/                   # API 路由
-│       ├── agents.js             # 智能体注册
-│       ├── todos.js              # 任务 CRUD + 指派/转交
-│       ├── projects.js           # 项目 + 全局看板
-│       ├── focus.js              # 聚焦引擎
-│       ├── contexts.js           # 上下文存储
-│       └── notifications.js      # 通知管理
+│   ├── routes/                   # API 路由
+│   │   ├── agents.js             # 智能体注册
+│   │   ├── todos.js              # 任务 CRUD + 指派/转交/心跳/驱动
+│   │   ├── projects.js           # 项目 + 全局看板
+│   │   ├── focus.js              # 聚焦引擎
+│   │   ├── contexts.js           # 上下文存储
+│   │   └── notifications.js      # 通知管理
+│   └── utils/
+│       └── driveHelper.js        # 手动驱动任务辅助（Prompt 构建）
 ├── sdk/
-│   └── agent-todo-sdk.js         # JavaScript SDK
-├── framework/                    # 可选：内置框架客户端
-│   ├── core/Framework.js         # 主框架（LLM 驱动）
+│   └── agent-todo-sdk.js         # JavaScript SDK（完整 CRUD + 协作 + 调度）
+├── framework/                    # 可选：内置框架客户端（LLM 驱动）
+│   ├── core/Framework.js         # 主框架（熔断 + 本地缓存 + 状态机）
 │   ├── modules/
 │   │   ├── TaskManager.js        # 任务管理
 │   │   ├── ContextManager.js     # 上下文管理
-│   │   ├── MemoryManager.js      # 记忆管理
-│   │   ├── PromptManager.js      # Prompt 增强
+│   │   ├── MemoryManager.js      # 记忆管理（内存 + 文件持久化）
+│   │   ├── PromptManager.js      # Prompt 增强 + 角色模板
 │   │   └── ProactiveManager.js   # 主动交互 + 漂移检测
-│   └── utils/ConfigLoader.js     # 配置加载器
-├── scripts/
-│   └── setup.js                  # 安装向导
+│   ├── llm/                      # LLM Provider 抽象层
+│   │   ├── LLMProvider.js        # 基类
+│   │   ├── MiniMaxProvider.js    # MiniMax 适配
+│   │   ├── OpenAIProvider.js     # OpenAI 适配
+│   │   ├── AnthropicProvider.js  # Anthropic 适配
+│   │   ├── OllamaProvider.js     # Ollama 本地模型适配
+│   │   ├── LLMFactory.js         # Provider 工厂
+│   │   └── LLMManager.js         # 管理器（主备切换）
+│   ├── utils/ConfigLoader.js     # 配置加载器
+│   └── examples/                 # 集成示例
 ├── skills/
 │   └── hermes-todo-skill/        # Hermes Skill 接入层
 │       ├── SKILL.md              # Skill 定义
@@ -133,14 +140,15 @@ TODO_Server/
 │       └── agents.yaml           # Profile → Agent 凭证映射
 ├── scripts/
 │   └── setup.js                  # 安装向导
-├── public/                       # Web 管理界面（可选）
-├── data/                         # SQLite 数据库（自动创建）
-├── logs/                         # 日志目录（自动创建）
-├── .env                          # 环境变量（setup 生成）
+├── public/                       # Web 管理界面
+├── data/                         # SQLite 数据库（自动创建，已 gitignore）
+├── logs/                         # 日志目录（自动创建，已 gitignore）
+├── .env                          # 环境变量（setup 生成，已 gitignore）
 ├── .env.example                  # 环境变量模板
-├── config.json                   # 框架配置（setup 生成）
+├── config.json                   # 框架配置（setup 生成，已 gitignore）
 ├── config.example.json           # 配置示例
-└── start.js                      # 框架客户端启动脚本
+├── start.js                      # 框架客户端启动脚本
+└── agent-worker.js               # Worker 执行模式入口
 ```
 
 ## 🎯 核心功能
@@ -150,11 +158,13 @@ TODO_Server/
 - 4 级优先级：`critical` / `high` / `medium` / `low`
 - 标签系统、上下文字段、位置排序
 - 子任务（`parent_id`）+ 自动完成父任务检测
+- 任务搜索（标题/描述/上下文模糊匹配）
 
 ### 2. 依赖管理
 - 任务间依赖关系
-- 循环依赖检测
+- 循环依赖检测（DFS 算法）
 - 可执行任务筛选（依赖已满足）
+- 依赖树查询
 
 ### 3. 聚焦引擎（Focus Engine）
 ```http
@@ -164,6 +174,7 @@ POST /api/agents/:id/focus/auto
 ```
 score = priority_weight(critical=100) + age_bonus(max 20) + ready_bonus(max 30) - retry_penalty
 ```
+每次任务创建/完成/状态变更后自动重新评估聚焦。
 
 ### 4. 心跳与重试追踪
 ```http
@@ -194,19 +205,35 @@ POST /api/agents/:id/todos/:id/heartbeat
 | 指派给我的 | `GET /todos/assigned` |
 | 跨 agent 通知 | `GET /notifications` |
 | 项目全局看板 | `GET /projects/:id/board` |
+| 自动创建被指派 agent | 指派时自动注册不存在的 agent |
 
-### 8. 对话上下文存储
+### 8. 定时调度任务
+- 任务模板（`is_template=true`）+ 调度规则（`schedule`）
+- 支持格式：`daily`、`weekly:mon,fri`、`cron:0 9 * * *`
+- 手动触发模板实例化：`POST /todos/:id/spawn`
+- 自动计算下次到期时间（`next_due_at`）
+
+### 9. 手动驱动执行
+```http
+POST /api/agents/:id/todos/:id/drive
+```
+- 强行触发 LLM 执行指定任务
+- 支持恢复 blocked 任务（自动增加重试计数）
+- 自动生成 Work Prompt + 解析回复更新心跳
+
+### 10. 对话上下文存储
 ```http
 POST /api/agents/:id/contexts      # 存储消息
 GET  /api/agents/:id/contexts      # 按 session 查询
+GET  /api/agents/:id/contexts/summary  # 会话摘要
 ```
 
-### 9. 自动运维监控
+### 11. 自动运维监控
 - **StuckTaskMonitor**：每 5 分钟自动扫描，超过 30 分钟无心跳的 `in_progress` 任务自动标记为 `blocked`
 - **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
 - **手动管理**：`POST /archive-old?days=30` 手动归档，`DELETE /archived` 物理清理已归档任务
 
-### 10. 项目看板
+### 12. 项目看板
 ```http
 GET /api/agents/:id/projects/:id/board
 ```
@@ -234,10 +261,18 @@ GET /api/agents/:id/projects/:id/board
 | POST | `/api/agents/:id/todos/:id/transfer` | 转交任务 |
 | POST | `/api/agents/:id/todos/:id/heartbeat` | 更新心跳 |
 | POST | `/api/agents/:id/todos/:id/attempt` | 记录重试 |
+| POST | `/api/agents/:id/todos/:id/drive` | 手动驱动执行 |
+| POST | `/api/agents/:id/todos/:id/spawn` | 模板实例化 |
+| POST | `/api/agents/:id/todos/:id/sub-tasks` | 创建子任务 |
 | GET | `/api/agents/:id/todos/:id/subtasks` | 获取子任务 |
+| GET | `/api/agents/:id/todos/:id/dependency-tree` | 依赖树 |
 | GET | `/api/agents/:id/todos/assigned` | 指派给我的 |
 | GET | `/api/agents/:id/todos/created` | 我创建的 |
 | GET | `/api/agents/:id/todos/stuck/list` | 卡住的任务 |
+| GET | `/api/agents/:id/todos/stats` | 任务统计 |
+| GET | `/api/agents/:id/todos/search?q=xxx` | 搜索任务 |
+| GET | `/api/agents/:id/todos/ready` | 可执行任务 |
+| GET | `/api/agents/:id/todos/templates` | 模板任务列表 |
 | POST | `/api/agents/:id/todos/archive-old` | 归档旧任务 |
 | DELETE | `/api/agents/:id/todos/archived` | 删除已归档任务 |
 
@@ -358,20 +393,24 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 | 任务 CRUD | ✅ | ✅ | ✅ | ✅ | 基础管理 |
 | 优先级 | ✅ | ✅ | ✅ | ✅ | 4 级 |
 | 标签 | ✅ | ✅ | ✅ | ✅ | 多标签 |
-| 依赖关系 | ✅ | ✅ | ✅ | ✅ | + 循环检测 |
+| 依赖关系 | ✅ | ✅ | ✅ | ✅ | + 循环检测（DFS） |
 | 项目分组 | ✅ | ✅ | ✅ | ✅ | + 看板 |
-| 聚焦引擎 | ✅ | ✅ | ✅ | ✅ | 自动选优 |
+| 聚焦引擎 | ✅ | ✅ | ✅ | ✅ | 自动选优 + 自动重评估 |
 | 心跳追踪 | ✅ | ✅ | - | ✅ | 5min 间隔 |
 | 重试管理 | ✅ | ✅ | - | ✅ | 3 次上限 |
 | 验收标准 | ✅ | ✅ | ✅ | ✅ | LLM 生成 + 确认 |
 | 漂移检测 | - | - | ✅ | - | LLM 语义分析 |
-| 多智能体指派 | ✅ | ✅ | - | ✅ | 跨 agent |
+| 多智能体指派 | ✅ | ✅ | - | ✅ | 跨 agent + 自动创建 |
 | 跨 agent 通知 | ✅ | ✅ | - | ✅ | assigned/transferred |
 | 上下文存储 | ✅ | ✅ | ✅ | ✅ | 按 session |
+| 定时调度 | ✅ | ✅ | - | - | 模板 + cron/weekly/daily |
+| 手动驱动 | ✅ | - | ✅ | - | LLM 执行 + 恢复 |
 | 自动 stuck 处理 | ✅ | - | - | - | 服务端定时器 |
 | 任务归档清理 | ✅ | - | - | - | 软删除 + 自动归档 |
 | 熔断 + 本地缓存 | - | - | ✅ | - | 3 次失败降级 |
-| LLM 集成 | - | - | ✅ | - | MiniMax/OpenAI/Claude |
+| LLM 集成 | - | - | ✅ | - | MiniMax/OpenAI/Claude/Ollama |
+| 角色模板系统 | - | - | ✅ | - | 通用/编码/分析/DevOps |
+| 记忆管理 | - | - | ✅ | - | 提取 + 自动摘要 |
 
 ## 📖 关联文档
 
@@ -387,23 +426,32 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 
 ### 已完成 ✅
 
-- [x] TODO Server 完整 REST API
-- [x] SQLite 数据库 + WAL 模式 + 安全迁移
+- [x] TODO Server 完整 REST API（30+ 路由）
+- [x] SQLite 数据库 + WAL 模式 + 自动迁移
 - [x] Agent 认证（secret_key）+ 跨 agent 操作
-- [x] JavaScript SDK（完整 CRUD + 协作）
-- [x] 聚焦引擎（Focus Engine）自动选优
+- [x] JavaScript SDK（完整 CRUD + 协作 + 调度）
+- [x] 聚焦引擎（Focus Engine）自动选优 + 状态变更自动重评估
 - [x] 心跳追踪（Heartbeat）+ 卡住检测
 - [x] 重试管理（attempt_count / max_attempts）
 - [x] 验收标准生成 + 显式确认
 - [x] 漂移检测 + 主动提醒
 - [x] 任务自动发现 + 用户确认创建
-- [x] 多智能体协作（指派 / 转交 / 通知）
+- [x] 多智能体协作（指派 / 转交 / 通知 + 自动创建被指派 agent）
 - [x] 项目全局看板（跨 agent 统计）
-- [x] 对话上下文存储
+- [x] 对话上下文存储 + 会话摘要
+- [x] 定时调度任务（模板 + daily/weekly/cron + spawn）
+- [x] 手动驱动执行（LLM 执行 + 恢复 blocked 任务）
+- [x] 循环依赖检测（DFS 算法修复）
 - [x] 熔断 + 本地缓存降级
+- [x] LLM Provider 抽象层（MiniMax / OpenAI / Anthropic / Ollama）
+- [x] 主备 LLM 自动切换
+- [x] 角色模板系统（通用/编码/分析/DevOps）
+- [x] 记忆管理（提取 + 自动摘要 + 过期清理）
 - [x] Hermes Skill 接入框架（Python CLI）
 - [x] Profile 感知自动匹配凭证
 - [x] `npm run setup` 一键安装向导
+- [x] Agent 接入指南文档（AGENT_INTEGRATION.md）
+- [x] Worker 执行模式（agent-worker.js）
 
 ### 进行中 🔄
 
