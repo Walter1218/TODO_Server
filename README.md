@@ -418,6 +418,7 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 |------|------|
 | [CONFIG_GUIDE.md](CONFIG_GUIDE.md) | 框架客户端配置详解 |
 | [AGENT_INTEGRATION.md](AGENT_INTEGRATION.md) | Agent SDK 接入指南 |
+| [IMPROVEMENT_GUIDE.md](IMPROVEMENT_GUIDE.md) | 项目改进建议（P0-P3 优先级） |
 | [HERMES_INTEGRATION_DESIGN.md](HERMES_INTEGRATION_DESIGN.md) | Hermes 集成架构设计 |
 | [MULTI_AGENT_DESIGN.md](MULTI_AGENT_DESIGN.md) | 多智能体协作设计 |
 | [TODO_ROADMAP.md](TODO_ROADMAP.md) | 剩余工作清单 |
@@ -452,6 +453,7 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 - [x] `npm run setup` 一键安装向导
 - [x] Agent 接入指南文档（AGENT_INTEGRATION.md）
 - [x] Worker 执行模式（agent-worker.js）
+- [x] 核心功能单元测试（98 用例，覆盖 Todo/Focus/Agent/Config/Prompt/Memory）
 
 ### 进行中 🔄
 
@@ -470,6 +472,12 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 ```bash
 # 启动开发服务器（热重载）
 npm run dev
+
+# 运行全部单元测试
+npm test
+
+# 查看测试覆盖率报告
+npm run test:coverage
 
 # 运行框架示例
 node framework/examples/ProgressiveIntegration.js

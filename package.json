@@ -8,7 +8,9 @@
     "setup": "node scripts/setup.js",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "agent": "node start.js"
+    "agent": "node start.js",
+    "test": "jest --runInBand --forceExit --detectOpenHandles",
+    "test:coverage": "jest --runInBand --forceExit --detectOpenHandles --coverage"
   },
   "keywords": [
     "todo",
@@ -24,5 +26,8 @@
     "dotenv": "^17.4.2",
     "express": "^4.21.2",
     "uuid": "^11.0.5"
+  },
+  "devDependencies": {
+    "jest": "^30.3.0"
   }
 }

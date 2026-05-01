@@ -6,6 +6,7 @@ const dbPath = path.join(__dirname, '..', 'data', 'todo.db');
 let db;
 
 function getDb() {
+  if (module.exports._testDb) return module.exports._testDb;
   if (!db) {
     const fs = require('fs');
     const dataDir = path.join(__dirname, '..', 'data');
