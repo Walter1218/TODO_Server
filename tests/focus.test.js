@@ -71,57 +71,57 @@ describe('AutoFocus', () => {
     agent = createTestAgent();
   });
 
-  test('returns null when no tasks exist', () => {
-    const result = FocusState.autoFocus(agent.id);
+  test('returns null when no tasks exist', async () => {
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).toBeNull();
   });
 
-  test('prioritizes in_progress tasks', () => {
+  test('prioritizes in_progress tasks', async () => {
     const t1 = Todo.create(agent.id, { title: 'Pending' });
     const t2 = Todo.create(agent.id, { title: 'In Progress' });
     Todo.update(agent.id, t2.id, { status: 'in_progress' });
 
-    const result = FocusState.autoFocus(agent.id);
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).not.toBeNull();
     expect(result.title).toBe('In Progress');
     expect(result.focus_reason).toBe('continue_in_progress');
   });
 
-  test('picks highest scoring ready task', () => {
+  test('picks highest scoring ready task', async () => {
     const t1 = Todo.create(agent.id, { title: 'Low Priority', priority: 'low' });
     const t2 = Todo.create(agent.id, { title: 'Critical Priority', priority: 'critical' });
 
-    const result = FocusState.autoFocus(agent.id);
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).not.toBeNull();
     expect(result.title).toBe('Critical Priority');
     expect(result.focus_reason).toBe('ready_highest_score');
   });
 
-  test('blocked tasks with remaining attempts get lowest priority', () => {
+  test('blocked tasks with remaining attempts get lowest priority', async () => {
     const t1 = Todo.create(agent.id, { title: 'Ready Task', priority: 'low' });
     const t2 = Todo.create(agent.id, { title: 'Blocked Task', priority: 'low', maxAttempts: 5 });
     Todo.update(agent.id, t2.id, { status: 'blocked', attemptCount: 2 });
 
-    const result = FocusState.autoFocus(agent.id);
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).not.toBeNull();
     expect(result.title).toBe('Ready Task');
   });
 
-  test('filters out template tasks', () => {
+  test('filters out template tasks', async () => {
     Todo.create(agent.id, { title: 'Template', isTemplate: true, schedule: 'daily' });
     Todo.create(agent.id, { title: 'Real Task' });
 
-    const result = FocusState.autoFocus(agent.id);
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).not.toBeNull();
     expect(result.title).toBe('Real Task');
   });
 
-  test('includes tasks assigned to this agent', () => {
+  test('includes tasks assigned to this agent', async () => {
     const otherAgent = createTestAgent('other');
     const todo = Todo.create(otherAgent.id, { title: 'Assigned to me' });
     Todo.assign(otherAgent.id, todo.id, agent.id);
 
-    const result = FocusState.autoFocus(agent.id);
+    const result = await FocusState.autoFocus(agent.id);
     expect(result).not.toBeNull();
     expect(result.title).toBe('Assigned to me');
   });
@@ -189,29 +189,29 @@ describe('getFocusContext', () => {
     agent = createTestAgent();
   });
 
-  test('returns null when no tasks exist', () => {
-    const ctx = FocusState.getFocusContext(agent.id);
+  test('returns null when no tasks exist', async () => {
+    const ctx = await FocusState.getFocusContext(agent.id);
     expect(ctx).toBeNull();
   });
 
-  test('returns current focus task via autoFocus', () => {
+  test('returns current focus task via autoFocus', async () => {
     const todo = Todo.create(agent.id, { title: 'Focused', priority: 'critical' });
 
-    const ctx = FocusState.getFocusContext(agent.id);
+    const ctx = await FocusState.getFocusContext(agent.id);
     expect(ctx).not.toBeNull();
     expect(ctx.current_task).toBeDefined();
     expect(ctx.current_task.title).toBe('Focused');
   });
 
-  test('auto-reFocuses when current task is deleted', () => {
+  test('auto-reFocuses when current task is deleted', async () => {
     const t1 = Todo.create(agent.id, { title: 'Task 1' });
     Todo.update(agent.id, t1.id, { status: 'in_progress' });
     const t2 = Todo.create(agent.id, { title: 'Task 2', priority: 'high' });
-    FocusState.autoFocus(agent.id);
+    await FocusState.autoFocus(agent.id);
 
     Todo.delete(agent.id, t1.id);
 
-    const ctx = FocusState.getFocusContext(agent.id);
+    const ctx = await FocusState.getFocusContext(agent.id);
     expect(ctx).not.toBeNull();
     expect(ctx.current_task).toBeDefined();
     expect(ctx.current_task.title).toBe('Task 2');

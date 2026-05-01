@@ -3,6 +3,7 @@ const Agent = require('../models/Agent');
 const Todo = require('../models/Todo');
 const FocusState = require('../models/FocusState');
 const Context = require('../models/Context');
+const { getDb } = require('../db');
 
 const router = express.Router({ mergeParams: true });
 
@@ -15,10 +16,14 @@ router.use((req, res, next) => {
 });
 
 // GET /api/agents/:agentId/focus — 获取当前聚焦状态 + 任务详情
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   try {
     const { agentId } = req.params;
-    const context = FocusState.getFocusContext(agentId);
+    const driveFramework = req.app.get('driveFramework');
+    const llmManager = driveFramework && driveFramework.modules
+      ? driveFramework.modules.llmManager
+      : null;
+    const context = await FocusState.getFocusContext(agentId, llmManager);
 
     if (!context || !context.current_task) {
       // Fix: 即使没有聚焦任务，如果检测到近期活动，返回合成 work_analysis
@@ -94,8 +99,7 @@ router.get('/', (req, res) => {
     // 获取最近的对话上下文（最近 10 条）
     const recentContexts = Context.findRecentByAgent(agentId, 10);
 
-    // 构建工作状态分析（结合任务心跳 + 最近活动记录）
-    const workAnalysis = buildWorkAnalysis(agentId, task);
+    const workAnalysis = await buildWorkAnalysis(agentId, task, driveFramework);
 
     res.json({
       success: true,
@@ -144,10 +148,12 @@ router.put('/', (req, res) => {
 });
 
 // POST /api/agents/:agentId/focus/auto — 自动聚焦（由 Focus Engine 选择）
-router.post('/auto', (req, res) => {
+router.post('/auto', async (req, res) => {
   try {
     const { agentId } = req.params;
-    const chosen = FocusState.autoFocus(agentId);
+    const fw = req.app.get('driveFramework');
+    const lm = fw && fw.modules ? fw.modules.llmManager : null;
+    const chosen = await FocusState.autoFocus(agentId, lm);
 
     if (!chosen) {
       return res.json({
@@ -224,15 +230,169 @@ function parseDbTime(dateStr) {
   return new Date(utcStr).getTime();
 }
 
-// 构建智能体工作状态分析（结合任务心跳 + 最近活动记录）
-function buildWorkAnalysis(agentId, task) {
+const LLMPrompts = {
+  workAnalysis: (task, activityLines, attemptLines, idleMinutes) =>
+    `你是一个 TODO Server 任务状态分析助手。请根据以下信息，推断智能体当前的真实工作状态。
+
+## 当前任务
+- 标题: ${task.title}
+- 进度: ${task.heartbeat_progress || 0}%
+- 最后心跳步骤: ${task.heartbeat_step || '无'}
+- 阻塞项: ${(task.heartbeat_blockers || []).length > 0 ? (task.heartbeat_blockers || []).join('、') : '无'}
+- 距离上次心跳: ${idleMinutes} 分钟
+- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}
+
+## 最近活动记录
+${activityLines || '无'}
+
+## 执行记录
+${attemptLines || '无执行记录'}
+
+## 请判断
+1. 智能体是否仍在有效工作？（true / false / uncertain）
+2. 如果仍在工作，当前可能在做什么？（一句话描述）
+3. 如果未工作，最可能的原因是什么？（等待输入 / 遇到错误 / 已完成 / 失联 / 其他）
+4. 建议的任务状态：（in_progress / blocked / completed）
+5. 置信度（0-1 之间的小数）
+
+请只返回纯 JSON，不要有任何其他文字：
+{"is_working": true, "current_action": "...", "reason": "...", "suggested_status": "in_progress", "confidence": 0.85}`,
+
+  focusScore: (candidates) => {
+    const candidateList = candidates.map((t, i) =>
+      `${i + 1}. [${t.priority}] ${t.title}${t.description ? ' — ' + t.description.substring(0, 80) : ''}${t.context ? ' (上下文: ' + t.context.substring(0, 60) + ')' : ''}`
+    ).join('\n');
+    return `你是任务调度助手。请从以下候选任务中选择当前最应该执行的一个。
+
+选择标准：
+1. 紧急程度 — 用户最关心哪个？优先级高的优先
+2. 完成难度 — 哪个能快速产出结果？简单任务优先（快速交付）
+3. 依赖关系 — 哪个能解锁后续更多任务？
+4. 风险评估 — 哪个失败代价最大？
+
+候选任务列表：
+${candidateList}
+
+请只返回纯 JSON，不要包含其他文字：
+{"chosen_index": 0, "reason": "选择原因", "estimated_minutes": 30}`;
+  }
+};
+
+function _collectActivityLines(agentId) {
+  try {
+    const recentContexts = Context.findRecentByAgent(agentId, 15);
+    return recentContexts.map(c => {
+      const meta = typeof c.metadata === 'string' ? JSON.parse(c.metadata || '{}') : c.metadata;
+      return `[${c.created_at}] ${meta.type || 'activity'}: ${c.content.substring(0, 120)}`;
+    }).join('\n');
+  } catch (e) {
+    return '';
+  }
+}
+
+function _collectAttemptLines(task) {
+  return (task.attempt_log || []).slice(-5).map((a, i) =>
+    `${i + 1}. [${a.success ? '成功' : '失败'}] ${a.reason || ''} — ${a.output || ''}`
+  ).join('\n') || '无执行记录';
+}
+
+async function _tryLLMWorkAnalysis(agentId, task, driveFramework) {
+  if (!driveFramework || !driveFramework.initialized) return null;
+  if (!driveFramework.modules.llmManager || !driveFramework.modules.llmManager.hasProvider()) return null;
+
+  const now = Date.now();
+  const lastHeartbeat = task.last_heartbeat ? parseDbTime(task.last_heartbeat) : 0;
+  const idleMinutes = lastHeartbeat ? Math.floor((now - lastHeartbeat) / 60000) : 999;
+
+  const activityLines = _collectActivityLines(agentId);
+  const attemptLines = _collectAttemptLines(task);
+
+  const prompt = LLMPrompts.workAnalysis(task, activityLines, attemptLines, idleMinutes);
+
+  const result = await driveFramework.modules.llmManager.chat({
+    messages: [{ role: 'user', content: prompt }],
+    system: '你是一个任务状态分析助手，请基于活动记录推断智能体状态，只返回 JSON。'
+  });
+
+  const reply = result.content || '';
+  const jsonMatch = reply.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+
+  try {
+    const inference = JSON.parse(jsonMatch[0]);
+    if (typeof inference.confidence !== 'number') return null;
+    return { inference, idleMinutes };
+  } catch (e) {
+    return null;
+  }
+}
+
+function _inferenceToWorkAnalysis(inference, task, contextActivity) {
+  const { inference: inf, idleMinutes } = inference;
+  const confidence = inf.confidence;
+  const isWorking = inf.is_working;
+  const suggestedStatus = inf.suggested_status;
+
+  let status, statusLabel, statusColor, currentAction;
+
+  if (suggestedStatus === 'completed' && !isWorking) {
+    status = 'completed';
+    statusLabel = '已完成';
+    statusColor = 'green';
+    currentAction = inf.reason || '任务已完成';
+  } else if (suggestedStatus === 'blocked' && !isWorking) {
+    status = 'blocked';
+    statusLabel = '已阻塞';
+    statusColor = 'red';
+    currentAction = inf.reason ? `被阻塞：${inf.reason}` : '任务被卡住';
+  } else if (isWorking) {
+    status = 'active';
+    statusLabel = '活跃工作中';
+    statusColor = 'green';
+    currentAction = inf.current_action || inf.reason || '正在执行';
+  } else if (suggestedStatus === 'blocked') {
+    status = 'stuck';
+    statusLabel = '可能卡住';
+    statusColor = 'orange';
+    currentAction = inf.reason || '长时间无响应';
+  } else {
+    status = 'idle';
+    statusLabel = '空闲/等待中';
+    statusColor = 'blue';
+    currentAction = inf.reason || '等待调度';
+  }
+
+  const blockers = task.heartbeat_blockers || [];
+  const attempts = task.attempt_log || [];
+
+  return {
+    status,
+    status_label: statusLabel,
+    status_color: statusColor,
+    idle_minutes: idleMinutes,
+    last_heartbeat: task.last_heartbeat,
+    current_step: task.heartbeat_step || '无步骤信息',
+    current_action: currentAction,
+    progress: task.heartbeat_progress || 0,
+    blockers,
+    blocker_count: blockers.length,
+    attempt_count: task.attempt_count || 0,
+    max_attempts: task.max_attempts || 3,
+    attempts_remaining: (task.max_attempts || 3) - (task.attempt_count || 0),
+    recent_attempts: attempts.slice(-3),
+    health_score: Math.max(0, 100 - idleMinutes * 2 - blockers.length * 15 - (task.attempt_count || 0) * 10),
+    context_activity: contextActivity,
+    llm_analysis: { confidence, reason: inf.reason, is_working: isWorking }
+  };
+}
+
+function _ruleBasedWorkAnalysis(agentId, task) {
   const now = Date.now();
   const lastHeartbeat = task.last_heartbeat ? parseDbTime(task.last_heartbeat) : 0;
   const idleMinutes = lastHeartbeat ? Math.floor((now - lastHeartbeat) / 60000) : 999;
   const blockers = task.heartbeat_blockers || [];
   const attempts = task.attempt_log || [];
 
-  // Fix 2: 从 contexts 表推断最近活动（即使任务心跳过时）
   let contextActivity = null;
   try {
     const recentContexts = Context.findRecentByAgent(agentId, 20);
@@ -251,11 +411,8 @@ function buildWorkAnalysis(agentId, task) {
         created_at: latest.created_at
       };
     }
-  } catch (e) {
-    // 忽略 contexts 查询错误
-  }
+  } catch (e) {}
 
-  // 如果 contexts 有最近活动（< 15 分钟），则认为智能体仍在工作
   const hasRecentContext = contextActivity && contextActivity.age_minutes < 15;
   const hasVeryRecentContext = contextActivity && contextActivity.age_minutes < 5;
 
@@ -263,7 +420,6 @@ function buildWorkAnalysis(agentId, task) {
   let statusLabel = '未知';
   let statusColor = 'gray';
 
-  // 最近 contexts 活动可以覆盖 blocked/completed 状态（智能体在做其他事）
   if (hasVeryRecentContext) {
     status = 'active';
     statusLabel = '活跃工作中';
@@ -294,11 +450,9 @@ function buildWorkAnalysis(agentId, task) {
     statusColor = 'blue';
   }
 
-  // 当前具体动作描述
   let currentAction = '';
   if (status === 'active') {
     if (hasRecentContext) {
-      // 优先使用最近 contexts 内容作为当前动作
       currentAction = `[${contextActivity.type}] ${contextActivity.content}`;
     } else {
       currentAction = task.heartbeat_step || '正在执行中';
@@ -326,15 +480,95 @@ function buildWorkAnalysis(agentId, task) {
     current_step: task.heartbeat_step || '无步骤信息',
     current_action: currentAction,
     progress: task.heartbeat_progress || 0,
-    blockers: blockers,
+    blockers,
     blocker_count: blockers.length,
     attempt_count: task.attempt_count || 0,
     max_attempts: task.max_attempts || 3,
     attempts_remaining: (task.max_attempts || 3) - (task.attempt_count || 0),
     recent_attempts: attempts.slice(-3),
     health_score: Math.max(0, 100 - idleMinutes * 2 - blockers.length * 15 - (task.attempt_count || 0) * 10),
-    context_activity: contextActivity  // 新增：contexts 活动信息
+    context_activity: contextActivity
   };
+}
+
+async function buildWorkAnalysis(agentId, task, driveFramework) {
+  const now = Date.now();
+  const lastHeartbeat = task.last_heartbeat ? parseDbTime(task.last_heartbeat) : 0;
+  const idleMinutes = lastHeartbeat ? Math.floor((now - lastHeartbeat) / 60000) : 999;
+
+  let contextActivity = null;
+  try {
+    const recentContexts = Context.findRecentByAgent(agentId, 20);
+    const nonSnapshot = recentContexts.filter(c =>
+      c.session_id !== 'work-snapshot' &&
+      c.session_id !== 'llm-inference'
+    );
+    if (nonSnapshot.length > 0) {
+      const latest = nonSnapshot[nonSnapshot.length - 1];
+      const contextAgeMin = Math.floor((now - parseDbTime(latest.created_at)) / 60000);
+      const meta = typeof latest.metadata === 'string' ? JSON.parse(latest.metadata || '{}') : latest.metadata;
+      contextActivity = {
+        age_minutes: contextAgeMin,
+        type: meta.type || 'activity',
+        content: latest.content.substring(0, 120),
+        created_at: latest.created_at
+      };
+    }
+  } catch (e) {}
+
+  const db = getDb();
+  const recentInference = db.prepare(`
+    SELECT metadata, created_at FROM contexts
+    WHERE agent_id = ? AND session_id = 'llm-inference'
+      AND metadata LIKE ?
+    ORDER BY created_at DESC LIMIT 1
+  `).get(agentId, `%"task_id":"${task.id}"%`);
+
+  if (recentInference) {
+    const createdAt = parseDbTime(recentInference.created_at);
+    const ageMinutes = (now - createdAt) / 60000;
+    if (ageMinutes < 5) {
+      try {
+        const meta = typeof recentInference.metadata === 'string'
+          ? JSON.parse(recentInference.metadata)
+          : recentInference.metadata;
+        if (meta && meta.inference) {
+          const storedIdleMin = meta.idle_minutes || idleMinutes;
+          return _inferenceToWorkAnalysis(
+            { inference: meta.inference, idleMinutes: storedIdleMin },
+            task, contextActivity
+          );
+        }
+      } catch (e) {}
+    }
+  }
+
+  try {
+    const llmResult = await _tryLLMWorkAnalysis(agentId, task, driveFramework);
+    if (llmResult) {
+      try {
+        db.prepare(`
+          INSERT INTO contexts (id, agent_id, session_id, role, content, metadata, created_at)
+          VALUES (?, ?, 'llm-inference', 'system', ?, ?, datetime('now'))
+        `).run(
+          require('uuid').v4(), agentId,
+          `[LLM推断-API] 任务「${task.title}」idle ${idleMinutes}min`,
+          JSON.stringify({
+            type: 'llm_inference',
+            task_id: task.id,
+            inference: llmResult.inference,
+            idle_minutes: idleMinutes
+          })
+        );
+      } catch (e) {}
+
+      return _inferenceToWorkAnalysis(llmResult, task, contextActivity);
+    }
+  } catch (e) {
+    console.error(`[buildWorkAnalysis] LLM 推断失败，回退到规则引擎: ${e.message}`);
+  }
+
+  return _ruleBasedWorkAnalysis(agentId, task);
 }
 
 module.exports = router;

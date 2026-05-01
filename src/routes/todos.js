@@ -7,6 +7,11 @@ const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper'
 
 const router = express.Router({ mergeParams: true });
 
+function getLlmManager(req) {
+  const fw = req.app.get('driveFramework');
+  return fw && fw.modules ? fw.modules.llmManager : null;
+}
+
 router.use((req, res, next) => {
   const { agentId } = req.params;
 
@@ -48,7 +53,7 @@ function validateSchedule(schedule) {
   return null;
 }
 
-router.post('/', (req, res) => {
+router.post('/', async (req, res) => {
   try {
     const { agentId } = req.params;
     const { title, description, priority, context, tags, dependencies, projectId, position, schedule, isTemplate, assignedAgentId } = req.body;
@@ -128,7 +133,7 @@ router.post('/', (req, res) => {
     });
 
     // 创建任务后自动重新评估聚焦
-    const focus = FocusState.autoFocus(agentId);
+    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
 
     res.status(201).json({
       success: true,
@@ -319,7 +324,7 @@ router.get('/:id', (req, res) => {
   }
 });
 
-router.delete('/:id', (req, res) => {
+router.delete('/:id', async (req, res) => {
   try {
     const { agentId, id } = req.params;
 
@@ -327,7 +332,7 @@ router.delete('/:id', (req, res) => {
     Todo.delete(agentId, id);
 
     // 删除任务后自动重新评估聚焦
-    const focus = FocusState.autoFocus(agentId);
+    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
 
     res.json({
       success: true,
@@ -343,7 +348,7 @@ router.delete('/:id', (req, res) => {
   }
 });
 
-router.patch('/:id/complete', (req, res) => {
+router.patch('/:id/complete', async (req, res) => {
   try {
     const { agentId, id } = req.params;
 
@@ -360,7 +365,7 @@ router.patch('/:id/complete', (req, res) => {
     const parentCompleted = Todo.checkAndCompleteParent(agentId, id);
 
     // 完成任务后自动切换到下一个可执行任务
-    const focus = FocusState.autoFocus(agentId);
+    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
 
     res.json({
       success: true,
@@ -377,7 +382,7 @@ router.patch('/:id/complete', (req, res) => {
   }
 });
 
-router.patch('/:id/status', (req, res) => {
+router.patch('/:id/status', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { status } = req.body;
@@ -409,7 +414,7 @@ router.patch('/:id/status', (req, res) => {
     // 状态变更为 completed / in_progress / cancelled 时重新评估聚焦
     let focus = null;
     if (['completed', 'in_progress', 'cancelled'].includes(status)) {
-      focus = FocusState.autoFocus(agentId);
+      focus = await FocusState.autoFocus(agentId, getLlmManager(req));
     }
 
     res.json({
@@ -500,7 +505,7 @@ router.get('/:id/dependency-tree', (req, res) => {
   }
 });
 
-router.put('/:id', (req, res) => {
+router.put('/:id', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { title, description, status, priority, context, tags, dependencies, projectId, position, schedule, isTemplate } = req.body;
@@ -592,7 +597,7 @@ router.put('/:id', (req, res) => {
     // 如果状态发生变化，重新评估聚焦
     let focus = null;
     if (status !== undefined) {
-      focus = FocusState.autoFocus(agentId);
+      focus = await FocusState.autoFocus(agentId, getLlmManager(req));
     }
 
     res.json({
@@ -610,7 +615,7 @@ router.put('/:id', (req, res) => {
 });
 
 // --- 定时调度任务路由：手动触发模板实例化 ---
-router.post('/:id/spawn', (req, res) => {
+router.post('/:id/spawn', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const todo = Todo.findById(agentId, id);
@@ -624,7 +629,7 @@ router.post('/:id/spawn', (req, res) => {
     const spawned = Todo.spawnFromTemplate(agentId, id);
 
     // Auto-focus after spawning
-    const focus = FocusState.autoFocus(agentId);
+    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
 
     res.json({
       success: true,

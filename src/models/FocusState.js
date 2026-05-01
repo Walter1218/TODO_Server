@@ -57,7 +57,7 @@ class FocusState {
     return this.findByAgent(agentId);
   }
 
-  static autoFocus(agentId) {
+  static async autoFocus(agentId, llmManager) {
     const db = getDb();
 
     // Get tasks for this agent:
@@ -107,11 +107,40 @@ class FocusState {
     });
 
     if (readyTasks.length > 0) {
-      // Score and pick the best one
+      if (readyTasks.length === 1) {
+        const chosen = readyTasks[0];
+        this.createOrUpdate(agentId, { currentTaskId: chosen.id });
+        return { ...chosen, focus_reason: 'ready_only_option' };
+      }
+
       const scored = readyTasks.map(t => ({
         ...t,
         score: this.calculateFocusScore(t, completedIds)
       })).sort((a, b) => b.score - a.score);
+
+      if (llmManager && llmManager.hasProvider && llmManager.hasProvider()) {
+        try {
+          const topCandidates = scored.slice(0, 5);
+          const prompt = this._buildFocusScorePrompt(topCandidates);
+          const result = await llmManager.chat({
+            messages: [{ role: 'user', content: prompt }],
+            system: '你是一个任务调度助手，请根据候选任务的信息选择最应该执行的任务，只返回 JSON。'
+          });
+          const reply = result.content || '';
+          const jsonMatch = reply.match(/\{[\s\S]*\}/);
+          if (jsonMatch) {
+            const parsed = JSON.parse(jsonMatch[0]);
+            const chosenIndex = parseInt(parsed.chosen_index);
+            if (!isNaN(chosenIndex) && chosenIndex >= 0 && chosenIndex < topCandidates.length) {
+              const chosen = topCandidates[chosenIndex];
+              this.createOrUpdate(agentId, { currentTaskId: chosen.id });
+              return { ...chosen, focus_reason: `llm_selected: ${parsed.reason || ''}` };
+            }
+          }
+        } catch (e) {
+          console.error(`[FocusState] LLM 选择失败，回退到评分排序: ${e.message}`);
+        }
+      }
 
       const chosen = scored[0];
       this.createOrUpdate(agentId, { currentTaskId: chosen.id });
@@ -166,12 +195,36 @@ class FocusState {
     return score;
   }
 
-  static getFocusContext(agentId) {
+  static _buildFocusScorePrompt(candidates) {
+    const candidateList = candidates.map((t, i) => {
+      let desc = `${i + 1}. [${t.priority}] ${t.title}`;
+      if (t.description) desc += ` — ${t.description.substring(0, 80)}`;
+      if (t.context) desc += ` (上下文: ${t.context.substring(0, 60)})`;
+      desc += ` [评分: ${t.score}]`;
+      return desc;
+    }).join('\n');
+
+    return `你是任务调度助手。请从以下候选任务中选择当前最应该执行的一个。
+
+选择标准：
+1. 紧急程度 — 用户最关心哪个？优先级高的优先
+2. 完成难度 — 哪个能快速产出结果？简单任务优先（快速交付）
+3. 依赖关系 — 哪个能解锁后续更多任务？
+4. 风险评估 — 哪个失败代价最大？
+
+候选任务列表：
+${candidateList}
+
+请只返回纯 JSON，不要包含其他文字：
+{"chosen_index": 0, "reason": "选择原因", "estimated_minutes": 30}`;
+  }
+
+  static async getFocusContext(agentId, llmManager) {
     let state = this.findByAgent(agentId);
 
     // 没有聚焦记录时自动尝试聚焦，保证前后端行为一致
     if (!state || !state.current_task_id) {
-      const reevaluated = this.autoFocus(agentId);
+      const reevaluated = await this.autoFocus(agentId, llmManager);
       if (!reevaluated) {
         return null;
       }
@@ -183,7 +236,7 @@ class FocusState {
     if (!currentTask) {
       // 当前聚焦的任务已不存在（被删除或归档），清理并尝试自动重新聚焦
       this.createOrUpdate(agentId, { currentTaskId: null });
-      const reevaluated = this.autoFocus(agentId);
+      const reevaluated = await this.autoFocus(agentId, llmManager);
       if (reevaluated) {
         currentTask = reevaluated;
         state = this.findByAgent(agentId);
@@ -194,12 +247,11 @@ class FocusState {
 
     // If current focus is a template task, re-evaluate via autoFocus
     if (currentTask.is_template === 1) {
-      const reevaluated = this.autoFocus(agentId);
+      const reevaluated = await this.autoFocus(agentId, llmManager);
       if (reevaluated) {
         currentTask = reevaluated;
         state = this.findByAgent(agentId);
       } else {
-        // No eligible task found — clear the invalid focus
         this.createOrUpdate(agentId, { currentTaskId: null });
         return null;
       }

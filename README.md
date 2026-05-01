@@ -170,11 +170,20 @@ TODO_Server/
 ```http
 POST /api/agents/:id/focus/auto
 ```
-自动选择最优任务，评分算法：
+**LLM 增强自动选优**：
+- 多个候选任务时，LLM 综合紧急程度、完成难度、依赖关系、风险评估选择最优任务
+- 单候选或无 LLM 时，回退到评分算法：`score = priority_weight(critical=100) + age_bonus(max 20) + ready_bonus(max 30) - retry_penalty`
+- 每次任务创建/完成/状态变更后自动重新评估聚焦
+
+### 3a. LLM 任务状态推断
+```http
+GET /api/agents/:id/focus
 ```
-score = priority_weight(critical=100) + age_bonus(max 20) + ready_bonus(max 30) - retry_penalty
-```
-每次任务创建/完成/状态变更后自动重新评估聚焦。
+**工作状态分析**（`buildWorkAnalysis`）：
+- 优先复用 `LLMInferencer` 后台推断结果（5 分钟缓存），避免重复调用 LLM
+- 无缓存时实时发起 LLM 分析：判断智能体是否在工作、当前动作、建议状态
+- LLM 不可用时自动回退到阈值规则引擎（idle 时间 + blocker 状态 + 上下文活动）
+- `LLMInferencer` 后台每 5 分钟扫描 idle 5-15 分钟的任务，高置信度（≥0.75）时自动标记 completed/blocked
 
 ### 4. 心跳与重试追踪
 ```http
@@ -229,8 +238,11 @@ GET  /api/agents/:id/contexts/summary  # 会话摘要
 ```
 
 ### 11. 自动运维监控
-- **StuckTaskMonitor**：每 5 分钟自动扫描，超过 30 分钟无心跳的 `in_progress` 任务自动标记为 `blocked`
+- **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked
+- **LLMInferencer**：每 5 分钟扫描 idle 5-15 分钟的任务，LLM 推断真实状态（completed/blocked/in_progress），置信度 ≥0.75 自动执行
+- **WorkSnapshotMonitor**：每 30 秒采集工作快照到 contexts
 - **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
+- **DailyScheduler**：每分钟检查到期的模板任务并生成实例
 - **手动管理**：`POST /archive-old?days=30` 手动归档，`DELETE /archived` 物理清理已归档任务
 
 ### 12. 项目看板
@@ -395,7 +407,8 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 | 标签 | ✅ | ✅ | ✅ | ✅ | 多标签 |
 | 依赖关系 | ✅ | ✅ | ✅ | ✅ | + 循环检测（DFS） |
 | 项目分组 | ✅ | ✅ | ✅ | ✅ | + 看板 |
-| 聚焦引擎 | ✅ | ✅ | ✅ | ✅ | 自动选优 + 自动重评估 |
+| 聚焦引擎 | ✅ | ✅ | ✅ | ✅ | LLM 增强选优 + 自动重评估 |
+| 工作状态推断 | ✅ | - | - | - | LLM 推断 + 规则兜底 + 缓存复用 |
 | 心跳追踪 | ✅ | ✅ | - | ✅ | 5min 间隔 |
 | 重试管理 | ✅ | ✅ | - | ✅ | 3 次上限 |
 | 验收标准 | ✅ | ✅ | ✅ | ✅ | LLM 生成 + 确认 |
@@ -403,14 +416,17 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 | 多智能体指派 | ✅ | ✅ | - | ✅ | 跨 agent + 自动创建 |
 | 跨 agent 通知 | ✅ | ✅ | - | ✅ | assigned/transferred |
 | 上下文存储 | ✅ | ✅ | ✅ | ✅ | 按 session |
+| 上下文智能排序 | - | - | ✅ | - | LLM 综合排序 + 规则兜底 |
 | 定时调度 | ✅ | ✅ | - | - | 模板 + cron/weekly/daily |
 | 手动驱动 | ✅ | - | ✅ | - | LLM 执行 + 恢复 |
-| 自动 stuck 处理 | ✅ | - | - | - | 服务端定时器 |
+| 自动运维监控 | ✅ | - | - | - | StuckMonitor + LLMInferencer + Snapshot |
 | 任务归档清理 | ✅ | - | - | - | 软删除 + 自动归档 |
 | 熔断 + 本地缓存 | - | - | ✅ | - | 3 次失败降级 |
-| LLM 集成 | - | - | ✅ | - | MiniMax/OpenAI/Claude/Ollama |
+| LLM 集成 | ✅ | - | ✅ | - | Server 聚焦/推断 + Framework 全模块 |
 | 角色模板系统 | - | - | ✅ | - | 通用/编码/分析/DevOps |
 | 记忆管理 | - | - | ✅ | - | 提取 + 自动摘要 |
+| 任务自动发现 | - | - | ✅ | - | LLM 对话分析 + 确认创建 |
+| 上下文注入 | - | - | ✅ | - | LLM 增强 prompt 构建 |
 
 ## 📖 关联文档
 
@@ -448,12 +464,14 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 - [x] 主备 LLM 自动切换
 - [x] 角色模板系统（通用/编码/分析/DevOps）
 - [x] 记忆管理（提取 + 自动摘要 + 过期清理）
+- [x] LLM 全模块集成（聚焦选优 / 工作状态推断 / 上下文排序 / 自动运维推断）
 - [x] Hermes Skill 接入框架（Python CLI）
 - [x] Profile 感知自动匹配凭证
 - [x] `npm run setup` 一键安装向导
 - [x] Agent 接入指南文档（AGENT_INTEGRATION.md）
 - [x] Worker 执行模式（agent-worker.js）
 - [x] 核心功能单元测试（98 用例，覆盖 Todo/Focus/Agent/Config/Prompt/Memory）
+- [x] LLMInferencer 后台推断 + 动态阈值 StuckMonitor + WorkSnapshot
 
 ### 进行中 🔄
 
