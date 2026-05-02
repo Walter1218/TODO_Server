@@ -386,7 +386,7 @@ app.listen(PORT, () => {
         const dueTemplates = Todo.findDueTemplates(agent.id);
         for (const template of dueTemplates) {
           try {
-            const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+            const spawned = Todo.spawnFromTemplate(agent.id, template.id, { replaceExisting: true });
             totalSpawned++;
 
             Context.create(agent.id, {

@@ -217,3 +217,68 @@ router.patch('/:id/status', async (req, res) => {
 - [HERMES_INTEGRATION_DESIGN.md](../HERMES_INTEGRATION_DESIGN.md) - Hermes 统一调度集成
 - [MULTI_AGENT_DESIGN.md](../MULTI_AGENT_DESIGN.md) - 多 Agent 协作设计
 - [AGENT_INTEGRATION.md](../AGENT_INTEGRATION.md) - Agent 集成总览
+- [EXECUTION_GUARD.md](./EXECUTION_GUARD.md) - 执行引擎与闭环验证
+
+---
+
+## 附录：每日调度重复任务问题
+
+> 日期: 2026-05-02
+> 状态: ✅ 已修复
+
+### 问题描述
+
+每日调度任务存在重复创建问题。原因：`spawnFromTemplate` 直接创建新实例，不检查同名进行中任务。
+
+### 修复方案
+
+**文件**: `src/models/Todo.js` - `Todo.spawnFromTemplate()`
+
+```javascript
+static spawnFromTemplate(agentId, templateId, options = {}) {
+  const { replaceExisting = false } = options;
+
+  if (replaceExisting) {
+    // 查找同名进行中任务
+    const activeDup = db.prepare(`
+      SELECT id, title, status, priority, created_at FROM todos
+      WHERE agent_id = ? AND title = ? AND archived = 0
+        AND status NOT IN ('completed', 'cancelled')
+        AND id != ?
+      LIMIT 1
+    `).get(agentId, template.title, templateId);
+
+    if (activeDup) {
+      // 旧任务标记为 cancelled + archived
+      db.prepare(`
+        UPDATE todos SET status = 'cancelled', archived = 1, updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND agent_id = ?
+      `).run(activeDup.id, agentId);
+
+      // 记录上下文
+      Context.create(agentId, {
+        sessionId: 'scheduler',
+        role: 'system',
+        content: `[DailyScheduler] 旧任务「${template.title}」(ID: ${activeDup.id}) 被新实例替换，已自动归档`,
+        metadata: { type: 'task_replaced', old_task_id: activeDup.id, template_id: templateId }
+      });
+    }
+  }
+
+  // ... 正常创建新任务，transferred_from 记录替换关系
+}
+```
+
+**文件**: `src/server.js` - DailyScheduler
+
+```javascript
+const spawned = Todo.spawnFromTemplate(agent.id, template.id, { replaceExisting: true });
+```
+
+### API 兼容性
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `skipDedupe` | `false` | 跳过重复检测 |
+| `replaceExisting` | `false` | 是否替换同名任务 |
+| `replacesId` | `null` | 手动指定被替换的任务 ID |

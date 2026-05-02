@@ -1,5 +1,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db');
+const Context = require('./Context');
 
 class Todo {
   static create(agentId, data) {
@@ -931,11 +932,43 @@ class Todo {
     }));
   }
 
-  static spawnFromTemplate(agentId, templateId) {
+  static spawnFromTemplate(agentId, templateId, options = {}) {
     const db = getDb();
     const template = this.findById(agentId, templateId);
     if (!template) throw new Error('Template not found');
     if (!template.is_template) throw new Error('Task is not a template');
+
+    const { skipDedupe = false, replacesId = null, replaceExisting = false } = options;
+
+    let replacedTask = null;
+
+    if (!skipDedupe && replaceExisting) {
+      const activeDup = db.prepare(`
+        SELECT id, title, status, priority, created_at FROM todos
+        WHERE agent_id = ? AND title = ? AND archived = 0
+          AND status NOT IN ('completed', 'cancelled')
+          AND id != ?
+        LIMIT 1
+      `).get(agentId, template.title, templateId);
+
+      if (activeDup) {
+        replacedTask = activeDup;
+        db.prepare(`
+          UPDATE todos SET
+            status = 'cancelled',
+            archived = 1,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND agent_id = ?
+        `).run(activeDup.id, agentId);
+
+        Context.create(agentId, {
+          sessionId: 'scheduler',
+          role: 'system',
+          content: `[DailyScheduler] 旧任务「${template.title}」(ID: ${activeDup.id}) 被新实例替换，已自动归档`,
+          metadata: { type: 'task_replaced', old_task_id: activeDup.id, template_id: templateId }
+        });
+      }
+    }
 
     const newId = uuidv4();
     const stmt = db.prepare(`
@@ -943,9 +976,10 @@ class Todo {
         id, agent_id, project_id, parent_id, title, description, priority,
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
-        origin_agent_id, assigned_agent_id, schedule, is_template, status, created_at, updated_at
+        origin_agent_id, assigned_agent_id, schedule, is_template, status, created_at, updated_at,
+        transferred_from
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
     `);
 
     stmt.run(
@@ -953,7 +987,8 @@ class Todo {
       template.title, template.description || '', template.priority,
       template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
       template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
-      agentId, template.assigned_agent_id || null, null, 0, 'pending'
+      agentId, template.assigned_agent_id || null, null, 0, 'pending',
+      replacedTask ? replacedTask.id : (replacesId || null)
     );
 
     // Update template: last_spawned_at and next_due_at
@@ -967,7 +1002,11 @@ class Todo {
     `);
     updateStmt.run(nextDueAt, templateId, agentId);
 
-    return this.findById(agentId, newId);
+    const spawned = this.findById(agentId, newId);
+    if (replacedTask) {
+      spawned._replacedFrom = replacedTask;
+    }
+    return spawned;
   }
 
   static writeReport(agentId, taskId, reportData) {
