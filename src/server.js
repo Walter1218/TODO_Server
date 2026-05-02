@@ -179,6 +179,24 @@ app.listen(PORT, () => {
             heartbeat_blockers: JSON.parse(rawTask.heartbeat_blockers || '[]')
           };
 
+          // 冷却期检查：任务刚被更新（5分钟内），跳过检测
+          // 防止任务刚启动就被误判为卡住
+          const lastUpdate = task.updated_at ? new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
+          if (Date.now() - lastUpdate < 5 * 60 * 1000) {
+            continue; // 5分钟内更新过，跳过
+          }
+
+          // 检查智能体是否有聚焦此任务（说明智能体正在关注）
+          const focusState = db.prepare(`
+            SELECT * FROM focus_states WHERE agent_id = ? AND current_task_id = ?
+          `).get(agent.id, task.id);
+          if (focusState) {
+            const focusUpdated = focusState.updated_at ? new Date(focusState.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
+            if (Date.now() - focusUpdated < 10 * 60 * 1000) {
+              continue; // 智能体最近10分钟内关注过此任务，跳过
+            }
+          }
+
           // 计算动态阈值
           const expectedDuration = task.expected_duration_minutes || null;
           const progress = task.heartbeat_progress || 0;

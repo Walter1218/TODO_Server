@@ -75,6 +75,21 @@ class Todo {
     return todo;
   }
 
+  static findByTitle(agentId, title) {
+    const db = getDb();
+    const stmt = db.prepare('SELECT * FROM todos WHERE agent_id = ? AND title = ? ORDER BY created_at DESC LIMIT 1');
+    const todo = stmt.get(agentId, title);
+
+    if (todo) {
+      todo.tags = JSON.parse(todo.tags || '[]');
+      todo.dependencies = JSON.parse(todo.dependencies || '[]');
+      todo.attempt_log = JSON.parse(todo.attempt_log || '[]');
+      todo.heartbeat_blockers = JSON.parse(todo.heartbeat_blockers || '[]');
+    }
+
+    return todo;
+  }
+
   static findAllByAgent(agentId, filters = {}) {
     const db = getDb();
     const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0, source } = filters;

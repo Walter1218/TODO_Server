@@ -680,6 +680,26 @@
         .tag-chip { background: rgba(102,126,234,0.1); color: var(--primary); padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; display: flex; align-items: center; gap: 4px; }
         .tag-chip button { background: none; border: none; cursor: pointer; color: var(--primary); font-size: 0.9rem; padding: 0; line-height: 1; }
         .tag-input { border: none; outline: none; font-size: 0.9rem; flex: 1; min-width: 100px; background: transparent; }
+
+        /* Report Modal */
+        .report-modal { max-width: 800px; }
+        .report-content { white-space: pre-wrap; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; line-height: 1.6; }
+        .report-content h1 { font-size: 1.3rem; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+        .report-content h2 { font-size: 1.1rem; margin-top: 20px; margin-bottom: 10px; color: var(--primary); }
+        .report-content h3 { font-size: 1rem; margin-top: 16px; margin-bottom: 8px; }
+        .report-content ul, .report-content ol { margin-left: 20px; margin-bottom: 10px; }
+        .report-content li { margin-bottom: 4px; }
+        .report-content code { background: #f6f8fa; padding: 2px 6px; border-radius: 3px; font-size: 0.9rem; }
+        .report-content pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow-x: auto; margin: 10px 0; }
+        .report-content blockquote { border-left: 3px solid var(--primary); padding-left: 12px; margin: 10px 0; color: var(--text-muted); }
+        .report-timeline { margin-left: 20px; }
+        .report-timeline-item { position: relative; padding-left: 20px; margin-bottom: 12px; }
+        .report-timeline-item::before { content: ''; position: absolute; left: 0; top: 4px; width: 8px; height: 8px; border-radius: 50%; background: var(--primary); }
+        .report-meta { display: flex; gap: 20px; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px; }
+        .report-status { padding: 4px 10px; border-radius: 4px; font-size: 0.8rem; font-weight: 600; }
+        .report-status.success { background: rgba(72,187,120,0.1); color: var(--success); }
+        .report-status.failed { background: rgba(245,101,101,0.1); color: var(--danger); }
+        .report-status.pending { background: rgba(102,126,234,0.1); color: var(--primary); }
         .create-error { color: var(--danger); font-size: 0.85rem; margin-top: 12px; display: none; }
     </style>
 </head>
@@ -731,42 +751,154 @@
                 <button class="modal-close" onclick="app.hideCreateTaskModal()">&times;</button>
             </div>
             <div class="modal-body">
+                <!-- 对话式任务描述输入 -->
                 <div class="form-group">
-                    <label>任务标题 *</label>
-                    <input type="text" id="createTitle" placeholder="输入任务标题（必填）">
+                    <label>📝 任务描述（用自然语言描述您的需求）</label>
+                    <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;">
+                        <div id="createDescriptionChat" style="height:140px;overflow-y:auto;padding:10px;background:#f8fafc;">
+                            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                                <span>🤖</span>
+                                <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                                    请用自然语言描述您需要完成的任务，我会帮您分析并提取关键信息。<br>
+                                    <span style="font-size:0.75rem;color:#a0aec0;">示例：帮我采集A股stk_limit数据到2026-04-30</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="display:flex;border-top:1px solid var(--border);padding:8px;">
+                            <input type="text" id="createDescriptionInput" placeholder="描述您的任务..." style="flex:1;border:none;outline:none;padding:8px 12px;font-size:0.9rem;" onkeydown="if(event.keyCode === 13) { app.addDescriptionMessage(); return false; }">
+                            <button class="btn btn-primary btn-sm" onclick="app.addDescriptionMessage()">发送</button>
+                        </div>
+                    </div>
+                    <textarea id="createDescription" style="display:none;"></textarea>
                 </div>
+
+                <!-- 对话式验收标准输入 -->
                 <div class="form-group">
-                    <label>任务描述</label>
-                    <textarea id="createDescription" placeholder="详细描述任务内容，可以包含命令步骤等"></textarea>
+                    <label>✅ 验收标准（用自然语言描述完成标准）</label>
+                    <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;">
+                        <div id="createCriteriaChat" style="height:140px;overflow-y:auto;padding:10px;background:#f8fafc;">
+                            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                                <span>✅</span>
+                                <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                                    请描述任务完成的验收标准，用于自动校验任务是否成功完成。<br>
+                                    <span style="font-size:0.75rem;color:#a0aec0;">示例：数据采集到2026-04-30，验证MAX(trade_date) = 2026-04-30</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="display:flex;border-top:1px solid var(--border);padding:8px;">
+                            <input type="text" id="createCriteriaInput" placeholder="描述验收标准..." style="flex:1;border:none;outline:none;padding:8px 12px;font-size:0.9rem;" onkeydown="if(event.keyCode === 13) { app.addCriteriaMessage(); return false; }">
+                            <button class="btn btn-primary btn-sm" onclick="app.addCriteriaMessage()">发送</button>
+                        </div>
+                    </div>
+                    <textarea id="createAcceptanceCriteria" style="display:none;"></textarea>
                 </div>
-                <div class="form-row">
+
+                <!-- 智能解析按钮 -->
+                <div style="display:flex;justify-content:center;margin-bottom:16px;">
+                    <button class="btn btn-primary" onclick="app.analyzeTask()" style="background:linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                        🧠 智能解析任务（提取标题、步骤、验收标准）
+                    </button>
+                </div>
+
+                <!-- 自动解析结果展示 -->
+                <div class="form-group" id="analysisResult" style="display:none;">
+                    <label>🔍 智能解析结果</label>
+                    <div style="background:linear-gradient(135deg, #f0fff4 0%, #e6fffa 100%);border:1px solid #c6f6d5;border-radius:8px;padding:12px;">
+                        <div style="font-size:0.85rem;margin-bottom:8px;">
+                            <strong>提取的任务标题：</strong>
+                            <span id="analysisTitle" style="color:var(--primary);font-weight:600;"></span>
+                        </div>
+                        <div style="font-size:0.85rem;margin-bottom:8px;">
+                            <strong>识别的步骤：</strong>
+                            <ul id="analysisSteps" style="margin:4px 0 0 20px;color:var(--text-muted);font-size:0.8rem;"></ul>
+                        </div>
+                        <div style="font-size:0.85rem;">
+                            <strong>验收标准：</strong>
+                            <span id="analysisCriteria" style="color:var(--success);font-weight:600;"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 询问智能体获取信息 -->
+                <div style="border-top:1px dashed var(--border);padding-top:16px;margin-top:8px;">
+                    <div style="font-size:0.9rem;font-weight:600;color:var(--text-muted);margin-bottom:12px;">💬 询问智能体获取信息（可选）</div>
+                    <div style="border:1px solid var(--border);border-radius:8px;overflow:hidden;">
+                        <div style="display:flex;padding:8px;border-bottom:1px solid var(--border);gap:8px;">
+                            <select id="askAgentSelect" style="flex:1;padding:6px;border:none;outline:none;font-size:0.85rem;">
+                                <option value="">选择要询问的智能体...</option>
+                            </select>
+                            <button class="btn btn-primary btn-sm" onclick="app.askAgent()" id="askAgentBtn" disabled>
+                                📤 发送询问
+                            </button>
+                        </div>
+                        <div id="askAgentChat" style="height:120px;overflow-y:auto;padding:10px;background:#f8fafc;">
+                            <div style="display:flex;gap:8px;margin-bottom:8px;">
+                                <span>💡</span>
+                                <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                                    您可以先询问智能体获取相关信息，例如数据存储位置、任务详情等。<br>
+                                    <span style="font-size:0.75rem;color:#a0aec0;">示例：请问数据存储在哪里？</span>
+                                </div>
+                            </div>
+                        </div>
+                        <div style="display:flex;border-top:1px solid var(--border);padding:8px;">
+                            <input type="text" id="askAgentInput" placeholder="输入您的问题..." style="flex:1;border:none;outline:none;padding:8px 12px;font-size:0.9rem;" onkeydown="if(event.keyCode === 13) { app.askAgent(); return false; }">
+                            <button class="btn btn-primary btn-sm" onclick="app.askAgent()">发送</button>
+                        </div>
+                    </div>
+                    <div style="font-size:0.75rem;color:#a0aec0;margin-top:6px;">
+                        💡 通过与智能体对话获取关键信息，帮助完善任务描述和验收标准
+                    </div>
+                </div>
+
+                <!-- 手动配置选项 -->
+                <div style="border-top:1px dashed var(--border);padding-top:16px;margin-top:8px;">
+                    <div style="font-size:0.9rem;font-weight:600;color:var(--text-muted);margin-bottom:12px;">⚙️ 手动配置</div>
+                    
                     <div class="form-group">
-                        <label>优先级</label>
-                        <select id="createPriority">
-                            <option value="medium">中 (medium)</option>
-                            <option value="low">低 (low)</option>
-                            <option value="high">高 (high)</option>
-                            <option value="critical">紧急 (critical)</option>
-                        </select>
+                        <label>任务标题</label>
+                        <input type="text" id="createTitle" placeholder="自动生成或手动输入">
                     </div>
-                    <div class="form-group">
-                        <label>指派给 Agent</label>
-                        <select id="createAssignedAgent">
-                            <option value="">不指定（自己处理）</option>
-                        </select>
+                    
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>优先级</label>
+                            <select id="createPriority">
+                                <option value="medium">中 (medium)</option>
+                                <option value="low">低 (low)</option>
+                                <option value="high">高 (high)</option>
+                                <option value="critical">紧急 (critical)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>指派给 Agent</label>
+                            <select id="createAssignedAgent">
+                                <option value="">不指定（自己处理）</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>任务类型</label>
+                            <select id="createTaskType">
+                                <option value="">通用任务</option>
+                                <option value="data-collection">数据采集</option>
+                                <option value="analysis">数据分析</option>
+                                <option value="development">开发任务</option>
+                                <option value="deployment">部署任务</option>
+                                <option value="validation">验证任务</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>标签</label>
+                            <div class="tag-input-container" onclick="document.getElementById('createTagInput').focus()">
+                                <div id="createTagList"></div>
+                                <input type="text" class="tag-input" id="createTagInput" placeholder="输入标签后按回车添加">
+                            </div>
+                        </div>
                     </div>
                 </div>
-                <div class="form-group">
-                    <label>标签</label>
-                    <div class="tag-input-container" onclick="document.getElementById('createTagInput').focus()">
-                        <div id="createTagList"></div>
-                        <input type="text" class="tag-input" id="createTagInput" placeholder="输入标签后按回车添加">
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>验收标准</label>
-                    <textarea id="createAcceptanceCriteria" placeholder="明确任务完成的标准，用于自动校验"></textarea>
-                </div>
+
                 <div class="create-error" id="createError"></div>
             </div>
             <div class="modal-footer">
@@ -823,6 +955,27 @@
 
         <!-- Tab: Agent Detail (templated per agent, rendered by JS) -->
         <div id="agentTabsContainer"></div>
+
+        <!-- Report Modal -->
+        <div class="modal-overlay hidden" id="reportModal">
+            <div class="modal report-modal">
+                <div class="modal-header">
+                    <h2>📊 任务报告</h2>
+                    <button class="modal-close" onclick="app.hideReportModal()">&times;</button>
+                </div>
+                <div class="modal-body">
+                    <div id="reportContent" style="min-height:400px;">
+                        <div style="display:flex;align-items:center;justify-content:center;height:200px;color:var(--text-muted);">
+                            <span>加载中...</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-ghost" onclick="app.hideReportModal()">关闭</button>
+                    <button class="btn btn-primary" onclick="app.downloadReport()">下载报告</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1830,6 +1983,15 @@
                         </div>
                         ` : ''}
                         <div id="subtasks-${t.id}"></div>
+                        <div class="detail-row">
+                            <div class="detail-col">
+                                <div class="detail-label">任务报告</div>
+                                <div class="detail-value">
+                                    <button class="btn btn-sm btn-primary" onclick="event.stopPropagation(); app.showReport('${t._agentId}', '${t.id}')">📊 查看任务报告</button>
+                                    <div style="font-size:0.75rem;color:var(--text-muted);margin-top:6px;">包含任务执行记录、验证记录和时间线</div>
+                                </div>
+                            </div>
+                        </div>
                         ${(t.attempt_log && t.attempt_log.length > 0) ? `
                         <div class="detail-row">
                             <div class="detail-col" style="flex:2">
@@ -2339,6 +2501,103 @@
             }
         },
 
+        // 当前查看的报告信息
+        currentReportAgentId: null,
+        currentReportTaskId: null,
+        currentReportData: null,
+
+        async showReport(agentId, taskId) {
+            this.currentReportAgentId = agentId;
+            this.currentReportTaskId = taskId;
+            
+            const modal = document.getElementById('reportModal');
+            const content = document.getElementById('reportContent');
+            
+            try {
+                content.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:200px;color:var(--text-muted);"><span>加载中...</span></div>';
+                modal.classList.remove('hidden');
+                
+                // 使用 fetch 获取纯文本（Markdown），而不是 JSON
+                const res = await fetch(`/api/agents/${agentId}/todos/${taskId}/report?format=markdown`, {
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+                }
+                
+                const markdown = await res.text();
+                
+                this.currentReportData = markdown;
+                content.innerHTML = this.renderMarkdownReport(markdown);
+            } catch (e) {
+                content.innerHTML = `<div style="color:var(--danger);padding:20px;">❌ 加载报告失败: ${e.message}</div>`;
+            }
+        },
+
+        hideReportModal() {
+            document.getElementById('reportModal').classList.add('hidden');
+            this.currentReportAgentId = null;
+            this.currentReportTaskId = null;
+            this.currentReportData = null;
+        },
+
+        async downloadReport() {
+            if (!this.currentReportAgentId || !this.currentReportTaskId) return;
+            
+            try {
+                // 使用 fetch 获取纯文本（Markdown）
+                const res = await fetch(`/api/agents/${this.currentReportAgentId}/todos/${this.currentReportTaskId}/report?format=markdown`, {
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                
+                if (!res.ok) {
+                    throw new Error(`HTTP ${res.status}: ${await res.text()}`);
+                }
+                
+                const markdown = await res.text();
+                const blob = new Blob([markdown], { type: 'text/markdown' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `task-report-${this.currentReportTaskId}.md`;
+                a.click();
+                URL.revokeObjectURL(url);
+            } catch (e) {
+                alert('下载报告失败: ' + e.message);
+            }
+        },
+
+        renderMarkdownReport(markdown) {
+            // 简单的 markdown 渲染
+            let html = markdown;
+            
+            // 标题
+            html = html.replace(/^### (.+)$/gm, '<h3>$1</h3>');
+            html = html.replace(/^## (.+)$/gm, '<h2>$1</h2>');
+            html = html.replace(/^# (.+)$/gm, '<h1>$1</h1>');
+            
+            // 列表
+            html = html.replace(/^- (.+)$/gm, '<li>$1</li>');
+            html = html.replace(/(<li>[\s\S]*?<\/li>)/gm, '<ul>$1</ul>');
+            
+            // 粗体和斜体
+            html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+            html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+            
+            // 代码
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="language-$1">$2</code></pre>');
+            
+            // 链接
+            html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank">$1</a>');
+            
+            // 换行
+            html = html.replace(/\n/g, '<br>');
+            
+            return `<div class="report-content">${html}</div>`;
+        },
+
         formatSchedule(schedule) {
             if (!schedule) return '—';
             if (schedule === 'daily') return '📅 每天';
@@ -2437,11 +2696,370 @@
             agentSelect.innerHTML = '<option value="">不指定（自己处理）</option>' +
                 this.agents.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
 
+            // 加载询问智能体的下拉菜单
+            const askAgentSelect = document.getElementById('askAgentSelect');
+            askAgentSelect.innerHTML = '<option value="">选择要询问的智能体...</option>' +
+                this.agents.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+            
+            // 添加智能体选择事件监听
+            askAgentSelect.onchange = () => {
+                const btn = document.getElementById('askAgentBtn');
+                btn.disabled = !askAgentSelect.value;
+            };
+
+            // 重置询问智能体的对话内容
+            document.getElementById('askAgentChat').innerHTML = `
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <span>💡</span>
+                    <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                        您可以先询问智能体获取相关信息，例如数据存储位置、任务详情等。<br>
+                        <span style="font-size:0.75rem;color:#a0aec0;">示例：请问数据存储在哪里？</span>
+                    </div>
+                </div>
+            `;
+
             document.getElementById('createTitle').focus();
         },
 
         hideCreateTaskModal() {
             document.getElementById('createTaskModal').classList.add('hidden');
+            // 重置对话内容
+            document.getElementById('createDescriptionChat').innerHTML = `
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <span>🤖</span>
+                    <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                        请用自然语言描述您需要完成的任务，我会帮您分析并提取关键信息。<br>
+                        <span style="font-size:0.75rem;color:#a0aec0;">示例：帮我采集A股stk_limit数据到2026-04-30</span>
+                    </div>
+                </div>
+            `;
+            document.getElementById('createCriteriaChat').innerHTML = `
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <span>✅</span>
+                    <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                        请描述任务完成的验收标准，用于自动校验任务是否成功完成。<br>
+                        <span style="font-size:0.75rem;color:#a0aec0;">示例：数据采集到2026-04-30，验证MAX(trade_date) = 2026-04-30</span>
+                    </div>
+                </div>
+            `;
+            document.getElementById('askAgentChat').innerHTML = `
+                <div style="display:flex;gap:8px;margin-bottom:8px;">
+                    <span>💡</span>
+                    <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                        您可以先询问智能体获取相关信息，例如数据存储位置、任务详情等。<br>
+                        <span style="font-size:0.75rem;color:#a0aec0;">示例：请问数据存储在哪里？</span>
+                    </div>
+                </div>
+            `;
+            document.getElementById('createDescriptionInput').value = '';
+            document.getElementById('createCriteriaInput').value = '';
+            document.getElementById('askAgentInput').value = '';
+            document.getElementById('createDescription').value = '';
+            document.getElementById('createAcceptanceCriteria').value = '';
+            document.getElementById('analysisResult').style.display = 'none';
+            document.getElementById('createTitle').value = '';
+            this._createTags = [];
+            document.getElementById('createTagList').innerHTML = '';
+        },
+
+        addDescriptionMessage() {
+            const input = document.getElementById('createDescriptionInput');
+            const value = input.value.trim();
+            if (!value) return;
+
+            const chat = document.getElementById('createDescriptionChat');
+            chat.innerHTML += `
+                <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:flex-end;">
+                    <div style="background:var(--primary);color:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;max-width:80%;">${this.escape(value)}</div>
+                    <span>👤</span>
+                </div>
+            `;
+            input.value = '';
+            chat.scrollTop = chat.scrollHeight;
+
+            // 更新隐藏的textarea
+            const existing = document.getElementById('createDescription').value;
+            document.getElementById('createDescription').value = existing ? existing + '\n' + value : value;
+        },
+
+        addCriteriaMessage() {
+            const input = document.getElementById('createCriteriaInput');
+            const value = input.value.trim();
+            if (!value) return;
+
+            const chat = document.getElementById('createCriteriaChat');
+            chat.innerHTML += `
+                <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:flex-end;">
+                    <div style="background:var(--primary);color:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;max-width:80%;">${this.escape(value)}</div>
+                    <span>👤</span>
+                </div>
+            `;
+            input.value = '';
+            chat.scrollTop = chat.scrollHeight;
+
+            // 更新隐藏的textarea
+            const existing = document.getElementById('createAcceptanceCriteria').value;
+            document.getElementById('createAcceptanceCriteria').value = existing ? existing + '\n' + value : value;
+        },
+
+        async analyzeTask() {
+            const description = document.getElementById('createDescription').value.trim();
+            const criteria = document.getElementById('createAcceptanceCriteria').value.trim();
+
+            if (!description) {
+                const err = document.getElementById('createError');
+                err.textContent = '请先描述任务内容';
+                err.style.display = 'block';
+                return;
+            }
+
+            const resultDiv = document.getElementById('analysisResult');
+            resultDiv.style.display = 'block';
+            
+            // 显示加载状态
+            document.getElementById('analysisTitle').textContent = '分析中...';
+            document.getElementById('analysisSteps').innerHTML = '<li>正在解析...</li>';
+            document.getElementById('analysisCriteria').textContent = '';
+
+            try {
+                // 模拟智能解析（实际应用中应该调用后端API）
+                await new Promise(resolve => setTimeout(resolve, 1000));
+
+                // 模拟解析结果
+                const analysis = this.simulateAnalysis(description, criteria);
+
+                document.getElementById('analysisTitle').textContent = analysis.title;
+                document.getElementById('analysisSteps').innerHTML = analysis.steps.map(s => `<li>${s}</li>`).join('');
+                document.getElementById('analysisCriteria').textContent = analysis.criteria;
+
+                // 自动填充任务标题
+                if (!document.getElementById('createTitle').value) {
+                    document.getElementById('createTitle').value = analysis.title;
+                }
+
+                // 如果没有验收标准，使用解析结果
+                if (!document.getElementById('createAcceptanceCriteria').value) {
+                    document.getElementById('createAcceptanceCriteria').value = analysis.criteria;
+                    document.getElementById('createCriteriaChat').innerHTML += `
+                        <div style="display:flex;gap:8px;margin-bottom:8px;">
+                            <span>✅</span>
+                            <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                                ${this.escape(analysis.criteria)}
+                            </div>
+                        </div>
+                    `;
+                }
+
+            } catch (e) {
+                const err = document.getElementById('createError');
+                err.textContent = '解析失败：' + e.message;
+                err.style.display = 'block';
+            }
+        },
+
+        // 询问智能体获取信息
+        async askAgent() {
+            const agentId = document.getElementById('askAgentSelect').value;
+            const question = document.getElementById('askAgentInput').value.trim();
+            
+            if (!agentId) {
+                alert('请先选择要询问的智能体');
+                return;
+            }
+            
+            if (!question) {
+                alert('请输入您的问题');
+                return;
+            }
+
+            const chatDiv = document.getElementById('askAgentChat');
+            const input = document.getElementById('askAgentInput');
+            
+            // 添加用户消息
+            chatDiv.innerHTML += `
+                <div style="display:flex;gap:8px;margin-bottom:8px;justify-content:flex-end;">
+                    <div style="background:var(--primary);color:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;max-width:80%;">
+                        ${this.escape(question)}
+                    </div>
+                    <span>👤</span>
+                </div>
+            `;
+            
+            // 清空输入
+            input.value = '';
+            
+            // 滚动到底部
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+            
+            try {
+                // 添加加载状态
+                chatDiv.innerHTML += `
+                    <div style="display:flex;gap:8px;margin-bottom:8px;">
+                        <span>🤖</span>
+                        <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text-muted);border:1px solid var(--border);">
+                            正在思考...
+                        </div>
+                    </div>
+                `;
+                chatDiv.scrollTop = chatDiv.scrollHeight;
+                
+                // 调用API询问智能体
+                const res = await fetch(`/api/agents/${agentId}/todos`, {
+                    method: 'POST',
+                    headers: { 
+                        'Content-Type': 'application/json',
+                        'X-Agent-Secret': this.secretKey
+                    },
+                    body: JSON.stringify({
+                        title: `临时咨询: ${question.substring(0, 30)}...`,
+                        description: question,
+                        priority: 'low',
+                        tags: ['temporary', 'question']
+                    })
+                });
+                
+                const data = await res.json();
+                
+                // 移除加载状态
+                const children = chatDiv.children;
+                if (children.length > 0) {
+                    const lastChild = children[children.length - 1];
+                    if (lastChild.textContent.includes('正在思考')) {
+                        chatDiv.removeChild(lastChild);
+                    }
+                }
+                
+                // 添加智能体回复
+                if (data.success) {
+                    chatDiv.innerHTML += `
+                        <div style="display:flex;gap:8px;margin-bottom:8px;">
+                            <span>🤖</span>
+                            <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--text);border:1px solid var(--border);max-width:80%;">
+                                ${this.escape(data.data?.title || '已收到您的问题，智能体正在处理...')}
+                            </div>
+                        </div>
+                    `;
+                } else {
+                    chatDiv.innerHTML += `
+                        <div style="display:flex;gap:8px;margin-bottom:8px;">
+                            <span>🤖</span>
+                            <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--danger);border:1px solid var(--border);">
+                                发送失败: ${data.message || '未知错误'}
+                            </div>
+                        </div>
+                    `;
+                }
+                
+                chatDiv.scrollTop = chatDiv.scrollHeight;
+                
+            } catch (e) {
+                // 移除加载状态
+                const children = chatDiv.children;
+                if (children.length > 0) {
+                    const lastChild = children[children.length - 1];
+                    if (lastChild.textContent.includes('正在思考')) {
+                        chatDiv.removeChild(lastChild);
+                    }
+                }
+                
+                chatDiv.innerHTML += `
+                    <div style="display:flex;gap:8px;margin-bottom:8px;">
+                        <span>🤖</span>
+                        <div style="background:white;padding:8px 12px;border-radius:8px;font-size:0.85rem;color:var(--danger);border:1px solid var(--border);">
+                            请求失败: ${e.message}
+                        </div>
+                    </div>
+                `;
+                chatDiv.scrollTop = chatDiv.scrollHeight;
+            }
+        },
+
+        simulateAnalysis(description, criteria) {
+            // 简单的规则匹配来模拟AI解析
+            let title = description.substring(0, 50) + (description.length > 50 ? '...' : '');
+            let steps = [];
+            let finalCriteria = criteria;
+
+            // 尝试提取关键词（注意：更具体的关键词应该放在前面）
+            
+            // 数据验证任务（验证、校验、检查）
+            if (description.includes('验证') || description.includes('校验') || description.includes('检查')) {
+                title = '数据验证任务';
+                steps.push('分析验证需求');
+                steps.push('设计验证规则');
+                steps.push('执行验证流程');
+                steps.push('生成验证报告');
+                if (!finalCriteria) finalCriteria = '验证完成，所有校验项通过';
+            
+            // 数据采集任务（采集、抓取、爬取）
+            } else if (description.includes('采集') || description.includes('抓取') || description.includes('爬取')) {
+                title = '数据采集任务';
+                steps.push('分析数据源需求');
+                steps.push('编写采集脚本');
+                steps.push('执行数据采集');
+                if (!finalCriteria) finalCriteria = '数据采集完成，验证数据完整性';
+            
+            // 数据分析任务（分析、统计、计算）
+            } else if (description.includes('分析') || description.includes('统计') || description.includes('计算')) {
+                title = '数据分析任务';
+                steps.push('收集分析数据');
+                steps.push('执行分析计算');
+                steps.push('生成分析报告');
+                if (!finalCriteria) finalCriteria = '分析报告生成完成，包含关键指标';
+            
+            // 开发任务（开发、实现、编码）
+            } else if (description.includes('开发') || description.includes('实现') || description.includes('编码')) {
+                title = '开发任务';
+                steps.push('需求分析');
+                steps.push('代码实现');
+                steps.push('单元测试');
+                if (!finalCriteria) finalCriteria = '功能开发完成，测试通过';
+            
+            // 部署任务（部署、发布、上线）
+            } else if (description.includes('部署') || description.includes('发布') || description.includes('上线')) {
+                title = '部署任务';
+                steps.push('准备部署环境');
+                steps.push('执行部署流程');
+                steps.push('验证部署结果');
+                if (!finalCriteria) finalCriteria = '服务部署成功，可正常访问';
+            
+            // 测试任务（测试、用例）
+            } else if (description.includes('测试') || description.includes('用例')) {
+                title = '测试任务';
+                steps.push('编写测试用例');
+                steps.push('执行测试');
+                steps.push('分析测试结果');
+                if (!finalCriteria) finalCriteria = '所有测试用例通过';
+            
+            // 文档任务（文档、编写、撰写）
+            } else if (description.includes('文档') || description.includes('编写') || description.includes('撰写')) {
+                title = '文档任务';
+                steps.push('收集文档素材');
+                steps.push('编写文档内容');
+                steps.push('审核文档质量');
+                if (!finalCriteria) finalCriteria = '文档编写完成，内容完整准确';
+            }
+
+            // 尝试从描述中提取日期
+            const dateMatch = description.match(/(\d{4}-\d{2}-\d{2})/);
+            if (dateMatch) {
+                title += ' - ' + dateMatch[1];
+                if (!finalCriteria && !finalCriteria?.includes(dateMatch[1])) {
+                    finalCriteria = (finalCriteria || '') + (finalCriteria ? '，' : '') + `截止日期: ${dateMatch[1]}`;
+                }
+            }
+
+            // 尝试从描述中提取目标对象
+            const targetMatch = description.match(/([A-Za-z0-9_]+(?:_[A-Za-z0-9_]+)*)/);
+            if (targetMatch && !title.includes(targetMatch[1])) {
+                title += ' - ' + targetMatch[1];
+            }
+
+            return {
+                title: title,
+                steps: steps.length > 0 ? steps : ['执行任务', '验证结果'],
+                criteria: finalCriteria || '任务执行完成'
+            };
         },
 
         async createTask() {

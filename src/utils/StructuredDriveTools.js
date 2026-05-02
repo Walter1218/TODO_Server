@@ -209,13 +209,23 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
 
     const prevProgress = task.heartbeat_progress || 0;
     const toResolve = explicitResolved || [];
-    if (toResolve.length > 0) {
+    
+    // 如果进度有明显提升（超过10%），自动清除所有阻塞项
+    // 这可以解决 StuckTaskMonitor 误判导致的阻塞标记
+    const progressDelta = progress - prevProgress;
+    if (progressDelta > 10 && currentBlockers.length > 0) {
+      const clearedBlockers = [...currentBlockers];
+      currentBlockers.length = 0; // 清除所有阻塞项
+      note = `进度提升 ${progressDelta}%，自动清除阻塞标记: ${clearedBlockers.join(', ')}`;
+    } else if (toResolve.length > 0) {
+      // 用户显式解决阻塞
       toResolve.forEach(rb => {
         const idx = currentBlockers.indexOf(rb);
         if (idx !== -1) currentBlockers.splice(idx, 1);
       });
       note = `已解决阻塞: ${toResolve.join(', ')}`;
     } else if (progress > prevProgress && currentBlockers.length > 0) {
+      // 自动清理非严重阻塞项
       const autoResolved = currentBlockers.filter(b =>
         !b.includes('网络') && !b.includes('权限') && !b.includes('人工')
       );

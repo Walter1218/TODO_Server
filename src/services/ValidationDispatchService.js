@@ -1,6 +1,7 @@
 const Todo = require('../models/Todo');
 const Context = require('../models/Context');
 const Notification = require('../models/Notification');
+const FocusState = require('../models/FocusState');
 
 class ValidationDispatchService {
   constructor() {
@@ -10,6 +11,13 @@ class ValidationDispatchService {
   async dispatchValidationTask(executorAgentId, task, originalExecutionLogs) {
     const taskId = task.id;
     const taskTitle = task.title;
+
+    // 检查是否已经存在相同的验证任务（防止重复创建）
+    const existingValidationTask = Todo.findByTitle(this.validatorAgentId, `[验证] ${taskTitle}`);
+    if (existingValidationTask && existingValidationTask.status === 'pending') {
+      console.log(`[ValidationDispatch] 验证任务已存在，跳过创建: ${existingValidationTask.id}`);
+      return existingValidationTask;
+    }
 
     const validationTaskTitle = `[验证] ${taskTitle}`;
     const validationTaskDescription = `## 验证任务
@@ -61,8 +69,12 @@ Body:
         originalTaskId: taskId,
         executorAgentId: executorAgentId,
         dispatchedAt: new Date().toISOString()
-      })
+      }),
+      assigned_agent_id: this.validatorAgentId  // 添加指派
     });
+
+    // 自动聚焦到验证任务
+    await FocusState.setFocus(this.validatorAgentId, validationTask.id);
 
     Context.create(this.validatorAgentId, {
       sessionId: 'validation-dispatch',

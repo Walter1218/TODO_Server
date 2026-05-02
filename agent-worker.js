@@ -17,7 +17,7 @@ const WORK_PROMPT_INTERVAL_MS = 5 * 60 * 1000; // 主动工作触发间隔：5�
 const ACTIVITY_LOG_LIMIT = 200; // 最多保留 200 条活动记录
 
 class AgentWorker {
-  constructor() {
+  constructor(agentId = null) {
     this.framework = null;
     this.heartbeatTimer = null;
     this.workTimer = null;
@@ -28,14 +28,21 @@ class AgentWorker {
     this.lastFocusSyncTime = 0;    // 上次强制同步 focus 的时间
     this.workLoopBusy = false;     // 防止 _workLoop 并发执行
     this.consecutiveCmdFailures = 0; // 当前任务连续命令失败次数
+    this.agentId = agentId;        // 指定的 agent ID
   }
 
   async start() {
     console.log('🚀 Agent Worker 启动中...');
 
-    // 1. 初始化框架
-    this.framework = AgentTaskFramework.fromConfig();
+    // 1. 初始化框架（支持指定 agentId）
+    const configOverride = this.agentId ? { base: { agentId: this.agentId } } : {};
+    this.framework = AgentTaskFramework.fromConfig(null, configOverride);
     await this.framework.initialize();
+    
+    // 显示使用的 agent ID
+    if (this.agentId) {
+      console.log(`🎯 使用指定的 Agent ID: ${this.agentId}`);
+    }
 
     const status = this.framework.getStatus();
     console.log('📊 框架状态：');
@@ -546,7 +553,11 @@ class AgentWorker {
 
 // 启动
 if (require.main === module) {
-  const worker = new AgentWorker();
+  const args = process.argv.slice(2);
+  const agentIndex = args.indexOf('--agent');
+  const agentId = agentIndex !== -1 && args[agentIndex + 1] ? args[agentIndex + 1] : null;
+  
+  const worker = new AgentWorker(agentId);
   worker.start().catch(err => {
     console.error('启动失败:', err);
     process.exit(1);

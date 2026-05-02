@@ -220,8 +220,11 @@ POST /api/agents/:id/todos/:id/heartbeat
 ### 5. 验收标准与自驱校验
 - **验收清单**：LLM 自动生成结构化验收清单，用户确认后开始执行。
 - **自驱验收**：Worker 完成任务后调用 `proposeCompletion()`，状态转为 `pending_validation`。
+- **第三方验证**：`ValidationDispatchService` 自动派发验证任务给指定智能体，避免自我验证。
+- **防重复机制**：基于 `Todo.findByTitle()` 防止同一任务重复创建验证任务。
 - **自动质检**：`ValidatorService` 自动读取执行上下文并进行 LLM 审计，通过则标记 `completed`，失败则打回并附带改进建议。
 - **任务流程报告**：验证完成后自动生成任务报告，包含基本信息、执行记录、验证记录和时间线，支持 JSON 和 Markdown 格式。
+- **网页端报告查看**：支持在任务详情中直接查看和下载任务报告。
 
 ### 6. 漂移检测（Drift Detection）
 - LLM 语义分析对话是否偏离当前任务
