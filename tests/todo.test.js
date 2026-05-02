@@ -339,6 +339,107 @@ describe('Templates and Scheduling', () => {
     expect(spawned.status).toBe('pending');
   });
 
+  test('spawn from template sets parent_id to template', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Daily Check',
+      schedule: 'daily',
+      isTemplate: true,
+      description: 'Check all services'
+    });
+
+    const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+    expect(spawned.parent_id).toBe(template.id);
+  });
+
+  test('spawn from template inherits description and context', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Health Check',
+      schedule: 'cron:0 9 * * *',
+      isTemplate: true,
+      description: 'Check system health',
+      context: 'production env'
+    });
+
+    const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+    expect(spawned.description).toBe('Check system health');
+    expect(spawned.context).toBe('production env');
+  });
+
+  test('findPendingByTemplate returns pending spawned tasks', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Patrol',
+      schedule: 'daily',
+      isTemplate: true
+    });
+
+    Todo.spawnFromTemplate(agent.id, template.id);
+    Todo.spawnFromTemplate(agent.id, template.id);
+
+    const pending = Todo.findPendingByTemplate(agent.id, template.id);
+    expect(pending.length).toBe(2);
+    expect(pending[0].parent_id).toBe(template.id);
+  });
+
+  test('findPendingByTemplate excludes completed tasks', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Patrol',
+      schedule: 'daily',
+      isTemplate: true
+    });
+
+    const s1 = Todo.spawnFromTemplate(agent.id, template.id);
+    Todo.spawnFromTemplate(agent.id, template.id);
+    Todo.updateStatus(agent.id, s1.id, 'completed');
+
+    const pending = Todo.findPendingByTemplate(agent.id, template.id);
+    expect(pending.length).toBe(1);
+  });
+
+  test('writeReport updates description and context', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Health Check',
+      schedule: 'daily',
+      isTemplate: true,
+      description: 'Check health'
+    });
+
+    const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+    const updated = Todo.writeReport(agent.id, spawned.id, {
+      status: 'completed',
+      description: 'All services healthy',
+      context: 'CPU 20%, Memory 45%'
+    });
+
+    expect(updated.status).toBe('completed');
+    expect(updated.description).toBe('All services healthy');
+    expect(updated.context).toBe('CPU 20%, Memory 45%');
+    expect(updated.completed_at).toBeTruthy();
+  });
+
+  test('writeReport partial update preserves other fields', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Check',
+      schedule: 'daily',
+      isTemplate: true,
+      description: 'Original desc'
+    });
+
+    const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+    const updated = Todo.writeReport(agent.id, spawned.id, {
+      heartbeatProgress: 50,
+      heartbeatStep: 'Running checks'
+    });
+
+    expect(updated.description).toBe('Original desc');
+    expect(updated.heartbeat_progress).toBe(50);
+    expect(updated.heartbeat_step).toBe('Running checks');
+  });
+
+  test('writeReport throws for non-existent task', () => {
+    expect(() => Todo.writeReport(agent.id, 'non-existent', { status: 'completed' }))
+      .toThrow('Task not found');
+  });
+
   test('computeNextDueAt daily', () => {
     const now = new Date('2025-01-15T10:00:00Z');
     const next = Todo.computeNextDueAt('daily', now);

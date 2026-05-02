@@ -141,6 +141,17 @@ app.listen(PORT, () => {
     });
     // 挂载到 app 供路由使用
     app.set('driveFramework', driveFramework);
+
+    const DriveOrchestrator = require('./services/DriveOrchestrator');
+    const driveOrchestrator = new DriveOrchestrator({
+      intervalMs: 60 * 1000,
+      maxRetries: 3,
+      retryBackoffMs: [0, 5000, 15000],
+      driveCooldownMs: 60 * 1000,
+      stallThreshold: 30 * 60 * 1000,
+    });
+    driveOrchestrator.start(driveFramework);
+    app.set('driveOrchestrator', driveOrchestrator);
   } catch (err) {
     console.error('[Framework] 加载失败:', err.message);
   }
@@ -378,13 +389,16 @@ app.listen(PORT, () => {
             const spawned = Todo.spawnFromTemplate(agent.id, template.id);
             totalSpawned++;
 
-            // Record spawn event in contexts for frontend visibility
             Context.create(agent.id, {
               sessionId: 'scheduler',
               role: 'system',
               content: `[DailyScheduler] 定时任务「${template.title}」已生成实例（ID: ${spawned.id}）`,
               metadata: { type: 'task_spawn', template_id: template.id, spawned_id: spawned.id }
             });
+
+            Notification.create(agent.id, spawned.id, 'assigned',
+              `定时模板「${template.title}」已生成执行实例，等待 cron job 认领执行`
+            );
 
             console.log(`[DailyScheduler] Agent ${agent.id}: 从模板 ${template.id} 生成任务 ${spawned.id}「${spawned.title}」`);
           } catch (spawnErr) {
@@ -402,6 +416,68 @@ app.listen(PORT, () => {
   }, SCHEDULER_INTERVAL_MS);
 
   console.log(`[DailyScheduler] 已启动，每 ${SCHEDULER_INTERVAL_MS / 1000}s 检查一次到期模板任务`);
+
+  // AssignmentDriver：每 60 秒扫描已指派但长时间未执行的任务，自动 focus + 通知
+  const ASSIGN_DRIVER_INTERVAL_MS = 60 * 1000;
+  const ASSIGN_STALE_MINUTES = 5;
+
+  setInterval(async () => {
+    try {
+      const db = getDb();
+      const agents = Agent.findAll();
+      let totalDriven = 0;
+
+      for (const agent of agents) {
+        const staleThreshold = new Date(Date.now() - ASSIGN_STALE_MINUTES * 60 * 1000).toISOString();
+
+        const staleAssigned = db.prepare(`
+          SELECT * FROM todos
+          WHERE assigned_agent_id = ?
+            AND status = 'pending'
+            AND (assigned_at IS NOT NULL AND assigned_at <= ?)
+            AND (is_template = 0 OR is_template IS NULL)
+          ORDER BY CASE priority WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END
+          LIMIT 5
+        `).all(agent.id, staleThreshold);
+
+        for (const rawTask of staleAssigned) {
+          try {
+            const focus = FocusState.findByAgent(agent.id);
+            if (focus && focus.current_task_id === rawTask.id) {
+              continue;
+            }
+
+            FocusState.createOrUpdate(agent.id, { currentTaskId: rawTask.id, focusMode: 'auto' });
+
+            Notification.create(agent.id, rawTask.id, 'assigned',
+              `[AssignmentDriver] 任务「${rawTask.title}」被指派后超过 ${ASSIGN_STALE_MINUTES} 分钟未启动，已自动聚焦`
+            );
+
+            Context.create(agent.id, {
+              sessionId: 'assignment-driver',
+              role: 'system',
+              content: `[AssignmentDriver] 任务「${rawTask.title}」被指派后超过 ${ASSIGN_STALE_MINUTES} 分钟未启动，已自动聚焦`,
+              metadata: { type: 'assignment_driver_recover', task_id: rawTask.id, stale_minutes: ASSIGN_STALE_MINUTES }
+            });
+            Context.pruneBySession(agent.id, 'assignment-driver', 50);
+
+            console.log(`[AssignmentDriver] Agent ${agent.id}: 任务 ${rawTask.id}「${rawTask.title}」被指派后超时，已自动聚焦`);
+            totalDriven++;
+          } catch (taskErr) {
+            console.error(`[AssignmentDriver] 处理任务 ${rawTask.id} 失败:`, taskErr.message);
+          }
+        }
+      }
+
+      if (totalDriven > 0) {
+        console.log(`[AssignmentDriver] 本次共驱动 ${totalDriven} 个超时未执行的已指派任务`);
+      }
+    } catch (err) {
+      console.error('[AssignmentDriver] 巡检时出错:', err.message);
+    }
+  }, ASSIGN_DRIVER_INTERVAL_MS);
+
+  console.log(`[AssignmentDriver] 已启动，每 ${ASSIGN_DRIVER_INTERVAL_MS / 1000}s 扫描已指派但未执行的任务（超时阈值 ${ASSIGN_STALE_MINUTES} 分钟）`);
 
   // 工作快照轮询：每 30 秒采集所有 Agent 工作状态
   const SNAPSHOT_INTERVAL_MS = 30 * 1000;

@@ -10,8 +10,10 @@
     "dev": "node --watch src/server.js",
     "agent": "node start.js",
     "test": "jest --runInBand --forceExit --detectOpenHandles",
-    "test:coverage": "jest --runInBand --forceExit --detectOpenHandles --coverage"
+    "test:coverage": "jest --runInBand --forceExit --detectOpenHandles --coverage",
+    "patch:hermes": "node scripts/patch-hermes-scheduler.js"
   },
+  "postinstall": "node scripts/patch-hermes-scheduler.js",
   "keywords": [
     "todo",
     "task-management",

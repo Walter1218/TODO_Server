@@ -274,6 +274,13 @@ function initializeSchema() {
   } catch (e) {
     // Column already exists, ignore
   }
+
+  // Migration: add last_driven_at column for DriveOrchestrator cooldown
+  try {
+    db.prepare(`ALTER TABLE todos ADD COLUMN last_driven_at DATETIME`).run();
+  } catch (e) {
+    // Column already exists, ignore
+  }
 }
 
 module.exports = { getDb };

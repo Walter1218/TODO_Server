@@ -469,6 +469,49 @@
             .agent-grid { grid-template-columns: 1fr; }
         }
 
+        /* Tab Navigation */
+        .tab-bar {
+            display: flex; gap: 0; margin-bottom: 24px;
+            border-bottom: 2px solid var(--border); overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+        }
+        .tab-bar::-webkit-scrollbar { height: 0; }
+        .tab-item {
+            padding: 12px 20px; cursor: pointer; font-size: 0.9rem;
+            font-weight: 500; color: var(--text-muted); white-space: nowrap;
+            border-bottom: 3px solid transparent; transition: all 0.2s;
+            display: flex; align-items: center; gap: 6px;
+            background: none; border-top: none; border-left: none; border-right: none;
+            position: relative; bottom: -2px;
+        }
+        .tab-item:hover { color: var(--primary); background: rgba(102,126,234,0.04); }
+        .tab-item.active {
+            color: var(--primary); border-bottom-color: var(--primary);
+            font-weight: 600;
+        }
+        .tab-badge {
+            font-size: 0.7rem; padding: 1px 6px; border-radius: 10px;
+            background: var(--border); color: var(--text-muted); font-weight: 600;
+        }
+        .tab-item.active .tab-badge {
+            background: rgba(102,126,234,0.15); color: var(--primary);
+        }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .tab-agent-header {
+            display: flex; align-items: center; gap: 16px;
+            margin-bottom: 20px; padding: 16px 20px;
+            background: var(--card); border-radius: 10px; box-shadow: var(--shadow);
+            border-left: 4px solid var(--primary);
+        }
+        .tab-agent-name { font-size: 1.1rem; font-weight: 700; }
+        .tab-agent-meta { font-size: 0.85rem; color: var(--text-muted); display: flex; gap: 16px; }
+        .tab-section-title {
+            font-size: 1rem; font-weight: 700; margin: 20px 0 12px;
+            display: flex; align-items: center; gap: 8px;
+            padding-bottom: 8px; border-bottom: 1px solid var(--border);
+        }
+
         .hidden { display: none !important; }
 
         /* Parent-Child Task Hierarchy */
@@ -654,87 +697,45 @@
         <!-- Stuck Alert -->
         <div id="stuckBanner"></div>
 
-        <!-- Agent Work Panels -->
-        <div class="section">
-            <div class="section-header">
-                <div class="section-title">🎯 Agent 工作面板</div>
-            </div>
-            <div class="agent-grid" id="agentGrid"></div>
-        </div>
+        <!-- Tab Navigation -->
+        <div class="tab-bar" id="tabBar"></div>
 
-        <!-- Agent Activity Stream -->
-        <div class="section">
-            <div class="section-header">
-                <div class="section-title">📡 智能体活动流</div>
+        <!-- Tab: Overview -->
+        <div class="tab-content active" id="tab-overview">
+            <!-- Agent Work Panels -->
+            <div class="section">
+                <div class="section-title tab-section-title">🎯 Agent 工作面板</div>
+                <div class="agent-grid" id="agentGrid"></div>
             </div>
-            <div id="activityStream"></div>
-        </div>
 
-        <!-- Work Snapshots -->
-        <div class="section">
-            <div class="section-header">
-                <div class="section-title">📊 工作快照 <span style="font-size:0.75rem;color:var(--text-muted);font-weight:400;">每30秒采集</span></div>
-            </div>
-            <div class="snapshot-list" id="snapshotList"></div>
-        </div>
-
-        <!-- Main Content: Tasks + Notifications -->
-        <div class="dashboard-layout">
-            <div>
-                <!-- Task List -->
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">📋 任务列表 <span class="badge" id="taskCountBadge"></span></div>
+            <div class="dashboard-layout">
+                <div>
+                    <!-- Projects -->
+                    <div class="section">
+                        <div class="section-title tab-section-title">📁 项目看板</div>
+                        <div class="project-grid" id="projectGrid"></div>
                     </div>
-                    <div class="filters">
-                        <select id="filterStatus" onchange="app.filterTasks()">
-                            <option value="">全部状态</option>
-                            <option value="in_progress">进行中</option>
-                            <option value="pending">待处理</option>
-                            <option value="completed">已完成</option>
-                            <option value="blocked">已卡住</option>
-                            <option value="cancelled">已取消</option>
-                        </select>
-                        <select id="filterPriority" onchange="app.filterTasks()">
-                            <option value="">全部优先级</option>
-                            <option value="critical">紧急</option>
-                            <option value="high">高</option>
-                            <option value="medium">中</option>
-                            <option value="low">低</option>
-                        </select>
-                        <input type="text" id="filterSearch" placeholder="🔍 搜索任务标题..." oninput="app.filterTasks()">
+                    <!-- Scheduled Templates -->
+                    <div class="section">
+                        <div class="section-title tab-section-title">📅 定时任务</div>
+                        <div class="template-grid" id="templateGrid"></div>
                     </div>
-                    <div class="task-list" id="taskList"></div>
                 </div>
-
-                <!-- Projects -->
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">📁 项目看板</div>
+                <!-- Notifications Sidebar -->
+                <div>
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title">🔔 通知中心 <span class="badge" id="notifBadge"></span></div>
+                            <button class="btn btn-sm" style="background:var(--bg);color:var(--text-muted);border:1px solid var(--border);" onclick="app.markAllRead()">全部已读</button>
+                        </div>
+                        <div class="notif-list" id="notifList"></div>
                     </div>
-                    <div class="project-grid" id="projectGrid"></div>
-                </div>
-
-                <!-- Scheduled Templates -->
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">📅 定时任务</div>
-                    </div>
-                    <div class="template-grid" id="templateGrid"></div>
-                </div>
-            </div>
-
-            <!-- Notifications Sidebar -->
-            <div>
-                <div class="section">
-                    <div class="section-header">
-                        <div class="section-title">🔔 通知中心 <span class="badge" id="notifBadge"></span></div>
-                        <button class="btn btn-sm" style="background:var(--bg);color:var(--text-muted);border:1px solid var(--border);" onclick="app.markAllRead()">全部已读</button>
-                    </div>
-                    <div class="notif-list" id="notifList"></div>
                 </div>
             </div>
         </div>
+
+        <!-- Tab: Agent Detail (templated per agent, rendered by JS) -->
+        <div id="agentTabsContainer"></div>
     </div>
 
     <script>
@@ -748,6 +749,7 @@
         pollInterval: null,
         expandedTasks: new Set(),
         expandedParents: new Set(),
+        activeTab: 'overview',
 
         async init() {
             // Try auto-login from localStorage
@@ -848,8 +850,7 @@
             document.getElementById('headerActions').classList.remove('hidden');
             document.getElementById('connDot').style.background = '#48bb78';
             document.getElementById('connText').textContent = '已连接';
-
-            // Start polling
+            this.renderTabs();
             if (!this.pollInterval) {
                 this.pollInterval = setInterval(() => this.refresh(), 2000);
             }
@@ -927,10 +928,9 @@
             this.renderStats();
             this.renderStuckBanner();
             this.renderAgents();
-            this.renderAgentActivities();
-            this.renderWorkSnapshots();
+            this.renderTabs();
+            this.renderAgentTabPanels();
             this.renderTemplates();
-            this.filterTasks();
             this.renderNotifications();
             this.renderProjects();
 
@@ -1131,6 +1131,368 @@
             }).join('');
 
             document.getElementById('agentGrid').innerHTML = html || '<div class="empty-state">暂无智能体</div>';
+        },
+
+        renderTabs() {
+            const bar = document.getElementById('tabBar');
+            if (!bar) return;
+            let html = `<button class="tab-item ${this.activeTab === 'overview' ? 'active' : ''}" onclick="app.switchTab('overview')">📊 概览</button>`;
+            for (const agent of this.agents) {
+                const d = this.agentData[agent.id] || {};
+                const stats = d.stats?.success ? d.stats.data : {};
+                const inProgress = stats.in_progress || 0;
+                const active = this.activeTab === 'agent-' + agent.id;
+                html += `<button class="tab-item ${active ? 'active' : ''}" onclick="app.switchTab('agent-${agent.id}')">
+                    🤖 ${this.escape(agent.name)}
+                    ${inProgress > 0 ? `<span class="tab-badge">${inProgress}</span>` : ''}
+                </button>`;
+            }
+            bar.innerHTML = html;
+        },
+
+        switchTab(tabId) {
+            this.activeTab = tabId;
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            const target = document.getElementById('tab-' + tabId);
+            if (target) target.classList.add('active');
+            this.renderTabs();
+            if (tabId !== 'overview') {
+                this.renderAgentTabPanels();
+            }
+        },
+
+        renderAgentTabPanels() {
+            const container = document.getElementById('agentTabsContainer');
+            if (!container) return;
+            container.innerHTML = '';
+
+            for (const agent of this.agents) {
+                const tabId = 'tab-agent-' + agent.id;
+                const tabKey = 'agent-' + agent.id;
+                const isActive = this.activeTab === tabKey;
+                const d = this.agentData[agent.id] || {};
+                const stats = d.stats?.success ? d.stats.data : {};
+                const focus = d.focus?.success ? d.focus.data : null;
+                const agentTasks = (d.tasks?.success ? d.tasks.data : []).filter(t => !t.is_template);
+                const stuckTasks = d.stuck?.success ? d.stuck.data : [];
+                const notifications = d.notifications?.success ? d.notifications.data : [];
+                const projects = d.projects?.success ? d.projects.data : [];
+                const activities = d.activities?.success ? d.activities.data : [];
+                const snapshots = d.snapshots?.success ? d.snapshots.data : [];
+                const templates = d.templates?.success ? d.templates.data : [];
+
+                const inProgress = stats.in_progress || 0;
+                const total = stats.total || 0;
+                const completed = stats.completed || 0;
+                const blocked = stats.blocked || 0;
+                const unread = notifications.filter(n => !n.read).length;
+                const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+                let focusTitle = '无聚焦任务';
+                let focusStep = '';
+                if (focus?.current_task) {
+                    focusTitle = focus.current_task.title;
+                    focusStep = focus.current_task.heartbeat_step || '';
+                }
+
+                const panelHtml = `
+                <div class="tab-content ${isActive ? 'active' : ''}" id="${tabId}">
+                    <div class="tab-agent-header">
+                        <div>
+                            <div class="tab-agent-name">🤖 ${this.escape(agent.name)}</div>
+                            <div class="tab-agent-meta">
+                                <span>📋 ${total} 个任务</span>
+                                <span>⚡ ${inProgress} 进行中</span>
+                                <span>✅ ${completed} 已完成</span>
+                                ${blocked > 0 ? `<span style="color:var(--danger);">🚫 ${blocked} 阻塞</span>` : ''}
+                                ${unread > 0 ? `<span style="color:var(--info);">🔔 ${unread} 未读</span>` : ''}
+                            </div>
+                        </div>
+                        <div style="margin-left:auto;display:flex;gap:12px;align-items:center;">
+                            <div style="text-align:center;">
+                                <div style="font-size:1.5rem;font-weight:700;">${pct}%</div>
+                                <div style="font-size:0.72rem;color:var(--text-muted);">完成率</div>
+                            </div>
+                        </div>
+                    </div>
+
+                    ${focus?.current_task ? `
+                    <div style="background:var(--card);border-radius:10px;box-shadow:var(--shadow);padding:16px 20px;margin-bottom:20px;">
+                        <div style="font-size:0.82rem;color:var(--text-muted);margin-bottom:6px;">🎯 当前聚焦</div>
+                        <div style="font-weight:600;font-size:0.95rem;">${this.escape(focusTitle)}</div>
+                        ${focusStep ? `<div style="font-size:0.82rem;color:var(--text-muted);margin-top:4px;">📝 ${this.escape(focusStep)}</div>` : ''}
+                        ${focus.work_analysis ? `
+                        <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
+                            <span class="tag ${focus.work_analysis.status === 'active' ? 'success' : 'blocked'}">${focus.work_analysis.status_label}</span>
+                            <span class="tag">进度 ${Math.round(focus.work_analysis.progress)}%</span>
+                            <span class="tag">健康度 ${Math.round(focus.work_analysis.health_score)}%</span>
+                        </div>` : ''}
+                    </div>` : ''}
+
+                    ${stuckTasks.length > 0 ? `
+                    <div class="stuck-banner" style="margin-bottom:16px;">
+                        <span class="stuck-banner-icon">⚠️</span>
+                        <div><strong>${stuckTasks.length} 个任务超过 30 分钟无心跳</strong>
+                        <div style="font-size:0.85rem;margin-top:4px;">${stuckTasks.map(t => t.title).join('、')}</div></div>
+                    </div>` : ''}
+
+                    <div class="section">
+                        <div class="section-title tab-section-title">📋 任务列表 <span class="badge" id="taskCountBadge-${agent.id}">${agentTasks.filter(t => !t.parent_id).length}</span></div>
+                        <div class="filters">
+                            <select id="filterStatus-${agent.id}" onchange="app.filterAgentTasks('${agent.id}')">
+                                <option value="">全部状态</option>
+                                <option value="in_progress">进行中</option>
+                                <option value="pending">待处理</option>
+                                <option value="completed">已完成</option>
+                                <option value="blocked">已卡住</option>
+                                <option value="cancelled">已取消</option>
+                            </select>
+                            <select id="filterPriority-${agent.id}" onchange="app.filterAgentTasks('${agent.id}')">
+                                <option value="">全部优先级</option>
+                                <option value="critical">紧急</option>
+                                <option value="high">高</option>
+                                <option value="medium">中</option>
+                                <option value="low">低</option>
+                            </select>
+                            <input type="text" id="filterSearch-${agent.id}" placeholder="🔍 搜索任务标题..." oninput="app.filterAgentTasks('${agent.id}')">
+                        </div>
+                        <div class="task-list" id="taskList-${agent.id}"></div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title tab-section-title">📡 活动流</div>
+                        <div class="activities" id="activityStream-${agent.id}"></div>
+                    </div>
+
+                    <div class="section">
+                        <div class="section-title tab-section-title">📊 工作快照 <span style="font-size:0.75rem;color:var(--text-muted);font-weight:400;">每30秒采集</span></div>
+                        <div class="snapshot-list" id="snapshotList-${agent.id}"></div>
+                    </div>
+
+                    ${projects.length > 0 ? `
+                    <div class="section">
+                        <div class="section-title tab-section-title">📁 项目</div>
+                        <div class="project-grid" id="projectGrid-${agent.id}"></div>
+                    </div>` : ''}
+
+                    ${templates.length > 0 ? `
+                    <div class="section">
+                        <div class="section-title tab-section-title">📅 定时任务</div>
+                        <div class="template-grid" id="templateGrid-${agent.id}"></div>
+                    </div>` : ''}
+
+                    <div class="section">
+                        <div class="section-header">
+                            <div class="section-title" style="border:none;margin:0;padding:0;">🔔 通知 <span class="badge" id="notifBadge-${agent.id}">${unread}</span></div>
+                            ${unread > 0 ? `<button class="btn btn-sm" style="background:var(--bg);color:var(--text-muted);border:1px solid var(--border);" onclick="app.markAgentAllRead('${agent.id}')">全部已读</button>` : ''}
+                        </div>
+                        <div class="notif-list" id="notifList-${agent.id}"></div>
+                    </div>
+                </div>`;
+                container.insertAdjacentHTML('beforeend', panelHtml);
+
+                this.renderAgentTasks(agent.id, agentTasks, agent.name);
+                this.renderAgentActivityStream(agent.id, activities, agent.name);
+                this.renderAgentSnapshots(agent.id, snapshots);
+                this.renderAgentProjects(agent.id, projects);
+                this.renderAgentTemplates(agent.id, templates, agent.id);
+                this.renderAgentNotifications(agent.id, notifications);
+            }
+        },
+
+        renderAgentTasks(agentId, tasks, agentName) {
+            const el = document.getElementById(`taskList-${agentId}`);
+            if (!el) return;
+            tasks.forEach(t => { t._agentId = agentId; t._agentName = agentName; });
+            const topTasks = tasks.filter(t => !t.parent_id);
+            if (topTasks.length === 0) {
+                el.innerHTML = '<div class="empty-state" style="padding:20px;font-size:0.85rem;">📭 暂无任务</div>';
+                return;
+            }
+            const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+            const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
+            topTasks.sort((a, b) => {
+                const sa = statusOrder[a.status] || 99;
+                const sb = statusOrder[b.status] || 99;
+                if (sa !== sb) return sa - sb;
+                const pa = priorityOrder[a.priority] || 99;
+                const pb = priorityOrder[b.priority] || 99;
+                return pa - pb;
+            });
+            el.innerHTML = topTasks.map(t => this.renderTask(t)).join('');
+        },
+
+        filterAgentTasks(agentId) {
+            const d = this.agentData[agentId] || {};
+            let tasks = (d.tasks?.success ? d.tasks.data : []).filter(t => !t.is_template);
+            const statusEl = document.getElementById(`filterStatus-${agentId}`);
+            const priorityEl = document.getElementById(`filterPriority-${agentId}`);
+            const searchEl = document.getElementById(`filterSearch-${agentId}`);
+            if (statusEl?.value) tasks = tasks.filter(t => t.status === statusEl.value);
+            if (priorityEl?.value) tasks = tasks.filter(t => t.priority === priorityEl.value);
+            if (searchEl?.value) {
+                const q = searchEl.value.trim().toLowerCase();
+                tasks = tasks.filter(t => t.title.toLowerCase().includes(q) || (t.description && t.description.toLowerCase().includes(q)));
+            }
+            const badge = document.getElementById(`taskCountBadge-${agentId}`);
+            if (badge) badge.textContent = tasks.filter(t => !t.parent_id).length;
+            const agent = this.agents.find(a => a.id === agentId);
+            this.renderAgentTasks(agentId, tasks, agent?.name || agentId);
+        },
+
+        renderAgentActivityStream(agentId, activities, agentName) {
+            const el = document.getElementById(`activityStream-${agentId}`);
+            if (!el) return;
+            if (!activities || activities.length === 0) {
+                el.innerHTML = '<div class="empty-state" style="padding:16px;font-size:0.85rem;">暂无活动记录</div>';
+                return;
+            }
+            const sorted = activities.slice().sort((a, b) => this.parseTime(b.created_at) - this.parseTime(a.created_at)).slice(0, 20);
+            const now = this.serverNow || new Date();
+            const latestAgeMin = sorted.length > 0 ? Math.floor((now - this.parseTime(sorted[0].created_at)) / 60000) : 999;
+            let statusHtml = '';
+            if (latestAgeMin < 2) {
+                statusHtml = `<div class="activity-status status-active">🟢 正在工作中 · 最后活动 ${this.formatDuration(latestAgeMin)}</div>`;
+            } else if (latestAgeMin < 10) {
+                statusHtml = `<div class="activity-status status-idle">🟡 可能空闲 · 最后活动 ${this.formatDuration(latestAgeMin)}</div>`;
+            } else {
+                statusHtml = `<div class="activity-status status-stopped">🔴 已停止 · 最后活动 ${this.formatDuration(latestAgeMin)}</div>`;
+            }
+
+            const typeIcons = { llm_prompt:'📤', llm_reply:'📥', llm_error:'❌', task_start:'▶️', task_recover:'🔄', focus_switch:'🔀', heartbeat:'💓', auto_recover:'🔄', user:'👤', assistant:'🤖', system:'⚙️' };
+            const typeLabels = { llm_prompt:'发送指令', llm_reply:'智能体回复', llm_error:'调用失败', task_start:'启动任务', task_recover:'恢复任务', focus_switch:'切换任务', heartbeat:'心跳更新', auto_recover:'自动恢复', user:'用户消息', assistant:'智能体回复', system:'系统消息' };
+
+            const html = sorted.map(a => {
+                const meta = a.metadata || {};
+                const type = meta.type || a.role || 'unknown';
+                const content = this.escape(a.content.substring(0, 120));
+                return `
+                    <div class="activity-item">
+                        <div class="activity-icon">${typeIcons[type] || '📌'}</div>
+                        <div class="activity-body">
+                            <div class="activity-header">
+                                <span class="activity-type">${typeLabels[type] || type}</span>
+                                <span class="activity-time" title="${a.created_at}">${this.formatDate(a.created_at, {short:true})}</span>
+                            </div>
+                            <div class="activity-content">${content}${a.content.length > 120 ? '...' : ''}</div>
+                        </div>
+                    </div>`;
+            }).join('');
+            el.innerHTML = statusHtml + html;
+        },
+
+        renderAgentSnapshots(agentId, snapshots) {
+            const el = document.getElementById(`snapshotList-${agentId}`);
+            if (!el) return;
+            if (!snapshots || snapshots.length === 0) {
+                el.innerHTML = '<div class="empty-state" style="padding:16px;font-size:0.85rem;">暂无工作快照，等待采集...</div>';
+                return;
+            }
+            const parsed = [];
+            for (const s of snapshots) {
+                try { parsed.push({ ...JSON.parse(s.content), created_at: s.created_at }); } catch (e) {}
+            }
+            parsed.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+            const recent = parsed.slice(0, 15);
+
+            const html = recent.map(s => {
+                const time = this.formatDate(s.created_at, { short: true });
+                const focus = s.focus_task;
+                const title = focus ? this.escape(focus.title) : '无聚焦任务';
+                const progress = focus ? Math.round(focus.progress || 0) : 0;
+                const stepBadge = focus?.step ? `<span class="snapshot-step">${this.escape(focus.step.substring(0, 30))}</span>` : '';
+                const blockersBadge = focus?.blockers?.length > 0 ? `<span class="snapshot-blockers">🚧 ${focus.blockers.length} 阻塞</span>` : '';
+                return `
+                    <div class="snapshot-item">
+                        <div class="snapshot-time">${time}</div>
+                        <div class="snapshot-body">
+                            <div class="snapshot-header">
+                                <span class="snapshot-title">${title}</span>
+                            </div>
+                            <div class="snapshot-progress">
+                                <div class="snapshot-progress-track"><div class="snapshot-progress-bar" style="width:${progress}%"></div></div>
+                                <span class="snapshot-progress-text">${progress}%</span>
+                                ${stepBadge}${blockersBadge}
+                            </div>
+                        </div>
+                    </div>`;
+            }).join('');
+            el.innerHTML = html;
+        },
+
+        renderAgentProjects(agentId, projects) {
+            const el = document.getElementById(`projectGrid-${agentId}`);
+            if (!el || !projects || projects.length === 0) return;
+            const d = this.agentData[agentId] || {};
+            const tasks = d.tasks?.success ? d.tasks.data : [];
+            const html = projects.map(p => {
+                const pt = tasks.filter(t => t.project_id === p.id);
+                const total = pt.length;
+                const done = pt.filter(t => t.status === 'completed').length;
+                const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+                return `
+                    <div class="project-card">
+                        <div class="project-header">
+                            <div class="project-color" style="background:${p.color || '#667eea'}"></div>
+                            <div class="project-name">${this.escape(p.name)}</div>
+                        </div>
+                        <div class="project-stats"><span>${done}/${total} 完成</span><span>${pct}%</span></div>
+                        <div class="project-bar"><div class="project-bar-fill" style="width:${pct}%;background:${p.color || '#667eea'}"></div></div>
+                    </div>`;
+            }).join('');
+            el.innerHTML = html;
+        },
+
+        renderAgentTemplates(agentId, templates, agentId2) {
+            const el = document.getElementById(`templateGrid-${agentId}`);
+            if (!el || !templates || templates.length === 0) return;
+            const html = templates.map(t => {
+                const scheduleLabel = this.formatSchedule(t.schedule);
+                const nextDue = this.formatTimeUntil(t.next_due_at);
+                const lastSpawned = t.last_spawned_at ? this.formatDate(t.last_spawned_at, { short: true }) : '从未生成';
+                const isDue = t.next_due_at && this.parseTime(t.next_due_at) <= (this.serverNow || new Date());
+                return `
+                    <div class="template-card ${isDue ? 'due' : ''}">
+                        <div class="template-header">
+                            <div class="template-title">${this.escape(t.title)}</div>
+                            <span class="template-schedule">${scheduleLabel}</span>
+                        </div>
+                        <div class="template-meta"><span>下次: ${nextDue}</span><span>上次: ${lastSpawned}</span></div>
+                        <div class="template-actions"><button class="btn btn-sm" onclick="app.spawnTemplate('${agentId2}', '${t.id}')">▶️ 立即执行</button></div>
+                    </div>`;
+            }).join('');
+            el.innerHTML = html;
+        },
+
+        renderAgentNotifications(agentId, notifications) {
+            const el = document.getElementById(`notifList-${agentId}`);
+            if (!el) return;
+            if (!notifications || notifications.length === 0) {
+                el.innerHTML = '<div class="empty-state" style="padding:16px;font-size:0.85rem;">暂无通知</div>';
+                return;
+            }
+            const sorted = [...notifications].sort((a, b) => {
+                if (a.read !== b.read) return a.read ? 1 : -1;
+                return this.parseTime(b.created_at) - this.parseTime(a.created_at);
+            }).slice(0, 15);
+            el.innerHTML = sorted.map(n => `
+                <div class="notif-item ${n.read ? 'read' : 'unread'}" onclick="app.markNotifRead('${agentId}', '${n.id}')">
+                    <div>${this.notifIcon(n.type)}</div>
+                    <div class="notif-content">
+                        <div>${this.escape(n.message)}</div>
+                        <div class="notif-time">${this.formatDate(n.created_at)}</div>
+                    </div>
+                </div>`).join('');
+        },
+
+        async markAgentAllRead(agentId) {
+            try {
+                await fetch(`/api/agents/${agentId}/notifications/read-all`, {
+                    method: 'POST',
+                    headers: { 'X-Agent-Secret': this.secretKey }
+                });
+                this.refresh();
+            } catch (e) {}
         },
 
         filterTasks() {

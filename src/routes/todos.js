@@ -3,7 +3,10 @@ const Agent = require('../models/Agent');
 const Todo = require('../models/Todo');
 const FocusState = require('../models/FocusState');
 const Context = require('../models/Context');
+const Notification = require('../models/Notification');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
+const CommandExecutor = require('../services/CommandExecutor');
+const ProgressValidator = require('../services/ProgressValidator');
 
 const router = express.Router({ mergeParams: true });
 
@@ -104,6 +107,23 @@ router.post('/', async (req, res) => {
       const schedErr = validateSchedule(schedule);
       if (schedErr) {
         return res.status(400).json({ error: 'Validation error', message: schedErr });
+      }
+    }
+
+    const { getDb } = require('../db');
+    if (!isTemplate) {
+      const activeDup = getDb().prepare(`
+        SELECT id, status, priority, created_at FROM todos
+        WHERE agent_id = ? AND title = ? AND archived = 0
+          AND status NOT IN ('completed', 'cancelled')
+        LIMIT 1
+      `).get(agentId, title);
+      if (activeDup) {
+        return res.status(409).json({
+          error: 'Conflict',
+          message: `同 agent 下已存在同名进行中任务（${activeDup.status}），请复用已有任务或更改标题`,
+          existing_task: { id: activeDup.id, status: activeDup.status, priority: activeDup.priority, created_at: activeDup.created_at }
+        });
       }
     }
 
@@ -299,6 +319,39 @@ router.get('/created', (req, res) => {
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
+
+// --- 定时调度路由：查询待执行的模板实例 ---
+router.get('/scheduled/pending', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const templates = Todo.findTemplates(agentId);
+    const result = [];
+
+    for (const template of templates) {
+      const pendingTasks = Todo.findPendingByTemplate(agentId, template.id);
+      if (pendingTasks.length > 0) {
+        result.push({
+          template_id: template.id,
+          template_title: template.title,
+          schedule: template.schedule,
+          pending_tasks: pendingTasks.map(t => ({
+            id: t.id,
+            title: t.title,
+            description: t.description,
+            context: t.context,
+            created_at: t.created_at
+          }))
+        });
+      }
+    }
+
+    res.json({ success: true, data: result, count: result.reduce((s, r) => s + r.pending_tasks.length, 0) });
+  } catch (error) {
+    console.error('Error fetching scheduled pending tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
 router.get('/:id', (req, res) => {
   try {
     const { agentId, id } = req.params;
@@ -409,7 +462,32 @@ router.patch('/:id/status', async (req, res) => {
       });
     }
 
-    const todo = Todo.updateStatus(agentId, id, status);
+    const todo = Todo.findById(agentId, id);
+
+    if (status === 'completed') {
+      const unmetCriteria = [];
+      if (todo.acceptance_criteria && !todo.criteria_confirmed) {
+        const criteria = todo.acceptance_criteria.split('\n').filter(l => l.trim());
+        const confirmedSet = new Set(
+          (todo.criteria_met || '').split('\n').filter(l => l.trim())
+        );
+        for (const c of criteria) {
+          if (c.trim() && !confirmedSet.has(c.trim())) {
+            unmetCriteria.push(c.trim());
+          }
+        }
+      }
+      if (unmetCriteria.length > 0) {
+        return res.status(409).json({
+          error: 'Acceptance criteria not met',
+          message: '任务有未满足的验收标准，请先通过工具调用 confirmCompletion 或明确标注 criteriaConfirmed',
+          unmet_criteria: unmetCriteria,
+          tip: '调用 POST /:id/confirm-completion 明确完成任务并声明满足的标准'
+        });
+      }
+    }
+
+    const updatedTodo = Todo.updateStatus(agentId, id, status);
 
     // 状态变更为 completed / in_progress / cancelled 时重新评估聚焦
     let focus = null;
@@ -419,7 +497,7 @@ router.patch('/:id/status', async (req, res) => {
 
     res.json({
       success: true,
-      data: todo,
+      data: updatedTodo,
       focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
@@ -689,15 +767,31 @@ router.post('/:id/drive', async (req, res) => {
       });
     }
 
-    // 3. 构建 Work Prompt
+    // 3. 执行前快照
     const refreshedTask = Todo.findById(agentId, id);
+    const before = ProgressValidator.snapshot(refreshedTask);
+
+    // 4. 构建 Work Prompt
     const workPrompt = buildDrivePrompt(refreshedTask, { isManual: true });
 
-    // 4. 调用 LLM
+    // 5. 调用 LLM
     const result = await framework.processMessage(workPrompt);
     const reply = result.response.message;
 
-    // 5. 解析回复并更新心跳
+    // 6. 【增强】提取并执行 bash 命令
+    let commandsExecuted = [];
+    const { commands, results } = await CommandExecutor.extractAndRun(reply, { task: refreshedTask });
+    if (commands.length > 0) {
+      commandsExecuted = results || [];
+      Context.create(agentId, {
+        sessionId: 'manual-drive',
+        role: 'system',
+        content: `[手动驱动] 命令执行结果:\n${CommandExecutor.buildExecutionSummary(commandsExecuted)}`,
+        metadata: { type: 'command_exec', task_id: id, commands_count: commands.length }
+      });
+    }
+
+    // 7. 解析 heartbeat 变更（结合命令执行结果）
     const parsed = parseHeartbeatReply(refreshedTask, reply);
     if (parsed.changed) {
       Todo.updateHeartbeat(agentId, id, {
@@ -707,7 +801,24 @@ router.post('/:id/drive', async (req, res) => {
       });
     }
 
-    // 6. 写入 contexts 记录
+    // 8. 更新 last_driven_at
+    const { getDb } = require('../db');
+    getDb().prepare(`UPDATE todos SET last_driven_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
+
+    // 9. 【新增】Progress 验证
+    const afterRefreshed = Todo.findById(agentId, id);
+    const after = ProgressValidator.snapshot(afterRefreshed);
+    const { changed } = ProgressValidator.compare(before, after);
+
+    const progressReport = ProgressValidator.buildReport(id, before, after, { success: changed, attempts: 1 });
+    Context.create(agentId, {
+      sessionId: 'manual-drive',
+      role: 'system',
+      content: `[手动驱动] ${progressReport}`,
+      metadata: { type: 'progress_report', task_id: id }
+    });
+
+    // 10. 写入 contexts 记录
     Context.create(agentId, {
       sessionId: 'manual-drive',
       role: 'system',
@@ -715,13 +826,15 @@ router.post('/:id/drive', async (req, res) => {
       metadata: { type: 'manual_drive', task_id: id, reply_length: reply.length }
     });
 
-    // 7. 返回结果
+    // 11. 返回结果
     res.json({
       success: true,
       data: {
         task: Todo.findById(agentId, id),
         llm_reply: reply,
         heartbeat_updated: parsed.changed,
+        commands_executed: commandsExecuted,
+        progress_changed: changed,
         parsed: { progress: parsed.progress, step: parsed.step, blockers: parsed.blockers }
       }
     });
@@ -731,6 +844,65 @@ router.post('/:id/drive', async (req, res) => {
       error: 'Internal server error',
       message: error.message || 'Failed to drive task'
     });
+  }
+});
+
+// --- 显式完成路由：带验收标准确认 ---
+router.post('/:id/confirm-completion', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { summary, criteriaMet, evidence } = req.body;
+
+    const todo = Todo.findById(agentId, id);
+    if (!todo) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+    if (todo.status === 'completed' || todo.status === 'cancelled') {
+      return res.status(400).json({ error: 'Validation error', message: 'Task is already completed or cancelled' });
+    }
+
+    if (todo.acceptance_criteria && (!criteriaMet || criteriaMet.length === 0)) {
+      return res.status(409).json({
+        error: 'Acceptance criteria required',
+        message: '任务有验收标准，必须提供 criteriaMet 列表',
+        acceptance_criteria: todo.acceptance_criteria,
+        tip: 'criteriaMet 为字符串数组，每项对应 acceptance_criteria 中的一条'
+      });
+    }
+
+    const criteriaText = criteriaMet
+      ? criteriaMet.map((c, i) => `${i + 1}. ${c}`).join('\n')
+      : '';
+
+    Todo.update(agentId, id, {
+      status: 'completed',
+      criteriaConfirmed: true,
+      description: todo.description
+        ? `${todo.description}\n\n## 完成摘要\n${summary || ''}\n\n## 验收标准满足情况\n${criteriaText}\n\n## 验收证据\n${evidence || ''}`
+        : `\n## 完成摘要\n${summary || ''}\n\n## 验收标准满足情况\n${criteriaText}\n\n## 验收证据\n${evidence || ''}`,
+      heartbeatProgress: 100,
+      heartbeatStep: '✅ 已完成（已确认验收）'
+    });
+
+    Context.create(agentId, {
+      sessionId: 'confirm-completion',
+      role: 'system',
+      content: `[confirm-completion] 任务「${todo.title}」被显式标记为完成，criteriaMet=${JSON.stringify(criteriaMet || [])}`,
+      metadata: { type: 'task_completion', task_id: id, criteria_met: criteriaMet || [], summary }
+    });
+
+    const parentCompleted = Todo.checkAndCompleteParent(agentId, id);
+    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
+
+    res.json({
+      success: true,
+      data: Todo.findById(agentId, id),
+      parent_auto_completed: parentCompleted,
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
+    });
+  } catch (error) {
+    console.error('Error confirming task completion:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });
 
@@ -863,7 +1035,7 @@ router.get('/stuck/list', (req, res) => {
 });
 
 // --- 多智能体协作路由：指派任务 ---
-router.post('/:id/assign', (req, res) => {
+router.post('/:id/assign', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { assignedAgentId, targetAgentId, note } = req.body;
@@ -880,11 +1052,23 @@ router.post('/:id/assign', (req, res) => {
 
     const todo = Todo.assign(agentId, id, targetId, note || '');
 
-    // 创建通知给被指派的 agent
-    const Notification = require('../models/Notification');
     Notification.create(targetId, id, 'assigned',
       `你被指派了任务：${todo.title}${note ? ' — ' + note : ''}`
     );
+
+    try {
+      const focus = await FocusState.autoFocus(targetId, getLlmManager(req));
+      if (focus) {
+        Context.create(targetId, {
+          sessionId: 'assignment-driver',
+          role: 'system',
+          content: `[AssignmentDriver] 任务「${todo.title}」被指派后自动聚焦到: ${focus.title}（原因: ${focus.focus_reason}）`,
+          metadata: { type: 'assignment_focus', task_id: id, focus_reason: focus.focus_reason }
+        });
+      }
+    } catch (focusErr) {
+      console.warn(`[Assign] auto-focus for ${targetId} failed: ${focusErr.message}`);
+    }
 
     res.json({ success: true, data: todo, message: '任务已指派' });
   } catch (error) {
@@ -894,7 +1078,7 @@ router.post('/:id/assign', (req, res) => {
 });
 
 // --- 多智能体协作路由：转交任务 ---
-router.post('/:id/transfer', (req, res) => {
+router.post('/:id/transfer', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { newAssignedAgentId, targetAgentId, note, reason } = req.body;
@@ -905,18 +1089,29 @@ router.post('/:id/transfer', (req, res) => {
       return res.status(400).json({ error: 'Validation error', message: 'newAssignedAgentId or targetAgentId is required' });
     }
 
-    // Auto-create target agent if not exists
     if (!Agent.exists(targetId)) {
       Agent.create({ id: targetId, name: targetId, metadata: { auto_created: true } });
     }
 
     const todo = Todo.transfer(agentId, id, targetId, transferNote);
 
-    // 创建通知
-    const Notification = require('../models/Notification');
     Notification.create(targetId, id, 'transferred',
       `任务「${todo.title}」被转交给你${transferNote ? '，原因：' + transferNote : ''}`
     );
+
+    try {
+      const focus = await FocusState.autoFocus(targetId, getLlmManager(req));
+      if (focus) {
+        Context.create(targetId, {
+          sessionId: 'assignment-driver',
+          role: 'system',
+          content: `[AssignmentDriver] 任务「${todo.title}」被转交后自动聚焦到: ${focus.title}（原因: ${focus.focus_reason}）`,
+          metadata: { type: 'transfer_focus', task_id: id, focus_reason: focus.focus_reason }
+        });
+      }
+    } catch (focusErr) {
+      console.warn(`[Transfer] auto-focus for ${targetId} failed: ${focusErr.message}`);
+    }
 
     res.json({ success: true, data: todo, message: '任务已转交' });
   } catch (error) {
@@ -948,6 +1143,40 @@ router.delete('/archived', (req, res) => {
     res.json({ success: true, deleted, message: `已删除 ${deleted} 个已归档任务` });
   } catch (error) {
     console.error('Error purging archived tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+// --- 定时调度路由：cron job 执行完后写入报告到模板实例 ---
+router.post('/:id/report', (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { status, description, context, heartbeatProgress, heartbeatStep, heartbeatBlockers } = req.body;
+
+    const todo = Todo.findById(agentId, id);
+    if (!todo) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const updated = Todo.writeReport(agentId, id, {
+      status,
+      description,
+      context,
+      heartbeatProgress,
+      heartbeatStep,
+      heartbeatBlockers
+    });
+
+    Context.create(agentId, {
+      sessionId: 'scheduled-report',
+      role: 'system',
+      content: `[CronReport] 任务「${todo.title}」已接收执行报告（status=${status || 'unchanged'}）`,
+      metadata: { type: 'cron_report', task_id: id, template_id: todo.parent_id }
+    });
+
+    res.json({ success: true, data: updated });
+  } catch (error) {
+    console.error('Error writing report:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });

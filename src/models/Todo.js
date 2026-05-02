@@ -941,7 +941,7 @@ class Todo {
     `);
 
     stmt.run(
-      newId, agentId, template.project_id, template.parent_id,
+      newId, agentId, template.project_id, templateId,
       template.title, template.description || '', template.priority,
       template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
       template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
@@ -960,6 +960,79 @@ class Todo {
     updateStmt.run(nextDueAt, templateId, agentId);
 
     return this.findById(agentId, newId);
+  }
+
+  static writeReport(agentId, taskId, reportData) {
+    const db = getDb();
+    const todo = this.findById(agentId, taskId);
+    if (!todo) throw new Error('Task not found');
+
+    const { status, description, context, heartbeatProgress, heartbeatStep, heartbeatBlockers } = reportData;
+
+    const updates = [];
+    const values = [];
+
+    if (status) {
+      updates.push('status = ?');
+      values.push(status);
+      if (status === 'completed') {
+        updates.push('completed_at = CURRENT_TIMESTAMP');
+      }
+    }
+
+    if (description !== undefined) {
+      updates.push('description = ?');
+      values.push(description);
+    }
+
+    if (context !== undefined) {
+      updates.push('context = ?');
+      values.push(context);
+    }
+
+    if (heartbeatProgress !== undefined) {
+      updates.push('heartbeat_progress = ?');
+      values.push(heartbeatProgress);
+    }
+
+    if (heartbeatStep !== undefined) {
+      updates.push('heartbeat_step = ?');
+      values.push(heartbeatStep);
+    }
+
+    if (heartbeatBlockers !== undefined) {
+      updates.push('heartbeat_blockers = ?');
+      values.push(JSON.stringify(heartbeatBlockers));
+    }
+
+    if (updates.length === 0) {
+      return this.findById(agentId, taskId);
+    }
+
+    updates.push('last_heartbeat = CURRENT_TIMESTAMP', 'updated_at = CURRENT_TIMESTAMP');
+    values.push(taskId, agentId);
+
+    const stmt = db.prepare(`
+      UPDATE todos SET ${updates.join(', ')}
+      WHERE id = ? AND agent_id = ?
+    `);
+    stmt.run(...values);
+    return this.findById(agentId, taskId);
+  }
+
+  static findPendingByTemplate(agentId, templateId) {
+    const db = getDb();
+    const stmt = db.prepare(
+      'SELECT * FROM todos WHERE agent_id = ? AND parent_id = ? AND status = ?'
+    );
+    const todos = stmt.all(agentId, templateId, 'pending');
+    return todos.map(todo => ({
+      ...todo,
+      tags: JSON.parse(todo.tags || '[]'),
+      dependencies: JSON.parse(todo.dependencies || '[]'),
+      attempt_log: JSON.parse(todo.attempt_log || '[]'),
+      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+    }));
   }
 
   static computeNextDueAt(schedule, fromTime) {

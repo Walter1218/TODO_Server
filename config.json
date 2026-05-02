@@ -5,9 +5,10 @@
   "llm": {
     "provider": "minimax",
     "minimax": {
-      "apiKey": "",
-      "groupId": "",
-      "model": "MiniMax-Text-01",
+      "apiKey": "local",
+      "groupId": "local",
+      "baseUrl": "http://localhost:3456",
+      "model": "MiniMax-M2.7",
       "temperature": 0.7,
       "maxTokens": 2000
     },
@@ -22,11 +23,19 @@
       "model": "claude-3-5-haiku-20241022",
       "temperature": 0.7,
       "maxTokens": 1024
+    },
+    "fallback": {
+      "provider": "ollama",
+      "baseUrl": "http://localhost:11434/v1",
+      "model": "Qwen3.5_9b_f16:latest",
+      "temperature": 0.7,
+      "maxTokens": 2000
     }
   },
   "agent": {
-    "id": "f6782f01-a158-42cf-a236-88f9b7afc3d6",
-    "name": "我的智能体"
+    "id": "cdb415c7-8d28-4511-a381-5cdaf40d936c",
+    "name": "hermes-default",
+    "secretKey": "69033C42CF6C6E4AB7A2893AA3729296"
   },
   "features": {
     "taskManagement": {

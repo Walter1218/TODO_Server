@@ -86,30 +86,38 @@ class LLMManager {
   }
 
   /**
-   * 发送聊天请求（带 fallback）
+   * 发送聊天请求（带 fallback 和结构化工具调用支持）
+   *
+   * @param {Object} params
+   * @param {Array} params.messages  - 消息列表
+   * @param {string} [params.system] - 系统提示词
+   * @param {string} [params.userContent] - 附加用户内容
+   * @param {Array}  [params.tools]  - 结构化工具定义（OpenAI tool_calls 格式）
+   * @returns {Promise<{content, usage, finishReason, toolCalls?}>}
    */
   async chat(params) {
-    const { messages, system, userContent } = params;
+    const { messages, system, userContent, tools } = params;
 
     if (!this.provider) {
       return this.mockChat(params);
     }
 
-    // 如果有userContent，添加到最后
     if (userContent) {
       messages.push({ role: 'user', content: userContent });
     }
 
     try {
-      const result = await this.provider.chat({
-        messages,
-        system
-      });
+      const requestParams = { messages, system };
+      if (tools && tools.length > 0) {
+        requestParams.tools = tools;
+      }
+      const result = await this.provider.chat(requestParams);
 
       return {
         content: result.content,
         usage: result.usage,
-        finishReason: result.finishReason || result.stopReason
+        finishReason: result.finishReason || result.stopReason,
+        toolCalls: result.toolCalls || null
       };
     } catch (primaryError) {
       console.error(`❌ 主 LLM 请求失败: ${primaryError.message}`);
@@ -118,16 +126,16 @@ class LLMManager {
       if (this.fallbackProvider) {
         console.log(`🔄 尝试 Fallback LLM...`);
         try {
-          const fallbackResult = await this.fallbackProvider.chat({
-            messages,
-            system
-          });
+          const fbParams = { messages, system };
+          if (tools && tools.length > 0) fbParams.tools = tools;
+          const fallbackResult = await this.fallbackProvider.chat(fbParams);
 
           console.log(`✅ Fallback LLM 响应成功`);
           return {
             content: fallbackResult.content,
             usage: fallbackResult.usage,
-            finishReason: fallbackResult.finishReason || fallbackResult.stopReason
+            finishReason: fallbackResult.finishReason || fallbackResult.stopReason,
+            toolCalls: fallbackResult.toolCalls || null
           };
         } catch (fallbackError) {
           console.error(`❌ Fallback LLM 也失败: ${fallbackError.message}`);

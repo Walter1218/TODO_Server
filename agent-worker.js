@@ -9,9 +9,7 @@
 
 const { AgentTaskFramework } = require('./framework');
 const { getDb } = require('./src/db');
-const { exec } = require('child_process');
-const util = require('util');
-const execAsync = util.promisify(exec);
+const CommandExecutor = require('./src/services/CommandExecutor');
 
 const WORK_INTERVAL_MS = 30 * 1000;      // 工作轮询间隔：30秒
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;  // 心跳间隔：1分钟
@@ -361,53 +359,31 @@ class AgentWorker {
     }
   }
 
-  /**
-   * 从 LLM 回复中提取并执行 bash 命令块
-   */
   async _executeBashBlocks(task, reply) {
-    const bashRegex = /```(?:bash|shell)\n([\s\S]*?)```/g;
-    const commands = [];
-    let match;
-    while ((match = bashRegex.exec(reply)) !== null) {
-      const cmd = match[1].trim();
-      if (cmd) commands.push(cmd);
-    }
+    const blocks = CommandExecutor.extractBashBlocks(reply);
+    if (blocks.length === 0) return null;
 
-    if (commands.length === 0) return null;
+    const timeoutMs = CommandExecutor.calcTimeout(task);
+    const execResults = await CommandExecutor.executeCommands(blocks, {
+      timeoutMs,
+      cwd: process.env.HOME,
+    });
 
-    const maxCommands = 3;
-    const toRun = commands.slice(0, maxCommands);
-    const results = [];
+    const summary = execResults.map((r) =>
+      `[${r.index}] ${r.success ? '✅' : '❌'} ${r.command}\n${r.output}`
+    ).join('\n---\n');
+    await this._recordActivity('command_exec', summary, task.id);
 
-    // 动态超时：基于任务预估耗时，最小 30s，最大 10 分钟
-    const expectedMin = task.expected_duration_minutes || 60;
-    const timeoutMs = Math.max(30000, Math.min(600000, expectedMin * 60 * 1000 * 0.25));
-
-    for (const cmd of toRun) {
-      console.log(`🖥️ 执行命令: ${cmd.substring(0, 80)}${cmd.length > 80 ? '...' : ''}`);
-      console.log(`⏱️ 命令超时: ${Math.round(timeoutMs / 1000)}s`);
-      try {
-        const { stdout, stderr } = await execAsync(cmd, { timeout: timeoutMs, cwd: process.env.HOME });
-        const output = stdout.trim() || stderr.trim() || '(无输出)';
-        results.push({ cmd, output, success: true });
-        this.consecutiveCmdFailures = 0; // 重置失败计数
-        console.log(`✅ 命令完成 | 输出: ${output.substring(0, 100)}${output.length > 100 ? '...' : ''}`);
-      } catch (execErr) {
-        const errOutput = execErr.stdout?.trim() || execErr.stderr?.trim() || execErr.message;
-        results.push({ cmd, output: errOutput, success: false });
+    for (const r of execResults) {
+      if (r.success) {
+        this.consecutiveCmdFailures = 0;
+      } else {
         this.consecutiveCmdFailures++;
-        console.error(`❌ 命令失败(${this.consecutiveCmdFailures}次连续): ${errOutput.substring(0, 100)}`);
+        console.error(`❌ 命令失败(${this.consecutiveCmdFailures}次连续): ${r.output.substring(0, 100)}`);
       }
     }
 
-    // 将执行结果写入 contexts
-    const resultSummary = results.map((r, i) =>
-      `[$${i + 1}] ${r.success ? '✅' : '❌'} ${r.cmd}\n${r.output}`
-    ).join('\n---\n');
-
-    await this._recordActivity('command_exec', resultSummary, task.id);
-
-    return results;
+    return execResults;
   }
 
   /**

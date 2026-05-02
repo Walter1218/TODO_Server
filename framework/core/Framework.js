@@ -195,7 +195,6 @@ class AgentTaskFramework {
     
     let response;
     if (options.executionMode) {
-      // Worker 执行模式：跳过 status-heavy 的 prompt 增强，使用执行导向的系统提示
       const execSystemPrompt = `你是 TODO Server 的智能体工作进程。你的唯一职责是**实际执行分配给你的任务**。
 
 核心原则：
@@ -208,6 +207,26 @@ class AgentTaskFramework {
 
 记住：你是执行者，不是汇报员。`;
       response = await this.generateResponseRaw(userMessage, conversationHistory, execSystemPrompt);
+    } else if (options.tools && options.tools.length > 0) {
+      response = await this.generateResponseRaw(
+        userMessage,
+        conversationHistory,
+        options.systemPrompt || '',
+        options.tools
+      );
+      if (response.toolCalls && response.toolCalls.length > 0) {
+        const { StructuredDriveTools } = require('../../../src/utils/StructuredDriveTools');
+        const taskId = options.taskId || this.currentHeartbeatTaskId;
+        const sessionId = options.sessionId || 'structured-drive';
+        const agentId = options.agentId || this.config.base?.agentId;
+        const toolResults = await StructuredDriveTools.executeToolCalls(
+          response.toolCalls,
+          agentId,
+          taskId,
+          sessionId
+        );
+        response.toolResults = toolResults;
+      }
     } else {
       const context = await this.prepareContext();
       const enhancedPrompt = await this.buildEnhancedPrompt(userMessage, context);
@@ -330,7 +349,7 @@ ${context.features.memory.map(m => `- ${m.content} (${m.timestamp})`).join('\n')
   /**
    * 生成回复（原始模式，跳过 prompt 增强，用于 Worker 执行模式）
    */
-  async generateResponseRaw(userMessage, conversationHistory = [], systemPrompt = '') {
+  async generateResponseRaw(userMessage, conversationHistory = [], systemPrompt = '', tools = null) {
     const llmStartTime = Date.now();
 
     if (!this.modules.llmManager.hasProvider()) {
@@ -343,13 +362,15 @@ ${context.features.memory.map(m => `- ${m.content} (${m.timestamp})`).join('\n')
         content: msg.content || msg.message
       }));
 
-      const result = await this.modules.llmManager.chat({
+      const requestParams = {
         messages,
         system: systemPrompt,
         userContent: userMessage
-      });
+      };
+      if (tools) requestParams.tools = tools;
 
-      // 记录 LLM 调用耗时到心跳
+      const result = await this.modules.llmManager.chat(requestParams);
+
       const llmDuration = Date.now() - llmStartTime;
       if (this.currentHeartbeatTaskId) {
         await this._sendHeartbeat(this.currentHeartbeatTaskId, {
@@ -361,7 +382,8 @@ ${context.features.memory.map(m => `- ${m.content} (${m.timestamp})`).join('\n')
       return {
         message: result.content,
         usage: result.usage,
-        llmDuration
+        llmDuration,
+        toolCalls: result.toolCalls || null
       };
     } catch (error) {
       this.log(`❌ LLM生成失败: ${error.message}`);

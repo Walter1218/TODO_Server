@@ -216,11 +216,13 @@ POST /api/agents/:id/todos/:id/heartbeat
 | 项目全局看板 | `GET /projects/:id/board` |
 | 自动创建被指派 agent | 指派时自动注册不存在的 agent |
 
-### 8. 定时调度任务
+### 8. 定时调度任务（统一调度架构）
 - 任务模板（`is_template=true`）+ 调度规则（`schedule`）
 - 支持格式：`daily`、`weekly:mon,fri`、`cron:0 9 * * *`
+- **模板 → 实例**：DailyScheduler 每分钟检查到期模板，自动 spawn 实例（`parent_id` 指向模板）
+- **实例 → 报告**：Hermes cron job 通过 `GET /todos/scheduled/pending` 查询待执行实例，执行完通过 `POST /todos/:id/report` 写入结果
+- spawn 时自动创建 `task_notification`（assigned 类型），通知 agent 有新实例待执行
 - 手动触发模板实例化：`POST /todos/:id/spawn`
-- 自动计算下次到期时间（`next_due_at`）
 
 ### 9. 手动驱动执行
 ```http
@@ -239,6 +241,8 @@ GET  /api/agents/:id/contexts/summary  # 会话摘要
 
 ### 11. 自动运维监控
 - **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked
+- **AssignmentDriver**：指派/转交后立即 auto-focus 到目标 agent；每 60 秒兜底扫描已指派但超过 5 分钟仍为 `pending` 的任务，自动强制 focus + 通知
+- **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证；无进展自动重试 3 次（追加失败上下文）；仍无变化标记 stalled + 通知人工
 - **LLMInferencer**：每 5 分钟扫描 idle 5-15 分钟的任务，LLM 推断真实状态（completed/blocked/in_progress），置信度 ≥0.75 自动执行
 - **WorkSnapshotMonitor**：每 30 秒采集工作快照到 contexts
 - **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
@@ -275,6 +279,7 @@ GET /api/agents/:id/projects/:id/board
 | POST | `/api/agents/:id/todos/:id/attempt` | 记录重试 |
 | POST | `/api/agents/:id/todos/:id/drive` | 手动驱动执行 |
 | POST | `/api/agents/:id/todos/:id/spawn` | 模板实例化 |
+| POST | `/api/agents/:id/todos/:id/report` | cron job 写入执行报告 |
 | POST | `/api/agents/:id/todos/:id/sub-tasks` | 创建子任务 |
 | GET | `/api/agents/:id/todos/:id/subtasks` | 获取子任务 |
 | GET | `/api/agents/:id/todos/:id/dependency-tree` | 依赖树 |
@@ -285,6 +290,7 @@ GET /api/agents/:id/projects/:id/board
 | GET | `/api/agents/:id/todos/search?q=xxx` | 搜索任务 |
 | GET | `/api/agents/:id/todos/ready` | 可执行任务 |
 | GET | `/api/agents/:id/todos/templates` | 模板任务列表 |
+| GET | `/api/agents/:id/todos/scheduled/pending` | 待执行模板实例 |
 | POST | `/api/agents/:id/todos/archive-old` | 归档旧任务 |
 | DELETE | `/api/agents/:id/todos/archived` | 删除已归档任务 |
 
@@ -417,9 +423,9 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 | 跨 agent 通知 | ✅ | ✅ | - | ✅ | assigned/transferred |
 | 上下文存储 | ✅ | ✅ | ✅ | ✅ | 按 session |
 | 上下文智能排序 | - | - | ✅ | - | LLM 综合排序 + 规则兜底 |
-| 定时调度 | ✅ | ✅ | - | - | 模板 + cron/weekly/daily |
+| 定时调度 | ✅ | ✅ | - | - | 模板 spawn → cron 执行 → report 写入（统一架构） |
 | 手动驱动 | ✅ | - | ✅ | - | LLM 执行 + 恢复 |
-| 自动运维监控 | ✅ | - | - | - | StuckMonitor + LLMInferencer + Snapshot |
+| 自动运维监控 | ✅ | - | - | - | StuckMonitor + LLMInferencer + Snapshot + AssignmentDriver + DriveOrchestrator |
 | 任务归档清理 | ✅ | - | - | - | 软删除 + 自动归档 |
 | 熔断 + 本地缓存 | - | - | ✅ | - | 3 次失败降级 |
 | LLM 集成 | ✅ | - | ✅ | - | Server 聚焦/推断 + Framework 全模块 |
@@ -456,7 +462,7 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 - [x] 多智能体协作（指派 / 转交 / 通知 + 自动创建被指派 agent）
 - [x] 项目全局看板（跨 agent 统计）
 - [x] 对话上下文存储 + 会话摘要
-- [x] 定时调度任务（模板 + daily/weekly/cron + spawn）
+- [x] 定时调度统一架构（模板 spawn → parent_id 链接 → cron report 写入）
 - [x] 手动驱动执行（LLM 执行 + 恢复 blocked 任务）
 - [x] 循环依赖检测（DFS 算法修复）
 - [x] 熔断 + 本地缓存降级
@@ -465,6 +471,8 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 - [x] 角色模板系统（通用/编码/分析/DevOps）
 - [x] 记忆管理（提取 + 自动摘要 + 过期清理）
 - [x] LLM 全模块集成（聚焦选优 / 工作状态推断 / 上下文排序 / 自动运维推断）
+- [x] AssignmentDriver 指派任务自动驱动（即时 auto-focus + 60s 兜底巡检）
+- [x] ExecutionGuard 执行守卫（CommandExecutor + ProgressValidator + DriveOrchestrator 闭环执行引擎）
 - [x] Hermes Skill 接入框架（Python CLI）
 - [x] Profile 感知自动匹配凭证
 - [x] `npm run setup` 一键安装向导
@@ -472,6 +480,8 @@ Skill 根据 `HERMES_HOME` 环境变量自动匹配 profile，无需手动切换
 - [x] Worker 执行模式（agent-worker.js）
 - [x] 核心功能单元测试（98 用例，覆盖 Todo/Focus/Agent/Config/Prompt/Memory）
 - [x] LLMInferencer 后台推断 + 动态阈值 StuckMonitor + WorkSnapshot
+- [x] Hermes Unified Scheduling 自动接入（postinstall patch + `npm run patch:hermes`）
+- [x] 任务 title 去重机制（409 Conflict + existing_task 返回）
 
 ### 进行中 🔄
 
