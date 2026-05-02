@@ -70,7 +70,7 @@ class Todo {
 
   static findAllByAgent(agentId, filters = {}) {
     const db = getDb();
-    const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0 } = filters;
+    const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0, source } = filters;
 
     let query = 'SELECT * FROM todos WHERE agent_id = ?';
     const params = [agentId];
@@ -108,6 +108,14 @@ class Todo {
 
     if (!includeArchived) {
       query += ' AND (archived = 0 OR archived IS NULL)';
+    }
+
+    if (source === 'agent') {
+      query += ' AND (origin_agent_id != ? OR assigned_agent_id = ?)';
+      params.push(agentId, agentId);
+    } else if (source === 'human') {
+      query += ' AND origin_agent_id = ? AND (assigned_agent_id IS NULL OR assigned_agent_id = ?)';
+      params.push(agentId, agentId);
     }
 
     query += ' ORDER BY CASE priority WHEN \'critical\' THEN 1 WHEN \'high\' THEN 2 WHEN \'medium\' THEN 3 ELSE 4 END, created_at DESC';

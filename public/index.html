@@ -1254,6 +1254,11 @@
                                 <option value="medium">中</option>
                                 <option value="low">低</option>
                             </select>
+                            <select id="filterSource-${agent.id}" onchange="app.filterAgentTasks('${agent.id}')">
+                                <option value="">全部来源</option>
+                                <option value="agent">🤖 Agent 执行</option>
+                                <option value="human">👤 人工创建</option>
+                            </select>
                             <input type="text" id="filterSearch-${agent.id}" placeholder="🔍 搜索任务标题..." oninput="app.filterAgentTasks('${agent.id}')">
                         </div>
                         <div class="task-list" id="taskList-${agent.id}"></div>
@@ -1327,9 +1332,18 @@
             let tasks = (d.tasks?.success ? d.tasks.data : []).filter(t => !t.is_template);
             const statusEl = document.getElementById(`filterStatus-${agentId}`);
             const priorityEl = document.getElementById(`filterPriority-${agentId}`);
+            const sourceEl = document.getElementById(`filterSource-${agentId}`);
             const searchEl = document.getElementById(`filterSearch-${agentId}`);
             if (statusEl?.value) tasks = tasks.filter(t => t.status === statusEl.value);
             if (priorityEl?.value) tasks = tasks.filter(t => t.priority === priorityEl.value);
+            if (sourceEl?.value) {
+                const source = sourceEl.value;
+                if (source === 'agent') {
+                    tasks = tasks.filter(t => t.origin_agent_id !== agentId || t.assigned_agent_id === agentId);
+                } else if (source === 'human') {
+                    tasks = tasks.filter(t => t.origin_agent_id === agentId && (!t.assigned_agent_id || t.assigned_agent_id === agentId));
+                }
+            }
             if (searchEl?.value) {
                 const q = searchEl.value.trim().toLowerCase();
                 tasks = tasks.filter(t => t.title.toLowerCase().includes(q) || (t.description && t.description.toLowerCase().includes(q)));
@@ -1575,6 +1589,12 @@
             const priorityTag = t.priority ? `<span class="tag ${t.priority}">${t.priority}</span>` : '';
             const statusTag = `<span class="tag ${t.status === 'blocked' ? 'blocked' : ''}">${this.statusLabel(t.status)}</span>`;
 
+            // Agent 来源标识
+            const isAgentTask = t.origin_agent_id !== t._agentId || t.assigned_agent_id;
+            const agentSourceTag = isAgentTask
+                ? `<span class="tag" style="background:rgba(99,102,241,0.1);color:#667eea;" title="由 ${this.escape(t._agentName)} 代理执行">🤖 Agent</span>`
+                : '';
+
             // 工作状态标签
             let workStatusHtml = '';
             if (t.status === 'blocked') {
@@ -1635,7 +1655,7 @@
                                 ${hasChildren && !isParentExpanded ? `<span class="child-count">📎 ${children.length} 个子任务</span>` : ''}
                             </div>
                         </div>
-                        <div class="task-tags">${priorityTag}${statusTag}</div>
+                        <div class="task-tags">${priorityTag}${agentSourceTag}${statusTag}</div>
                         <div class="task-right">
                             <div class="task-progress-bar-wrap">
                                 <div class="task-progress-bar" style="width:${progress}%"></div>
@@ -1645,7 +1665,7 @@
                                 ${activeTimeHtml}
                             </div>
                             <div class="task-agent">${t._agentName}</div>
-                            ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') ? `
+                            ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') && !isAgentTask ? `
                                 <button class="drive-btn" id="drive-btn-${t.id}" title="强行驱动执行" onclick="event.stopPropagation(); app.driveTask('${t._agentId}', '${t.id}')">🚀</button>
                             ` : ''}
                         </div>
@@ -1659,10 +1679,11 @@
                                     <div>ID: <code>${t.id}</code></div>
                                     <div>状态: ${this.statusLabel(t.status)}</div>
                                     <div>优先级: ${t.priority || 'medium'}</div>
+                                    ${isAgentTask ? `<div style="color:#667eea;font-weight:600;">🤖 由 Agent 代理执行</div>` : '<div>👤 人工创建</div>'}
                                     <div>创建时间: ${this.formatDate(t.created_at)}</div>
                                     ${t.completed_at ? `<div>完成时间: ${this.formatDate(t.completed_at)}</div>` : ''}
                                     ${t.last_heartbeat ? `<div>最后心跳: ${this.formatDate(t.last_heartbeat)} · ${this.formatDuration(idleMinutes)}</div>` : ''}
-                                ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') ? `
+                                ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') && !isAgentTask ? `
                                     <div style="margin-top:10px;">
                                         <button class="btn btn-primary" onclick="event.stopPropagation(); app.driveTask('${t._agentId}', '${t.id}')">🚀 强行驱动执行</button>
                                     </div>

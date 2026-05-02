@@ -172,7 +172,7 @@ router.post('/', async (req, res) => {
 router.get('/', (req, res) => {
   try {
     const { agentId } = req.params;
-    const { status, priority, tags, limit, offset, projectId, isTemplate, title } = req.query;
+    const { status, priority, tags, limit, offset, projectId, isTemplate, title, source } = req.query;
 
     const filters = {};
     if (status) filters.status = status;
@@ -183,6 +183,7 @@ router.get('/', (req, res) => {
     if (title) filters.title = title;
     if (limit) filters.limit = parseInt(limit);
     if (offset) filters.offset = parseInt(offset);
+    if (source) filters.source = source;
 
     const todos = Todo.findAllByAgent(agentId, filters);
 
@@ -197,6 +198,42 @@ router.get('/', (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to fetch TODOs'
+    });
+  }
+});
+
+router.get('/agent-tasks', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const { status, priority, limit, offset } = req.query;
+
+    const filters = { source: 'agent' };
+    if (status) filters.status = status;
+    if (priority) filters.priority = priority;
+    if (limit) filters.limit = parseInt(limit);
+    if (offset) filters.offset = parseInt(offset);
+
+    const todos = Todo.findAllByAgent(agentId, filters);
+
+    const enhanced = todos.map(t => {
+      const isExecuting = t.last_heartbeat && (Date.now() - new Date(t.last_heartbeat).getTime()) < 300000;
+      return {
+        ...t,
+        _isAgentExecuting: isExecuting,
+        _executingAgent: isExecuting ? t.assigned_agent_id || t.origin_agent_id : null
+      };
+    });
+
+    res.json({
+      success: true,
+      data: enhanced,
+      count: enhanced.length
+    });
+  } catch (error) {
+    console.error('Error fetching agent tasks:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to fetch agent tasks'
     });
   }
 });
