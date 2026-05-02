@@ -39,6 +39,16 @@ module.exports = {
       env: {
         NODE_ENV: 'development'
       }
+    },
+    {
+      name: 'hermes-tester',
+      script: 'start.js',
+      args: '--config config.hermes-tester.json',
+      autorestart: true,
+      restart_delay: 5000,
+      env: {
+        NODE_ENV: 'development'
+      }
     }
   ]
 };

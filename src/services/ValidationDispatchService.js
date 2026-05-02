@@ -5,7 +5,7 @@ const FocusState = require('../models/FocusState');
 
 class ValidationDispatchService {
   constructor() {
-    this.validatorAgentId = process.env.VALIDATOR_AGENT_ID || 'hermes-ops';
+    this.validatorAgentId = process.env.VALIDATOR_AGENT_ID || 'hermes-tester';
   }
 
   async dispatchValidationTask(executorAgentId, task, originalExecutionLogs) {
@@ -70,10 +70,9 @@ Body:
         executorAgentId: executorAgentId,
         dispatchedAt: new Date().toISOString()
       }),
-      assigned_agent_id: this.validatorAgentId  // 添加指派
+      assigned_agent_id: this.validatorAgentId
     });
 
-    // 自动聚焦到验证任务
     await FocusState.setFocus(this.validatorAgentId, validationTask.id);
 
     Context.create(this.validatorAgentId, {
