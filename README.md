@@ -544,6 +544,45 @@ node framework/examples/ProgressiveIntegration.js
 sqlite3 data/todo.db ".tables"
 ```
 
+## 📊 日志分析指南
+
+### 日志文件位置
+
+| 进程 | 日志路径 | 说明 |
+|------|----------|------|
+| todo-server | `~/.pm2/logs/todo-server-out.log` | 服务端所有请求和操作 |
+| hermes-default | `~/.pm2/logs/hermes-default-out.log` | 默认智能体执行记录 |
+| hermes-ops | `~/.pm2/logs/hermes-ops-out.log` | Ops智能体执行记录 |
+| hermes-coder | `~/.pm2/logs/hermes-coder-out.log` | Coder智能体执行记录 |
+| agent-worker | `logs/agent-worker.log` | Agent Worker运行状态 |
+
+### 日志分析思路
+
+**1. 对比同一时间段内各智能体日志和任务状态变化**
+- 找到任务状态变化的时间点
+- 对比各智能体在该时间的日志，还原完整执行链路
+
+**2. 结合 `attempt_log` 和智能体执行日志还原执行链路**
+- 任务详情中的 `attempt_log` 记录了执行尝试
+- 智能体日志记录了详细的 LLM 交互和工具调用
+- 两者结合可完整还原执行过程
+
+**3. 分析 StuckTaskMonitor 的恢复日志找优化点**
+- 搜索 `[StuckTaskMonitor]` 关键字
+- 分析自动恢复的成功率和原因
+- 识别频繁卡住的任务类型
+
+```bash
+# 查看特定时间范围的日志
+grep "2026-05-02T15:" ~/.pm2/logs/todo-server-out.log | head -50
+
+# 分析 StuckTaskMonitor 日志
+grep "\[StuckTaskMonitor\]" ~/.pm2/logs/todo-server-out.log | tail -20
+
+# 对比任务创建和智能体执行
+grep "任务.*验证" ~/.pm2/logs/hermes-ops-out.log
+```
+
 ## 📝 环境变量
 
 | 变量 | 默认值 | 说明 |
