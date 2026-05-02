@@ -202,7 +202,79 @@ router.patch('/:id/status', async (req, res) => {
 
 ---
 
-## 五、优先级总结
+## 五、智能体功能概述
+
+### 5.1 智能体工作进程
+
+**文件**: `agent-worker.js`
+
+独立的智能体执行进程，负责：
+- 每 30 秒轮询 `focus_states`
+- 调用 LLM 生成命令并执行
+- 支持 bash 命令执行和进度报告
+
+### 5.2 结构化工具调用系统
+
+**文件**: `src/utils/StructuredDriveTools.js`
+
+智能体工作时使用的工具集：
+
+| 工具 | 功能 |
+|------|------|
+| `updateProgress` | 更新任务进度（progress/step/blockers） |
+| `confirmCompletion` | 标记任务完成并提供验收证据 |
+| `askForHelp` | 请求人工或外部支持 |
+
+**工具定义示例**:
+```javascript
+{
+  type: "function",
+  function: {
+    name: "askForHelp",
+    description: "遇到无法自行解决的阻塞时调用，请求人工介入或外部支持。",
+    parameters: {
+      blocker: "阻塞的具体描述",
+      neededResource: "需要什么资源或支持",
+      alternativesTried: ["已经尝试过的替代方案"]
+    }
+  }
+}
+```
+
+### 5.3 任务驱动引擎
+
+**DriveOrchestrator**（在 `EXECUTION_GUARD.md` 中规划）：
+- 服务器内置执行引擎
+- 强制执行闭环验证
+- 自动重试机制（最多 3 次）
+
+### 5.4 多智能体支持
+
+系统支持多个 Agent 协作：
+- **Hermes**（ops）- 运维智能体
+- **OpenClaw** - 数据采集智能体
+- 可扩展其他智能体
+
+### 5.5 Agent 相关数据模型
+
+| 字段 | 说明 |
+|------|------|
+| `agent_id` | 任务所属智能体 |
+| `origin_agent_id` | 任务创建者智能体 |
+| `assigned_agent_id` | 被指派执行的智能体 |
+
+### 5.6 askForHelp 当前实现
+
+当智能体调用 `askForHelp` 时：
+1. 更新任务状态为 `blocked`
+2. 添加阻塞项到 `heartbeat_blockers`
+3. 创建通知（`Notification.create`）
+
+**缺少的功能**：当前无法向特定智能体发送询问请求，仅能创建通知等待人类响应。
+
+---
+
+## 六、优先级总结
 
 | 优先级 | 功能 | 状态 | 影响文件 |
 |--------|------|------|----------|
@@ -212,7 +284,7 @@ router.patch('/:id/status', async (req, res) => {
 
 ---
 
-## 六、相关文档
+## 七、相关文档
 
 - [HERMES_INTEGRATION_DESIGN.md](../HERMES_INTEGRATION_DESIGN.md) - Hermes 统一调度集成
 - [MULTI_AGENT_DESIGN.md](../MULTI_AGENT_DESIGN.md) - 多 Agent 协作设计
@@ -221,7 +293,7 @@ router.patch('/:id/status', async (req, res) => {
 
 ---
 
-## 附录：每日调度重复任务问题
+## 八、附录：每日调度重复任务问题
 
 > 日期: 2026-05-02
 > 状态: ✅ 已修复
