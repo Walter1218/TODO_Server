@@ -33,9 +33,9 @@
     }
   },
   "agent": {
-    "id": "hermes-default",
-    "name": "hermes-default",
-    "secretKey": "2E6B15AE1A5F36679E1F66221DBFB5A6"
+    "id": "hermes-coder",
+    "name": "hermes-coder",
+    "secretKey": "44C75BA8D3CC3FF3031D2E7EEBA30CEF"
   },
   "features": {
     "taskManagement": {

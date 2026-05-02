@@ -417,6 +417,86 @@ app.listen(PORT, () => {
 
   console.log(`[DailyScheduler] 已启动，每 ${SCHEDULER_INTERVAL_MS / 1000}s 检查一次到期模板任务`);
 
+  const CRON_START_GRACE_MINUTES = parseInt(process.env.CRON_START_GRACE_MINUTES || '10', 10);
+  const CRON_NAG_COOLDOWN_MINUTES = parseInt(process.env.CRON_NAG_COOLDOWN_MINUTES || '60', 10);
+  const CRON_MONITOR_OPS_AGENT_ID = process.env.CRON_MONITOR_OPS_AGENT_ID || 'hermes-ops';
+  const CRON_MONITOR_INTERVAL_MS = 60 * 1000;
+
+  setInterval(() => {
+    try {
+      const db = getDb();
+      const overdueCutoff = new Date(Date.now() - CRON_START_GRACE_MINUTES * 60 * 1000).toISOString();
+      const notifyCutoff = new Date(Date.now() - CRON_NAG_COOLDOWN_MINUTES * 60 * 1000).toISOString();
+
+      const overdue = db.prepare(`
+        SELECT t.*, p.title AS template_title, p.schedule AS template_schedule
+        FROM todos t
+        JOIN todos p ON p.id = t.parent_id AND p.agent_id = t.agent_id
+        WHERE t.status = 'pending'
+          AND (t.is_template = 0 OR t.is_template IS NULL)
+          AND t.parent_id IS NOT NULL
+          AND p.is_template = 1
+          AND (t.archived = 0 OR t.archived IS NULL)
+          AND t.created_at <= ?
+          AND (t.last_heartbeat IS NULL OR t.last_heartbeat = '')
+        ORDER BY t.created_at ASC
+        LIMIT 50
+      `).all(overdueCutoff);
+
+      let totalNagged = 0;
+
+      for (const task of overdue) {
+        const alreadyNotified = db.prepare(`
+          SELECT id FROM task_notifications
+          WHERE task_id = ?
+            AND type = 'stalled'
+            AND message LIKE '[CronMonitor]%'
+            AND created_at >= ?
+          LIMIT 1
+        `).get(task.id, notifyCutoff);
+        if (alreadyNotified) continue;
+
+        const executorId = task.assigned_agent_id || task.agent_id;
+        const msg = `[CronMonitor] 定时实例超过 ${CRON_START_GRACE_MINUTES} 分钟仍未开始（无心跳）：「${task.title}」(ID: ${task.id})`;
+
+        if (Agent.exists(executorId)) {
+          Notification.create(executorId, task.id, 'stalled', msg);
+        }
+        if (task.agent_id && task.agent_id !== executorId && Agent.exists(task.agent_id)) {
+          Notification.create(task.agent_id, task.id, 'stalled', msg);
+        }
+        if (CRON_MONITOR_OPS_AGENT_ID && CRON_MONITOR_OPS_AGENT_ID !== executorId && CRON_MONITOR_OPS_AGENT_ID !== task.agent_id && Agent.exists(CRON_MONITOR_OPS_AGENT_ID)) {
+          Notification.create(CRON_MONITOR_OPS_AGENT_ID, task.id, 'stalled', msg);
+        }
+
+        Context.create(task.agent_id, {
+          sessionId: 'cron-monitor',
+          role: 'system',
+          content: `${msg}\n模板: ${task.template_title || '(unknown)'}\nschedule: ${task.template_schedule || '(none)'}`,
+          metadata: { type: 'cron_overdue', task_id: task.id, template_id: task.parent_id }
+        });
+        Context.pruneBySession(task.agent_id, 'cron-monitor', 50);
+
+        if (executorId === task.agent_id) {
+          const current = FocusState.findByAgent(executorId);
+          if (!current || current.current_task_id !== task.id) {
+            FocusState.createOrUpdate(executorId, { currentTaskId: task.id, focusMode: 'cron-monitor' });
+          }
+        }
+
+        totalNagged++;
+      }
+
+      if (totalNagged > 0) {
+        console.log(`[CronExecutionMonitor] 本次标记/提醒 ${totalNagged} 个未按时启动的定时实例（阈值 ${CRON_START_GRACE_MINUTES}min）`);
+      }
+    } catch (err) {
+      console.error('[CronExecutionMonitor] 扫描出错:', err.message);
+    }
+  }, CRON_MONITOR_INTERVAL_MS);
+
+  console.log(`[CronExecutionMonitor] 已启动，每 ${CRON_MONITOR_INTERVAL_MS / 1000}s 扫描 pending 定时实例；启动阈值 ${CRON_START_GRACE_MINUTES}min，提醒冷却 ${CRON_NAG_COOLDOWN_MINUTES}min`);
+
   // AssignmentDriver：每 60 秒扫描已指派但长时间未执行的任务，自动 focus + 通知
   const ASSIGN_DRIVER_INTERVAL_MS = 60 * 1000;
   const ASSIGN_STALE_MINUTES = 5;

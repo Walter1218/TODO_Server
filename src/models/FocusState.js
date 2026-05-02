@@ -72,7 +72,7 @@ class FocusState {
           OR assigned_agent_id = ?
         )
         AND (
-          status IN ('pending', 'in_progress')
+          status IN ('pending', 'in_progress', 'validation_failed')
           OR (status = 'blocked' AND attempt_count < max_attempts)
         )
         AND (is_template = 0 OR is_template IS NULL)
@@ -86,8 +86,8 @@ class FocusState {
       return null;
     }
 
-    // Priority 1: in_progress tasks (continue working on them)
-    const inProgress = todos.find(t => t.status === 'in_progress');
+    // Priority 1: in_progress or validation_failed tasks (continue working on them)
+    const inProgress = todos.find(t => ['in_progress', 'validation_failed'].includes(t.status));
     if (inProgress) {
       this.createOrUpdate(agentId, { currentTaskId: inProgress.id });
       return { ...inProgress, focus_reason: 'continue_in_progress' };

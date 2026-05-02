@@ -6,6 +6,8 @@ const Notification = require('../models/Notification');
 const Agent = require('../models/Agent');
 const CommandExecutor = require('./CommandExecutor');
 const ProgressValidator = require('./ProgressValidator');
+const ValidatorService = require('./ValidatorService');
+const ValidationDispatchService = require('./ValidationDispatchService');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
 
 const DEFAULTS = {
@@ -15,6 +17,7 @@ const DEFAULTS = {
   driveCooldownMs: 60 * 1000,
   stallThreshold: 30 * 60 * 1000,
   maxConcurrentDrives: 3,
+  useThirdPartyValidation: true,
 };
 
 class DriveOrchestrator {
@@ -25,17 +28,22 @@ class DriveOrchestrator {
     this.driveCooldownMs = options.driveCooldownMs || DEFAULTS.driveCooldownMs;
     this.stallThreshold = options.stallThreshold || DEFAULTS.stallThreshold;
     this.maxConcurrentDrives = options.maxConcurrentDrives || DEFAULTS.maxConcurrentDrives;
+    this.useThirdPartyValidation = options.useThirdPartyValidation !== undefined ? options.useThirdPartyValidation : DEFAULTS.useThirdPartyValidation;
     this.drivingTasks = new Set();
     this.framework = null;
+    this.validator = null;
+    this.validationDispatcher = null;
     this._timer = null;
   }
 
   start(framework) {
     this.framework = framework;
+    this.validator = new ValidatorService(framework);
+    this.validationDispatcher = new ValidationDispatchService();
     this._timer = setInterval(() => this.tick().catch(err => {
       console.error('[DriveOrchestrator] tick error:', err.message);
     }), this.intervalMs);
-    console.log(`[DriveOrchestrator] 已启动，每 ${this.intervalMs / 1000}s 扫描一次`);
+    console.log(`[DriveOrchestrator] 已启动，每 ${this.intervalMs / 1000}s 扫描一次，第三方验证: ${this.useThirdPartyValidation ? '启用' : '禁用'}`);
   }
 
   stop() {
@@ -47,7 +55,7 @@ class DriveOrchestrator {
 
   shouldDrive(task) {
     if (!task) return false;
-    const drivable = ['pending', 'in_progress'].includes(task.status);
+    const drivable = ['pending', 'in_progress', 'pending_validation', 'validation_failed'].includes(task.status);
     if (!drivable) return false;
     if (this.drivingTasks.has(task.id)) return false;
     if (task.is_template) return false;
@@ -82,14 +90,47 @@ class DriveOrchestrator {
         return Todo.findById(task.agent_id, task.id);
       }
     }
+    if (task.status === 'validation_failed') {
+      const currentAttempts = task.attempt_count || 0;
+      const maxAttempts = task.max_attempts || 3;
+      if (currentAttempts < maxAttempts) {
+        let feedback = '';
+        if (task.validation_report) {
+          try {
+            const report = JSON.parse(task.validation_report);
+            feedback = report.feedback || '';
+          } catch (e) {
+            console.error('[DriveOrchestrator] 解析 validation_report 失败:', e.message);
+          }
+        }
+
+        Todo.update(task.agent_id, task.id, {
+          status: 'in_progress',
+          attemptCount: currentAttempts + 1,
+          heartbeatStep: `🔄 校验失败重试中，参考反馈: ${feedback.substring(0, 50)}...`,
+          attemptLog: [...(task.attempt_log || []), {
+            timestamp: new Date().toISOString(),
+            success: false,
+            reason: 'ValidatorService 校验失败，自动重试',
+            output: feedback || 'No feedback available',
+          }],
+        });
+        const refreshed = Todo.findById(task.agent_id, task.id);
+        refreshed._validationFeedback = feedback;
+        return refreshed;
+      }
+    }
     return task;
   }
 
-  buildRetryContext(reply, results, attempt) {
+  buildRetryContext(reply, results, attempt, validationFeedback) {
     const failedOutput = results
       ? results.filter(r => !r.success).map(r => `[失败] ${r.command}: ${r.output}`).join('; ')
       : '';
-    return `【自动重试 #${attempt + 1}】上次回复未能推进任务。${failedOutput ? '失败命令: ' + failedOutput : '请分析上次回复为何无效，换一种方式继续。'}`;
+    const baseMsg = `【自动重试 #${attempt + 1}】`;
+    const progressMsg = failedOutput ? `失败命令: ${failedOutput}` : '上次回复未能推进任务，请分析原因并换一种方式继续。';
+    const validationMsg = validationFeedback ? `\n\n📋 上次验证失败反馈（请务必解决）:\n${validationFeedback}` : '';
+    return `${baseMsg}${progressMsg}${validationMsg}`;
   }
 
   async driveTask(agentId, task) {
@@ -97,7 +138,7 @@ class DriveOrchestrator {
     if (!task_) return { success: false, attempts: 0, reason: 'prepare_failed' };
 
     let attempt = 0;
-    let retryContext = null;
+    let retryContext = task_._validationFeedback ? `📋 验证失败反馈（请务必解决）:\n${task_._validationFeedback}` : null;
     let lastResults = null;
     let lastReply = null;
 
@@ -176,12 +217,23 @@ class DriveOrchestrator {
       });
 
       if (changed) {
+        const refreshedForValidation = Todo.findById(agentId, task_.id);
+        if (refreshedForValidation.heartbeat_progress >= 100) {
+          await Context.create(agentId, {
+            sessionId: 'drive-orchestrator',
+            role: 'system',
+            content: `[DriveOrchestrator] 任务进度达到 100%，自动触发验证流程`,
+            metadata: { type: 'auto_validation_trigger', task_id: task_.id },
+          });
+          Todo.update(agentId, task_.id, { status: 'pending_validation' });
+          return { success: true, validationTriggered: true, attempts: attempt + 1 };
+        }
         return { success: true, attempts: attempt + 1, reply, commands: execResults, changed };
       }
 
       lastReply = reply;
       lastResults = execResults;
-      retryContext = this.buildRetryContext(reply, execResults, attempt);
+      retryContext = this.buildRetryContext(reply, execResults, attempt, task_._validationFeedback || null);
       attempt++;
     }
 
@@ -222,16 +274,106 @@ class DriveOrchestrator {
       this.drivingTasks.add(task.id);
       concurrent++;
       try {
-        const result = await this.driveTask(agent.id, task);
-        if (result.success) {
-          totalDriven++;
-        } else if (result.stalled) {
-          totalStalled++;
+        if (task.status === 'pending_validation') {
+          if (this.useThirdPartyValidation) {
+            const recent = await Context.findRecentByAgent(agent.id, 200);
+            const related = recent.filter(c => (c.metadata || {}).task_id === task.id);
+            const logs = related.map(c => `[${c.session_id || 'session'}][${c.role}] ${c.content}`).join('\n---\n');
+            await this.validationDispatcher.dispatchValidationTask(agent.id, task, logs);
+            Todo.update(agent.id, task.id, { heartbeatStep: '📋 已派发第三方验证任务，等待验证报告...' });
+            totalDriven++;
+          } else {
+            const validationResult = await this.validator.validateTask(agent.id, task);
+            if (validationResult.pass) {
+              totalDriven++;
+            }
+          }
+        } else {
+          const result = await this.driveTask(agent.id, task);
+          if (result.success) {
+            totalDriven++;
+          } else if (result.stalled) {
+            totalStalled++;
+          }
         }
       } catch (err) {
         console.error(`[DriveOrchestrator] driveTask ${task.id} error:`, err.message);
       } finally {
         this.drivingTasks.delete(task.id);
+      }
+    }
+
+    if (concurrent < this.maxConcurrentDrives) {
+      const validateCutoff = new Date(Date.now() - 30 * 1000).toISOString();
+      const limit = Math.max(0, this.maxConcurrentDrives - concurrent);
+      const pendingValidations = db.prepare(`
+        SELECT * FROM todos
+        WHERE status = 'pending_validation'
+          AND is_template = 0
+          AND archived = 0
+          AND updated_at <= ?
+        ORDER BY updated_at ASC
+        LIMIT ?
+      `).all(validateCutoff, limit);
+
+      for (const pv of pendingValidations) {
+        if (concurrent >= this.maxConcurrentDrives) break;
+        if (this.drivingTasks.has(pv.id)) continue;
+
+        this.drivingTasks.add(pv.id);
+        concurrent++;
+        try {
+          if (this.useThirdPartyValidation) {
+            const recent = await Context.findRecentByAgent(pv.agent_id, 200);
+            const related = recent.filter(c => (c.metadata || {}).task_id === pv.id);
+            const logs = related.map(c => `[${c.session_id || 'session'}][${c.role}] ${c.content}`).join('\n---\n');
+            await this.validationDispatcher.dispatchValidationTask(pv.agent_id, pv, logs);
+            Todo.update(pv.agent_id, pv.id, { heartbeatStep: '📋 已派发第三方验证任务，等待验证报告...' });
+            totalDriven++;
+          } else {
+            const validationResult = await this.validator.validateTask(pv.agent_id, pv);
+            if (validationResult.pass) {
+              totalDriven++;
+            }
+          }
+        } catch (err) {
+          console.error(`[DriveOrchestrator] validateTask ${pv.id} error:`, err.message);
+        } finally {
+          this.drivingTasks.delete(pv.id);
+        }
+      }
+    }
+
+    if (concurrent < this.maxConcurrentDrives) {
+      const failedRetryCutoff = new Date(Date.now() - 60 * 1000).toISOString();
+      const limit = Math.max(0, this.maxConcurrentDrives - concurrent);
+      const failedTasks = db.prepare(`
+        SELECT * FROM todos
+        WHERE status = 'validation_failed'
+          AND is_template = 0
+          AND archived = 0
+          AND attempt_count < max_attempts
+          AND updated_at <= ?
+        ORDER BY updated_at ASC
+        LIMIT ?
+      `).all(failedRetryCutoff, limit);
+
+      for (const ft of failedTasks) {
+        if (concurrent >= this.maxConcurrentDrives) break;
+        if (this.drivingTasks.has(ft.id)) continue;
+
+        this.drivingTasks.add(ft.id);
+        concurrent++;
+        try {
+          const result = await this.driveTask(ft.agent_id, ft);
+          if (result.success) {
+            totalDriven++;
+          }
+        } catch (err) {
+          console.error(`[DriveOrchestrator] driveTask (retry) ${ft.id} error:`, err.message);
+        } finally {
+          this.drivingTasks.delete(ft.id);
+        }
       }
     }
 
@@ -244,6 +386,24 @@ class DriveOrchestrator {
         AND is_template = 0
         AND archived = 0
     `).all(staleThreshold);
+
+    const completedTasks = db.prepare(`
+      SELECT * FROM todos
+      WHERE status = 'in_progress'
+        AND heartbeat_progress >= 100
+        AND is_template = 0
+        AND archived = 0
+    `).all();
+
+    for (const ct of completedTasks) {
+      await Context.create(ct.agent_id, {
+        sessionId: 'drive-orchestrator',
+        role: 'system',
+        content: `[DriveOrchestrator] 检测到任务进度 100%，自动触发验证流程`,
+        metadata: { type: 'auto_validation_trigger', task_id: ct.id },
+      });
+      Todo.update(ct.agent_id, ct.id, { status: 'pending_validation' });
+    }
 
     for (const staleTask of staleTasks) {
       if (totalStalled >= 5) break;

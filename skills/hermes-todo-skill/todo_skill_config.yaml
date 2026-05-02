@@ -1,0 +1,9 @@
+server:
+  url: "http://localhost:3000"
+agent:
+  id: ""
+  name: ""
+  secret_key: ""
+cache:
+  enabled: true
+  ttl_seconds: 300

@@ -206,6 +206,10 @@ class AgentTODOSDK {
     return this.completeTodo(todoId);
   }
 
+  async proposeCompletion(todoId, summary = '') {
+    return this.updateStatus(todoId, 'pending_validation');
+  }
+
   async planTaskChain(tasks) {
     const results = [];
 

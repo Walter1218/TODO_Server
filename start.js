@@ -11,9 +11,17 @@ async function main() {
   console.log('='.repeat(50));
 
   try {
+    const args = process.argv.slice(2);
+    // 处理命令行参数 --config
+    let configPath = null;
+    const configIndex = args.indexOf('--config');
+    if (configIndex !== -1 && args[configIndex + 1]) {
+      configPath = args[configIndex + 1];
+    }
+
     // 从配置文件加载框架
-    console.log('\n📄 加载配置文件...');
-    const framework = AgentTaskFramework.fromConfig();
+    console.log(`\n📄 加载配置文件: ${configPath || 'config.json'}...`);
+    const framework = AgentTaskFramework.fromConfig(configPath);
 
     // 初始化
     console.log('\n⚙️ 初始化框架...');
@@ -27,11 +35,12 @@ async function main() {
     console.log('- 已启用功能:', status.enabledFeatures);
     console.log('- LLM:', status.llm?.provider || '未配置');
 
-    // 测试对话
-    console.log('\n💬 测试对话...');
-    const result = await framework.processMessage('你好，请介绍一下你自己');
-    console.log('\n🤖 回复：');
-    console.log(result.response.message);
+    if (args.includes('--smoke-test')) {
+      console.log('\n💬 Smoke test...');
+      const result = await framework.processMessage('你好，请介绍一下你自己');
+      console.log('\n🤖 回复：');
+      console.log(result.response.message);
+    }
 
     console.log('\n' + '='.repeat(50));
     console.log('✅ 智能体启动成功！\n');
@@ -89,10 +98,24 @@ if (require.main === module) {
     // 如果提供了命令行参数 --chat，则进入对话模式
     if (process.argv.includes('--chat')) {
       chatLoop(framework);
-    } else {
-      console.log('💡 提示：使用 --chat 参数进入对话模式');
-      console.log('   npm run agent -- --chat\n');
+    } else if (process.argv.includes('--once')) {
       process.exit(0);
+    } else {
+      console.log('💡 运行模式：daemon（后台驻留）');
+      console.log('   - --chat 进入交互式对话');
+      console.log('   - --once 启动后退出');
+      console.log('   - --smoke-test 启动后执行一次测试对话\n');
+
+      const keepAlive = setInterval(() => {}, 60 * 60 * 1000);
+      keepAlive.unref?.();
+
+      const shutdown = () => {
+        clearInterval(keepAlive);
+        process.exit(0);
+      };
+
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
     }
   })();
 }

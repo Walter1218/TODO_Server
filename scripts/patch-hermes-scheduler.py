@@ -42,7 +42,12 @@ _TOOL_INSTRUCTIONS = """
    {"tool_calls":[{"function":{"name":"updateProgress","arguments":{"progress":80,"step":"数据采集完成","blockers":[]}}]}
    ```
 
-2. **confirmCompletion** - 确认任务完成（任务完全完成时调用）
+2. **proposeCompletion** - 任务执行完毕，申请验收（不再直接标记完成）
+   ```json
+   {"tool_calls":[{"function":{"name":"proposeCompletion","arguments":{"progress":100,"step":"工作全部完成，请验收"}}} ]}
+   ```
+
+3. **confirmCompletion** - 确认任务完成（仅在无法使用 proposeCompletion 时作为备选）
    ```json
    {"tool_calls":[{"function":{"name":"confirmCompletion","arguments":{"summary":"执行摘要","criteriaMet":["标准1","标准2"],"evidence":"验证证据"}}]}
    ```

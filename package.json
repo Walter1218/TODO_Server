@@ -11,7 +11,16 @@
     "agent": "node start.js",
     "test": "jest --runInBand --forceExit --detectOpenHandles",
     "test:coverage": "jest --runInBand --forceExit --detectOpenHandles --coverage",
-    "patch:hermes": "node scripts/patch-hermes-scheduler.js"
+    "patch:hermes": "node scripts/patch-hermes-scheduler.js",
+    "sync:skills": "node scripts/sync_skills.js",
+    "setup:hermes": "node scripts/setup_hermes_agents.js && node scripts/sync_skills.js",
+    "start:agents": "node scripts/start_all.js",
+    "pm2:start": "npx pm2 start ecosystem.config.js",
+    "pm2:stop": "npx pm2 stop todo-server hermes-default hermes-ops hermes-coder",
+    "pm2:restart": "npx pm2 restart todo-server hermes-default hermes-ops hermes-coder",
+    "pm2:status": "npx pm2 status",
+    "pm2:logs": "npx pm2 logs",
+    "pm2:monit": "npx pm2 monit"
   },
   "postinstall": "node scripts/patch-hermes-scheduler.js",
   "keywords": [
@@ -30,6 +39,7 @@
     "uuid": "^11.0.5"
   },
   "devDependencies": {
-    "jest": "^30.3.0"
+    "jest": "^30.3.0",
+    "pm2": "^7.0.0"
   }
 }

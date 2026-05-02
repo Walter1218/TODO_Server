@@ -441,11 +441,37 @@ router.delete('/:id', async (req, res) => {
 router.patch('/:id/complete', async (req, res) => {
   try {
     const { agentId, id } = req.params;
+    const forceComplete = String(req.query.force || '').toLowerCase() === 'true'
+      || String(req.query.force || '') === '1'
+      || String(req.headers['x-force-complete'] || '').toLowerCase() === 'true';
 
-    if (!Todo.findById(agentId, id)) {
+    const existing = Todo.findById(agentId, id);
+    if (!existing) {
       return res.status(404).json({
         error: 'Not found',
         message: 'TODO not found'
+      });
+    }
+
+    if (!forceComplete) {
+      Todo.update(agentId, id, {
+        status: 'pending_validation',
+        heartbeatProgress: 100,
+        heartbeatStep: '🧾 已提交验收申请（待自动校验）'
+      });
+
+      Context.create(agentId, {
+        sessionId: 'completion-proposal',
+        role: 'system',
+        content: `[complete->pending_validation] 任务「${existing.title}」触发自动验收流程（可用 ?force=true 跳过）`,
+        metadata: { type: 'task_completion_proposal', task_id: id }
+      });
+
+      return res.json({
+        success: true,
+        data: Todo.findById(agentId, id),
+        status_rewritten: true,
+        note: '已将 completed 请求重写为 pending_validation，以触发内嵌智能体自动验收。需要强制完成可使用 ?force=true 或 X-Force-Complete: true'
       });
     }
 
@@ -476,6 +502,9 @@ router.patch('/:id/status', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { status } = req.body;
+    const forceComplete = String(req.query.force || '').toLowerCase() === 'true'
+      || String(req.query.force || '') === '1'
+      || String(req.headers['x-force-complete'] || '').toLowerCase() === 'true';
 
     if (!status) {
       return res.status(400).json({
@@ -484,11 +513,11 @@ router.patch('/:id/status', async (req, res) => {
       });
     }
 
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked'];
+    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled, blocked'
+        message: 'Invalid status. Must be one of: ' + validStatuses.join(', ')
       });
     }
 
@@ -501,7 +530,9 @@ router.patch('/:id/status', async (req, res) => {
 
     const todo = Todo.findById(agentId, id);
 
-    if (status === 'completed') {
+    const appliedStatus = (status === 'completed' && !forceComplete) ? 'pending_validation' : status;
+
+    if (appliedStatus === 'completed') {
       const unmetCriteria = [];
       if (todo.acceptance_criteria && !todo.criteria_confirmed) {
         const criteria = todo.acceptance_criteria.split('\n').filter(l => l.trim());
@@ -524,17 +555,18 @@ router.patch('/:id/status', async (req, res) => {
       }
     }
 
-    const updatedTodo = Todo.updateStatus(agentId, id, status);
+    const updatedTodo = Todo.updateStatus(agentId, id, appliedStatus);
 
     // 状态变更为 completed / in_progress / cancelled 时重新评估聚焦
     let focus = null;
-    if (['completed', 'in_progress', 'cancelled'].includes(status)) {
+    if (['completed', 'in_progress', 'cancelled'].includes(appliedStatus)) {
       focus = await FocusState.autoFocus(agentId, getLlmManager(req));
     }
 
     res.json({
       success: true,
       data: updatedTodo,
+      status_rewritten: status === 'completed' && appliedStatus === 'pending_validation',
       focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
@@ -623,7 +655,10 @@ router.get('/:id/dependency-tree', (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { agentId, id } = req.params;
-    const { title, description, status, priority, context, tags, dependencies, projectId, position, schedule, isTemplate } = req.body;
+    const { title, description, status, priority, context, tags, dependencies, projectId, position, schedule, isTemplate, assignedAgentId } = req.body;
+    const assignedAgentIdCompat = req.body.assigned_agent_id;
+    const assignmentNote = req.body.assignmentNote !== undefined ? req.body.assignmentNote : req.body.assignment_note;
+    const normalizedAssignedAgentId = assignedAgentId !== undefined ? assignedAgentId : assignedAgentIdCompat;
 
     if (!Todo.findById(agentId, id)) {
       return res.status(404).json({
@@ -632,11 +667,11 @@ router.put('/:id', async (req, res) => {
       });
     }
 
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked'];
+    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed'];
     if (status && !validStatuses.includes(status)) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid status. Must be one of: pending, in_progress, completed, cancelled, blocked'
+        message: 'Invalid status. Must be one of: ' + validStatuses.join(', ')
       });
     }
 
@@ -682,6 +717,19 @@ router.put('/:id', async (req, res) => {
 
     // For updates, check both the incoming title/tags and the existing task
     const existingTask = Todo.findById(agentId, id);
+
+    if (normalizedAssignedAgentId !== undefined || assignmentNote !== undefined) {
+      if (!existingTask?.is_template) {
+        return res.status(400).json({
+          error: 'Validation error',
+          message: 'assigned_agent_id 不支持通过 PUT /todos/:id 直接更新。请使用 POST /todos/:id/assign 或 POST /todos/:id/transfer；模板任务（is_template=true）例外可通过 PUT 设置默认执行者。'
+        });
+      }
+      if (normalizedAssignedAgentId && !Agent.exists(normalizedAssignedAgentId)) {
+        Agent.create({ id: normalizedAssignedAgentId, name: normalizedAssignedAgentId, metadata: { auto_created: true } });
+      }
+    }
+
     const checkTitle = title !== undefined ? title : existingTask?.title;
     const checkTags = tags !== undefined ? tags : existingTask?.tags;
     const finalPriority = enforcePatrolPriority(checkTitle, checkTags, priority);
@@ -705,6 +753,8 @@ router.put('/:id', async (req, res) => {
       heartbeatProgress: req.body.heartbeatProgress,
       heartbeatStep: req.body.heartbeatStep,
       heartbeatBlockers: req.body.heartbeatBlockers,
+      assignedAgentId: normalizedAssignedAgentId,
+      assignmentNote,
       schedule,
       isTemplate
     });
@@ -889,6 +939,9 @@ router.post('/:id/confirm-completion', async (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { summary, criteriaMet, evidence } = req.body;
+    const forceComplete = String(req.query.force || '').toLowerCase() === 'true'
+      || String(req.query.force || '') === '1'
+      || String(req.headers['x-force-complete'] || '').toLowerCase() === 'true';
 
     const todo = Todo.findById(agentId, id);
     if (!todo) {
@@ -912,29 +965,32 @@ router.post('/:id/confirm-completion', async (req, res) => {
       : '';
 
     Todo.update(agentId, id, {
-      status: 'completed',
+      status: forceComplete ? 'completed' : 'pending_validation',
       criteriaConfirmed: true,
       description: todo.description
         ? `${todo.description}\n\n## 完成摘要\n${summary || ''}\n\n## 验收标准满足情况\n${criteriaText}\n\n## 验收证据\n${evidence || ''}`
         : `\n## 完成摘要\n${summary || ''}\n\n## 验收标准满足情况\n${criteriaText}\n\n## 验收证据\n${evidence || ''}`,
       heartbeatProgress: 100,
-      heartbeatStep: '✅ 已完成（已确认验收）'
+      heartbeatStep: forceComplete ? '✅ 已完成（强制完成）' : '🧾 已提交验收申请（待自动校验）'
     });
 
     Context.create(agentId, {
       sessionId: 'confirm-completion',
       role: 'system',
-      content: `[confirm-completion] 任务「${todo.title}」被显式标记为完成，criteriaMet=${JSON.stringify(criteriaMet || [])}`,
-      metadata: { type: 'task_completion', task_id: id, criteria_met: criteriaMet || [], summary }
+      content: forceComplete
+        ? `[confirm-completion] 任务「${todo.title}」被强制标记为完成，criteriaMet=${JSON.stringify(criteriaMet || [])}`
+        : `[confirm-completion] 任务「${todo.title}」提交验收申请，criteriaMet=${JSON.stringify(criteriaMet || [])}`,
+      metadata: { type: forceComplete ? 'task_force_completion' : 'task_completion_proposal', task_id: id, criteria_met: criteriaMet || [], summary }
     });
 
-    const parentCompleted = Todo.checkAndCompleteParent(agentId, id);
-    const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
+    const parentCompleted = forceComplete ? Todo.checkAndCompleteParent(agentId, id) : false;
+    const focus = forceComplete ? await FocusState.autoFocus(agentId, getLlmManager(req)) : null;
 
     res.json({
       success: true,
       data: Todo.findById(agentId, id),
       parent_auto_completed: parentCompleted,
+      status_rewritten: !forceComplete,
       focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {
@@ -1189,31 +1245,127 @@ router.post('/:id/report', (req, res) => {
   try {
     const { agentId, id } = req.params;
     const { status, description, context, heartbeatProgress, heartbeatStep, heartbeatBlockers } = req.body;
+    const forceComplete = String(req.query.force || '').toLowerCase() === 'true'
+      || String(req.query.force || '') === '1'
+      || String(req.headers['x-force-complete'] || '').toLowerCase() === 'true';
 
     const todo = Todo.findById(agentId, id);
     if (!todo) {
       return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
     }
 
+    const appliedStatus = (status === 'completed' && !forceComplete) ? 'pending_validation' : status;
+    const appliedHeartbeatStep = (status === 'completed' && !forceComplete)
+      ? '🧾 已提交验收申请（待自动校验）'
+      : heartbeatStep;
+
     const updated = Todo.writeReport(agentId, id, {
-      status,
+      status: appliedStatus,
       description,
       context,
       heartbeatProgress,
-      heartbeatStep,
+      heartbeatStep: appliedHeartbeatStep,
       heartbeatBlockers
     });
 
     Context.create(agentId, {
       sessionId: 'scheduled-report',
       role: 'system',
-      content: `[CronReport] 任务「${todo.title}」已接收执行报告（status=${status || 'unchanged'}）`,
+      content: `[CronReport] 任务「${todo.title}」已接收执行报告（status=${appliedStatus || 'unchanged'}）`,
       metadata: { type: 'cron_report', task_id: id, template_id: todo.parent_id }
     });
 
-    res.json({ success: true, data: updated });
+    res.json({ success: true, data: updated, status_rewritten: status === 'completed' && appliedStatus === 'pending_validation' });
   } catch (error) {
     console.error('Error writing report:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+router.post('/:id/validation-report', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { validatorAgentId, pass, reason, feedback, score } = req.body;
+
+    if (validatorAgentId === undefined || pass === undefined || score === undefined) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'Missing required fields: validatorAgentId, pass, score'
+      });
+    }
+
+    const task = Todo.findById(agentId, id);
+    if (!task) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const newValidationCount = (task.validation_count || 0) + 1;
+    const updateData = {
+      validationCount: newValidationCount,
+      validationReport: JSON.stringify({ pass, reason, feedback, score, validatorAgentId }),
+      validatedBy: validatorAgentId
+    };
+
+    if (pass) {
+      updateData.status = 'completed';
+      updateData.heartbeatStep = '✅ 第三方验证通过';
+    } else {
+      updateData.status = 'validation_failed';
+      updateData.heartbeatStep = `❌ 第三方验证未通过: ${reason}`;
+    }
+
+    const updated = Todo.update(agentId, id, updateData);
+
+    Context.create(agentId, {
+      sessionId: 'validation-report',
+      role: 'system',
+      content: `[ThirdPartyValidation] 验证报告来自 ${validatorAgentId}：${pass ? '✅ 通过' : '❌ 失败'}（评分 ${score}）\n原因：${reason}\n反馈：${feedback || '无'}`,
+      metadata: { type: 'third_party_validation_report', task_id: id, validator: validatorAgentId, pass, score }
+    });
+
+    if (pass) {
+      Todo.checkAndCompleteParent(agentId, id);
+
+      const TaskReportService = require('../services/TaskReportService');
+      const report = await TaskReportService.generateReport(agentId, id);
+      const reportMarkdown = TaskReportService.formatMarkdownReport(report);
+
+      Context.create(agentId, {
+        sessionId: 'task-report',
+        role: 'system',
+        content: `[TaskReport] 任务流程报告已自动生成\n\n${reportMarkdown}`,
+        metadata: { type: 'task_report_auto', task_id: id, report_generated_at: new Date().toISOString() }
+      });
+
+      console.log(`[TaskReport] 任务 ${id} 流程报告已自动生成`);
+    }
+
+    console.log(`[ThirdPartyValidation] 验证报告已接收: task=${id}, validator=${validatorAgentId}, pass=${pass}, score=${score}`);
+    res.json({ success: true, data: updated });
+
+  } catch (error) {
+    console.error('Error processing validation report:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+router.get('/:id/report', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { format } = req.query;
+
+    const TaskReportService = require('../services/TaskReportService');
+
+    const report = await TaskReportService.generateReport(agentId, id);
+
+    if (format === 'markdown') {
+      const markdown = TaskReportService.formatMarkdownReport(report);
+      res.type('text/markdown').send(markdown);
+    } else {
+      res.json({ success: true, data: report });
+    }
+  } catch (error) {
+    console.error('Error generating task report:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });

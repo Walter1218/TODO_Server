@@ -648,6 +648,39 @@
         .template-meta { display: flex; gap: 12px; font-size: 0.78rem; color: var(--text-sec); margin-bottom: 6px; flex-wrap: wrap; }
         .template-agent { font-size: 0.75rem; color: var(--text-muted); margin-bottom: 10px; }
         .template-actions { display: flex; gap: 8px; }
+
+        /* Task Create Modal */
+        .modal-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5); z-index: 1000; display: flex;
+            align-items: center; justify-content: center; padding: 20px;
+        }
+        .modal-overlay.hidden { display: none; }
+        .modal {
+            background: var(--card); border-radius: 12px; width: 100%; max-width: 560px;
+            max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+        }
+        .modal-header {
+            padding: 20px 24px; border-bottom: 1px solid var(--border);
+            display: flex; align-items: center; justify-content: space-between;
+        }
+        .modal-header h2 { font-size: 1.2rem; font-weight: 700; }
+        .modal-close { background: none; border: none; font-size: 1.5rem; cursor: pointer; color: var(--text-muted); padding: 4px; line-height: 1; }
+        .modal-close:hover { color: var(--text); }
+        .modal-body { padding: 24px; }
+        .modal-footer {
+            padding: 16px 24px; border-top: 1px solid var(--border);
+            display: flex; gap: 12px; justify-content: flex-end;
+        }
+        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+        .form-group textarea { width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 0.95rem; font-family: inherit; resize: vertical; min-height: 80px; }
+        .form-group textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px rgba(102,126,234,0.15); }
+        .tag-input-container { border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; cursor: text; }
+        .tag-input-container:focus-within { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(102,126,234,0.15); }
+        .tag-chip { background: rgba(102,126,234,0.1); color: var(--primary); padding: 2px 8px; border-radius: 4px; font-size: 0.8rem; display: flex; align-items: center; gap: 4px; }
+        .tag-chip button { background: none; border: none; cursor: pointer; color: var(--primary); font-size: 0.9rem; padding: 0; line-height: 1; }
+        .tag-input { border: none; outline: none; font-size: 0.9rem; flex: 1; min-width: 100px; background: transparent; }
+        .create-error { color: var(--danger); font-size: 0.85rem; margin-top: 12px; display: none; }
     </style>
 </head>
 <body>
@@ -661,6 +694,7 @@
             </div>
         </div>
         <div class="header-actions" id="headerActions">
+            <button class="btn btn-primary btn-sm" onclick="app.showCreateTaskModal()">+ 新建任务</button>
             <button class="btn btn-ghost btn-sm" onclick="app.refresh()">🔄 刷新</button>
             <button class="btn btn-ghost btn-sm" onclick="app.logout()">退出</button>
         </div>
@@ -686,6 +720,59 @@
             <p style="margin-top:16px;font-size:0.8rem;color:var(--text-muted);">
                 💡 提示：任意已知 Agent 的 Secret Key 都可以查看所有 Agent 的数据（跨 Agent 协作权限）。Key 保存在 <code>~/.hermes/skills/hermes-todo-skill/agents.yaml</code>
             </p>
+        </div>
+    </div>
+
+    <!-- Task Create Modal -->
+    <div class="modal-overlay hidden" id="createTaskModal">
+        <div class="modal">
+            <div class="modal-header">
+                <h2>📝 新建任务</h2>
+                <button class="modal-close" onclick="app.hideCreateTaskModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label>任务标题 *</label>
+                    <input type="text" id="createTitle" placeholder="输入任务标题（必填）">
+                </div>
+                <div class="form-group">
+                    <label>任务描述</label>
+                    <textarea id="createDescription" placeholder="详细描述任务内容，可以包含命令步骤等"></textarea>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>优先级</label>
+                        <select id="createPriority">
+                            <option value="medium">中 (medium)</option>
+                            <option value="low">低 (low)</option>
+                            <option value="high">高 (high)</option>
+                            <option value="critical">紧急 (critical)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>指派给 Agent</label>
+                        <select id="createAssignedAgent">
+                            <option value="">不指定（自己处理）</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>标签</label>
+                    <div class="tag-input-container" onclick="document.getElementById('createTagInput').focus()">
+                        <div id="createTagList"></div>
+                        <input type="text" class="tag-input" id="createTagInput" placeholder="输入标签后按回车添加">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>验收标准</label>
+                    <textarea id="createAcceptanceCriteria" placeholder="明确任务完成的标准，用于自动校验"></textarea>
+                </div>
+                <div class="create-error" id="createError"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-ghost" onclick="app.hideCreateTaskModal()">取消</button>
+                <button class="btn btn-primary" onclick="app.createTask()">创建任务</button>
+            </div>
         </div>
     </div>
 
@@ -1618,10 +1705,12 @@
             const blockersHtml = hasBlockers
                 ? `<div class="blocker-alert">🚧 阻塞项：${t.heartbeat_blockers.join('、')}</div>` : '';
 
-            // 活跃时间友好显示
-            const activeTimeHtml = idleMinutes !== null
-                ? `<span class="active-time ${isStuck ? 'stuck' : (isStalled ? 'stalled' : '')}">💓 ${this.formatDuration(idleMinutes)}</span>`
-                : '<span class="active-time">💓 从未活跃</span>';
+            // 活跃时间友好显示 - 已完成任务不显示心跳信息
+            const activeTimeHtml = t.status === 'completed' ? '' : (
+                idleMinutes !== null
+                    ? `<span class="active-time ${isStuck ? 'stuck' : (isStalled ? 'stalled' : '')}">💓 ${this.formatDuration(idleMinutes)}</span>`
+                    : '<span class="active-time">💓 从未活跃</span>'
+            );
 
             // 父任务展开/收拢按钮
             const parentExpandHtml = hasChildren ? `
@@ -1682,7 +1771,7 @@
                                     ${isAgentTask ? `<div style="color:#667eea;font-weight:600;">🤖 由 Agent 代理执行</div>` : '<div>👤 人工创建</div>'}
                                     <div>创建时间: ${this.formatDate(t.created_at)}</div>
                                     ${t.completed_at ? `<div>完成时间: ${this.formatDate(t.completed_at)}</div>` : ''}
-                                    ${t.last_heartbeat ? `<div>最后心跳: ${this.formatDate(t.last_heartbeat)} · ${this.formatDuration(idleMinutes)}</div>` : ''}
+                                    ${t.last_heartbeat && t.status !== 'completed' ? `<div>最后心跳: ${this.formatDate(t.last_heartbeat)} · ${this.formatDuration(idleMinutes)}</div>` : ''}
                                 ${(t.status === 'blocked' || t.status === 'in_progress' || t.status === 'pending') && !isAgentTask ? `
                                     <div style="margin-top:10px;">
                                         <button class="btn btn-primary" onclick="event.stopPropagation(); app.driveTask('${t._agentId}', '${t.id}')">🚀 强行驱动执行</button>
@@ -2333,10 +2422,109 @@
             if (!str) return '';
             return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         },
+
+        showCreateTaskModal() {
+            document.getElementById('createTaskModal').classList.remove('hidden');
+            document.getElementById('createTitle').value = '';
+            document.getElementById('createDescription').value = '';
+            document.getElementById('createPriority').value = 'medium';
+            document.getElementById('createAcceptanceCriteria').value = '';
+            document.getElementById('createTagList').innerHTML = '';
+            this._createTags = [];
+            document.getElementById('createError').style.display = 'none';
+
+            const agentSelect = document.getElementById('createAssignedAgent');
+            agentSelect.innerHTML = '<option value="">不指定（自己处理）</option>' +
+                this.agents.map(a => `<option value="${a.id}">${a.name}</option>`).join('');
+
+            document.getElementById('createTitle').focus();
+        },
+
+        hideCreateTaskModal() {
+            document.getElementById('createTaskModal').classList.add('hidden');
+        },
+
+        async createTask() {
+            const title = document.getElementById('createTitle').value.trim();
+            if (!title) {
+                const err = document.getElementById('createError');
+                err.textContent = '请输入任务标题';
+                err.style.display = 'block';
+                return;
+            }
+
+            const description = document.getElementById('createDescription').value.trim();
+            const priority = document.getElementById('createPriority').value;
+            const assignedAgentId = document.getElementById('createAssignedAgent').value || undefined;
+            const acceptanceCriteria = document.getElementById('createAcceptanceCriteria').value.trim();
+            const tags = this._createTags || [];
+
+            try {
+                const res = await fetch(`/api/agents/${this.selectedAgentId}/todos`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-Agent-Secret': this.secretKey
+                    },
+                    body: JSON.stringify({
+                        title,
+                        description,
+                        priority,
+                        assignedAgentId,
+                        acceptanceCriteria,
+                        tags
+                    })
+                });
+
+                const data = await res.json();
+
+                if (!res.ok) {
+                    const err = document.getElementById('createError');
+                    err.textContent = data.message || '创建任务失败';
+                    err.style.display = 'block';
+                    return;
+                }
+
+                this.hideCreateTaskModal();
+                await this.refresh();
+
+            } catch (e) {
+                const err = document.getElementById('createError');
+                err.textContent = '网络错误：' + e.message;
+                err.style.display = 'block';
+            }
+        },
     };
 
     // Init on load
     window.addEventListener('DOMContentLoaded', () => app.init());
+
+    document.addEventListener('keydown', (e) => {
+        if (e.target.id === 'createTagInput' && e.key === 'Enter') {
+            e.preventDefault();
+            const val = e.target.value.trim();
+            if (val && !app._createTags.includes(val)) {
+                app._createTags.push(val);
+                const chip = document.createElement('span');
+                chip.className = 'tag-chip';
+                chip.innerHTML = app.escape(val) + ' <button onclick="app.removeCreateTag(\'' + app.escape(val).replace(/'/g, "\\'") + '\')">&times;</button>';
+                document.getElementById('createTagList').appendChild(chip);
+                e.target.value = '';
+            }
+        }
+    });
+
+    app.removeCreateTag = function(tag) {
+        app._createTags = app._createTags.filter(t => t !== tag);
+        const chips = document.querySelectorAll('#createTagList .tag-chip');
+        chips.forEach(chip => {
+            if (chip.textContent.replace('×', '').trim() === tag) chip.remove();
+        });
+    };
+
+    document.getElementById('createTaskModal').addEventListener('click', (e) => {
+        if (e.target.id === 'createTaskModal') app.hideCreateTaskModal();
+    });
     </script>
 </body>
 </html>

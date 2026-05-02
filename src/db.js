@@ -281,6 +281,114 @@ function initializeSchema() {
   } catch (e) {
     // Column already exists, ignore
   }
+
+  // Migration: add Agent-to-Agent validation columns
+  const validationMigrations = [
+    { col: 'validation_report', type: 'TEXT' },
+    { col: 'validated_by', type: 'TEXT' },
+    { col: 'validation_count', type: 'INTEGER DEFAULT 0' },
+  ];
+
+  for (const mig of validationMigrations) {
+    try {
+      database.exec(`ALTER TABLE todos ADD COLUMN ${mig.col} ${mig.type}`);
+      console.log(`[DB] Migration: todos.${mig.col} added`);
+    } catch (err) {
+      // Column already exists
+    }
+  }
+
+  // Migration: update status CHECK constraint for todos to include validation states
+  try {
+    const tblInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='todos'").get();
+    if (tblInfo && tblInfo.sql && !tblInfo.sql.includes('pending_validation')) {
+      console.log('[DB] Migration: Updating todos status CHECK constraint...');
+      db.exec(`
+        PRAGMA foreign_keys=OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE todos_new (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          project_id TEXT,
+          parent_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT DEFAULT '',
+          status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed')),
+          priority TEXT DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high', 'critical')),
+          context TEXT DEFAULT '',
+          tags TEXT DEFAULT '[]',
+          dependencies TEXT DEFAULT '[]',
+          acceptance_criteria TEXT DEFAULT '',
+          criteria_confirmed BOOLEAN DEFAULT false,
+          max_attempts INTEGER DEFAULT 3,
+          attempt_count INTEGER DEFAULT 0,
+          attempt_log TEXT DEFAULT '[]',
+          last_heartbeat DATETIME,
+          heartbeat_progress REAL DEFAULT 0,
+          heartbeat_step TEXT DEFAULT '',
+          heartbeat_blockers TEXT DEFAULT '[]',
+          position INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          completed_at DATETIME,
+          expected_duration_minutes INTEGER,
+          schedule TEXT,
+          is_template BOOLEAN DEFAULT 0,
+          origin_agent_id TEXT,
+          assigned_agent_id TEXT,
+          assignment_note TEXT DEFAULT '',
+          assigned_at DATETIME,
+          transferred_from TEXT,
+          archived BOOLEAN DEFAULT 0,
+          next_due_at DATETIME,
+          last_spawned_at DATETIME,
+          last_driven_at DATETIME,
+          validation_report TEXT,
+          validated_by TEXT,
+          validation_count INTEGER DEFAULT 0,
+          FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+          FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
+          FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
+        );
+        INSERT INTO todos_new (
+          id, agent_id, project_id, parent_id, title, description, status, priority,
+          context, tags, dependencies, acceptance_criteria, criteria_confirmed,
+          max_attempts, attempt_count, attempt_log, last_heartbeat,
+          heartbeat_progress, heartbeat_step, heartbeat_blockers, position,
+          created_at, updated_at, completed_at, expected_duration_minutes,
+          schedule, is_template, origin_agent_id, assigned_agent_id,
+          assignment_note, assigned_at, transferred_from, archived,
+          next_due_at, last_spawned_at, last_driven_at,
+          validation_report, validated_by, validation_count
+        )
+        SELECT 
+          id, agent_id, project_id, parent_id, title, description, status, priority,
+          context, tags, dependencies, acceptance_criteria, criteria_confirmed,
+          max_attempts, attempt_count, attempt_log, last_heartbeat,
+          heartbeat_progress, heartbeat_step, heartbeat_blockers, position,
+          created_at, updated_at, completed_at, expected_duration_minutes,
+          schedule, is_template, origin_agent_id, assigned_agent_id,
+          assignment_note, assigned_at, transferred_from, archived,
+          next_due_at, last_spawned_at, last_driven_at,
+          validation_report, validated_by, validation_count
+        FROM todos;
+        DROP TABLE todos;
+        ALTER TABLE todos_new RENAME TO todos;
+        CREATE INDEX IF NOT EXISTS idx_todos_agent_id ON todos(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_project_id ON todos(project_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
+        CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos(priority);
+        CREATE INDEX IF NOT EXISTS idx_todos_created_at ON todos(created_at);
+        CREATE INDEX IF NOT EXISTS idx_todos_parent_id ON todos(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_template_due ON todos(is_template, next_due_at);
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+      `);
+      console.log('[DB] Migration: todos status CHECK constraint updated');
+    }
+  } catch (err) {
+    console.log('[DB] Migration: todos status CHECK constraint failed:', err.message);
+  }
 }
 
 module.exports = { getDb };

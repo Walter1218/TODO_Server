@@ -16,7 +16,8 @@
 - **心跳追踪**：实时监控任务执行进度和阻塞
 - **多智能体协作**：任务指派、转交、跨 agent 通知
 - **验收标准**：LLM 生成检查清单，用户确认后执行
-- **漂移检测**：自动发现对话偏离当前任务，主动提醒
+- **自动运维监控**：`StuckMonitor`、`DriveOrchestrator` 与 `ValidatorService` 协同工作，实现无人值守的任务修复与验收。
+- **Agent-to-Agent 自驱校验**：Worker 执行，Validator 验收，Orchestrator 编排，彻底跳出 Human-in-the-loop。
 
 ## 🚀 快速开始
 
@@ -70,24 +71,40 @@ NODE_ENV=development   # 运行环境
 }
 ```
 
-### 3. 启动
+### 3. 启动与管理 (守护进程模式)
 
+推荐使用 PM2 管理集群，支持后台运行、自动重启和日志监控：
+
+```bash
+# 一键启动所有服务 (Server + 3 Hermes Agents)
+npm run pm2:start
+
+# 查看集群状态
+npm run pm2:status
+
+# 查看实时日志
+npm run pm2:logs
+
+# 停止 / 重启集群
+npm run pm2:stop
+npm run pm2:restart
+```
+
+**传统启动方式 (仅用于调试)：**
 ```bash
 # 启动 TODO Server API
 npm start
 
-# 开发模式（热重载）
-npm run dev
-
-# 启动框架客户端（需要配置 LLM）
-npm run agent
+# 启动框架客户端 (需手动指定配置)
+node start.js --config config.hermes-coder.json
 ```
 
-**启动后验证：**
+### 4. 部署 Hermes Skill
+如果需要使用 Hermes 接入，运行以下命令同步 Skill 到本地 Hermes 目录：
 ```bash
-curl http://localhost:3000/health
-# 预期: {"status":"ok","timestamp":"...","uptime":...}
+npm run setup:hermes
 ```
+> 此命令会自动注册智能体、同步凭证并部署最新的 Python Skill。
 
 ## 📁 项目结构
 
@@ -98,18 +115,25 @@ TODO_Server/
 │   ├── db.js                     # SQLite 数据库（WAL 模式 + 自动迁移）
 │   ├── models/                   # 数据模型
 │   │   ├── Agent.js              # 智能体 CRUD + secret_key
-│   │   ├── Todo.js               # 任务 CRUD + 协作 + 调度 + 归档
+│   │   ├── Todo.js               # 任务 CRUD + 协作 + 调度 + 归档 + 校验状态
 │   │   ├── Project.js            # 项目 CRUD
 │   │   ├── FocusState.js         # 聚焦状态管理
 │   │   ├── Context.js            # 对话上下文存储
 │   │   └── Notification.js       # 跨 agent 通知
 │   ├── routes/                   # API 路由
 │   │   ├── agents.js             # 智能体注册
-│   │   ├── todos.js              # 任务 CRUD + 指派/转交/心跳/驱动
+│   │   ├── todos.js              # 任务 CRUD + 指派/转交/心跳/驱动/验收
 │   │   ├── projects.js           # 项目 + 全局看板
 │   │   ├── focus.js              # 聚焦引擎
 │   │   ├── contexts.js           # 上下文存储
 │   │   └── notifications.js      # 通知管理
+│   └── services/
+│       ├── CommandExecutor.js    # 命令提取与执行
+│       ├── DriveOrchestrator.js  # 自动化任务驱动器
+│       ├── ProgressValidator.js  # 任务进展验证器
+│       ├── ValidatorService.js   # Agent-to-Agent 自动化校验服务
+│       ├── ValidationDispatchService.js # 第三方验证任务派发服务
+│       └── TaskReportService.js  # 任务流程报告生成服务
 │   └── utils/
 │       └── driveHelper.js        # 手动驱动任务辅助（Prompt 构建）
 ├── sdk/
@@ -193,10 +217,11 @@ POST /api/agents/:id/todos/:id/heartbeat
 - 超过 30 分钟无心跳 → 自动标记为 stuck
 - 超过最大重试次数（默认 3）→ 自动标记为 `blocked`
 
-### 5. 验收标准流程
-- LLM 自动生成结构化验收清单
-- 用户显式确认后（`criteria_confirmed=true`）才能执行
-- 完成时展示检查清单，用户确认后才标记完成
+### 5. 验收标准与自驱校验
+- **验收清单**：LLM 自动生成结构化验收清单，用户确认后开始执行。
+- **自驱验收**：Worker 完成任务后调用 `proposeCompletion()`，状态转为 `pending_validation`。
+- **自动质检**：`ValidatorService` 自动读取执行上下文并进行 LLM 审计，通过则标记 `completed`，失败则打回并附带改进建议。
+- **任务流程报告**：验证完成后自动生成任务报告，包含基本信息、执行记录、验证记录和时间线，支持 JSON 和 Markdown 格式。
 
 ### 6. 漂移检测（Drift Detection）
 - LLM 语义分析对话是否偏离当前任务
@@ -242,7 +267,8 @@ GET  /api/agents/:id/contexts/summary  # 会话摘要
 ### 11. 自动运维监控
 - **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked
 - **AssignmentDriver**：指派/转交后立即 auto-focus 到目标 agent；每 60 秒兜底扫描已指派但超过 5 分钟仍为 `pending` 的任务，自动强制 focus + 通知
-- **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证；无进展自动重试 3 次（追加失败上下文）；仍无变化标记 stalled + 通知人工
+- **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证；
+- **ValidatorService**：检测到 `pending_validation` 任务时自动执行异步校验逻辑，闭环 Agent-to-Agent 协作。
 - **LLMInferencer**：每 5 分钟扫描 idle 5-15 分钟的任务，LLM 推断真实状态（completed/blocked/in_progress），置信度 ≥0.75 自动执行
 - **WorkSnapshotMonitor**：每 30 秒采集工作快照到 contexts
 - **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
@@ -280,6 +306,7 @@ GET /api/agents/:id/projects/:id/board
 | POST | `/api/agents/:id/todos/:id/drive` | 手动驱动执行 |
 | POST | `/api/agents/:id/todos/:id/spawn` | 模板实例化 |
 | POST | `/api/agents/:id/todos/:id/report` | cron job 写入执行报告 |
+| GET | `/api/agents/:id/todos/:id/report` | 获取任务流程报告 |
 | POST | `/api/agents/:id/todos/:id/sub-tasks` | 创建子任务 |
 | GET | `/api/agents/:id/todos/:id/subtasks` | 获取子任务 |
 | GET | `/api/agents/:id/todos/:id/dependency-tree` | 依赖树 |

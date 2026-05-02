@@ -51,17 +51,30 @@ function buildDrivePrompt(task, opts = {}) {
   }
 
   prompt += `\n## 回复格式要求\n`;
-  prompt += `请在回复中包含：\n`;
-  prompt += `- 当前完成的具体工作\n`;
-  prompt += `- 进度: XX%（更新后的进度）\n`;
-  prompt += `- 下一步计划\n`;
-  prompt += `- 如有阻塞请明确说明\n`;
+  prompt += `请按照以下格式回复：\n`;
+  prompt += `\n### 当前状态\n`;
+  prompt += `- 已完成: 具体做了什么\n`;
+  prompt += `- 进度: XX%\n`;
+  prompt += `- 下一步: 计划做什么\n`;
+  prompt += `\n### 执行命令\n`;
+  prompt += `如果任务需要执行命令，请在 \`\`\`bash\`\`\` 块中输出命令：\n`;
+  prompt += `\`\`\`bash\n`;
+  prompt += `# 在此处输入要执行的命令\n`;
+  prompt += `\`\`\`\n`;
+  prompt += `\n### 阻塞说明（如有）\n`;
+  prompt += `如遇到阻塞，请说明：\n`;
+  prompt += `- 阻塞原因：\n`;
+  prompt += `- 需要的帮助：\n`;
 
   if (task.acceptance_criteria) {
     prompt += `\n## 验收标准\n${task.acceptance_criteria}`;
   }
 
-  prompt += `\n\n现在请开始工作。`;
+  if (task.description) {
+    prompt += `\n## 任务描述\n${task.description}`;
+  }
+
+  prompt += `\n\n重要提示：请直接执行任务，不要等待用户确认。如果任务描述中包含明确的命令步骤，请直接执行这些命令。`;
   return prompt;
 }
 

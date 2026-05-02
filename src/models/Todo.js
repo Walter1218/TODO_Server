@@ -9,6 +9,7 @@ class Todo {
     const {
       title,
       description = '',
+      status = 'pending',
       priority = 'medium',
       context = '',
       tags = [],
@@ -21,7 +22,10 @@ class Todo {
       maxAttempts = 3,
       schedule = null,
       isTemplate = false,
-      assignedAgentId = null
+      assignedAgentId = null,
+      validationReport = '',
+      validatedBy = null,
+      validationCount = 0
     } = data;
 
     // Auto-set isTemplate=true if schedule is provided but isTemplate not explicitly set
@@ -36,19 +40,21 @@ class Todo {
 
     const stmt = db.prepare(`
       INSERT INTO todos (
-        id, agent_id, project_id, parent_id, title, description, priority,
+        id, agent_id, project_id, parent_id, title, description, status, priority,
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
-        origin_agent_id, assigned_agent_id, schedule, is_template, next_due_at
+        origin_agent_id, assigned_agent_id, schedule, is_template, next_due_at,
+        validation_report, validated_by, validation_count
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
-      id, agentId, projectId, parentId, title, description, priority,
+      id, agentId, projectId, parentId, title, description, status, priority,
       context, JSON.stringify(tags), JSON.stringify(dependencies), position,
       acceptanceCriteria, criteriaConfirmed ? 1 : 0, maxAttempts,
-      agentId, assignedAgentId, schedule, finalIsTemplate ? 1 : 0, nextDueAt
+      agentId, assignedAgentId, schedule, finalIsTemplate ? 1 : 0, nextDueAt,
+      validationReport, validatedBy, validationCount
     );
 
     return this.findById(agentId, id);
@@ -157,9 +163,14 @@ class Todo {
       heartbeatProgress,
       heartbeatStep,
       heartbeatBlockers,
+      assignedAgentId,
+      assignmentNote,
       schedule,
       isTemplate,
-      expectedDurationMinutes
+      expectedDurationMinutes,
+      validationReport,
+      validatedBy,
+      validationCount
     } = data;
 
     const updates = [];
@@ -266,9 +277,35 @@ class Todo {
       values.push(JSON.stringify(heartbeatBlockers));
     }
 
+    if (assignedAgentId !== undefined) {
+      updates.push('assigned_agent_id = ?');
+      values.push(assignedAgentId);
+      updates.push('assigned_at = CURRENT_TIMESTAMP');
+    }
+
+    if (assignmentNote !== undefined) {
+      updates.push('assignment_note = ?');
+      values.push(assignmentNote);
+    }
+
     if (expectedDurationMinutes !== undefined) {
       updates.push('expected_duration_minutes = ?');
       values.push(expectedDurationMinutes);
+    }
+
+    if (validationReport !== undefined) {
+      updates.push('validation_report = ?');
+      values.push(validationReport);
+    }
+
+    if (validatedBy !== undefined) {
+      updates.push('validated_by = ?');
+      values.push(validatedBy);
+    }
+
+    if (validationCount !== undefined) {
+      updates.push('validation_count = ?');
+      values.push(validationCount);
     }
 
     if (schedule !== undefined) {
@@ -971,15 +1008,16 @@ class Todo {
     }
 
     const newId = uuidv4();
+    const assignedAt = template.assigned_agent_id ? new Date().toISOString() : null;
     const stmt = db.prepare(`
       INSERT INTO todos (
         id, agent_id, project_id, parent_id, title, description, priority,
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
-        origin_agent_id, assigned_agent_id, schedule, is_template, status, created_at, updated_at,
+        origin_agent_id, assigned_agent_id, assigned_at, schedule, is_template, status, created_at, updated_at,
         transferred_from
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
     `);
 
     stmt.run(
@@ -987,7 +1025,7 @@ class Todo {
       template.title, template.description || '', template.priority,
       template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
       template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
-      agentId, template.assigned_agent_id || null, null, 0, 'pending',
+      agentId, template.assigned_agent_id || null, assignedAt, null, 0, 'pending',
       replacedTask ? replacedTask.id : (replacesId || null)
     );
 
