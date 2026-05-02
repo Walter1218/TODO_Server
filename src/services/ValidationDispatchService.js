@@ -13,9 +13,10 @@ class ValidationDispatchService {
     const taskTitle = task.title;
 
     // 检查是否已经存在相同的验证任务（防止重复创建）
+    // 只要不是 completed 或 cancelled，就认为验证任务还在进行中，跳过创建
     const existingValidationTask = Todo.findByTitle(this.validatorAgentId, `[验证] ${taskTitle}`);
-    if (existingValidationTask && existingValidationTask.status === 'pending') {
-      console.log(`[ValidationDispatch] 验证任务已存在，跳过创建: ${existingValidationTask.id}`);
+    if (existingValidationTask && !['completed', 'cancelled'].includes(existingValidationTask.status)) {
+      console.log(`[ValidationDispatch] 验证任务已存在 (status=${existingValidationTask.status})，跳过创建: ${existingValidationTask.id}`);
       return existingValidationTask;
     }
 

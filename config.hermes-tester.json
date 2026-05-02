@@ -1,0 +1,73 @@
+{
+  "server": {
+    "url": "http://localhost:3000"
+  },
+  "llm": {
+    "provider": "minimax",
+    "minimax": {
+      "apiKey": "local",
+      "groupId": "local",
+      "baseUrl": "http://localhost:3456",
+      "model": "MiniMax-M2.7",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+    "openai": {
+      "apiKey": "",
+      "model": "gpt-3.5-turbo",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    },
+    "anthropic": {
+      "apiKey": "",
+      "model": "claude-3-5-haiku-20241022",
+      "temperature": 0.7,
+      "maxTokens": 1024
+    },
+    "fallback": {
+      "provider": "ollama",
+      "baseUrl": "http://localhost:11434/v1",
+      "model": "Qwen3.5_9b_f16:latest",
+      "temperature": 0.7,
+      "maxTokens": 2000
+    }
+  },
+  "agent": {
+    "id": "hermes-tester",
+    "name": "hermes-tester",
+    "secretKey": "5E796FA81A7E912E7A34C5F6CE79208C"
+  },
+  "features": {
+    "taskManagement": {
+      "enabled": true,
+      "autoCreateTasks": false,
+      "autoUpdateStatus": false,
+      "priority": "high"
+    },
+    "contextManagement": {
+      "enabled": true,
+      "injectInterval": "every_turn",
+      "maxContextLength": 2000,
+      "prioritizeBy": "priority"
+    },
+    "memoryManagement": {
+      "enabled": false,
+      "memoryRetention": 7
+    },
+    "promptManagement": {
+      "enabled": true,
+      "autoEnhance": true,
+      "addChecklist": true,
+      "addProgress": true
+    },
+    "proactiveInteraction": {
+      "enabled": true,
+      "remindInterval": 5,
+      "suggestOnIdle": true
+    },
+    "dependencyManagement": {
+      "enabled": true,
+      "showBlockers": true
+    }
+  }
+}
