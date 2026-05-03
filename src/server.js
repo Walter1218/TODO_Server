@@ -305,6 +305,95 @@ app.listen(PORT, () => {
           console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 进度停滞 ${PROGRESS_STALL_MINUTES} 分钟`);
         }
 
+        // 2b. 检测验证任务连续失败并发送纠正指导
+        const FAILED_COMMAND_THRESHOLD = 3;
+        const validationTasks = db.prepare(`
+          SELECT * FROM todos
+          WHERE agent_id = ? AND status IN ('in_progress', 'validating')
+            AND title LIKE '[验证]%'
+            AND updated_at < ?
+        `).all(agent.id, new Date(Date.now() - 10 * 60 * 1000).toISOString());
+
+        for (const task of validationTasks) {
+          const lastStep = task.heartbeat_step || '';
+          if (lastStep.includes('连续') && lastStep.includes('失败')) {
+            const match = lastStep.match(/连续\s*(\d+)\s*次/);
+            if (match && parseInt(match[1]) >= FAILED_COMMAND_THRESHOLD) {
+              Context.create(agent.id, {
+                sessionId: task.id,
+                role: 'system',
+                content: `[StuckTaskMonitor] 检测到验证任务「${task.title}」连续命令失败。请检查：\n1. 确认命令是否正确（如 duckdb CLI 不存在，应使用 python3 -c "import duckdb..."）\n2. 如遇到无法解决的问题，请调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助\n3. 避免重复执行相同的失败命令，尝试替代方案`,
+                metadata: { type: 'corrective_guidance', task_id: task.id, failure_count: parseInt(match[1]) }
+              });
+              console.log(`[StuckTaskMonitor] 已向验证任务 ${task.id} 发送纠正指导`);
+            }
+          }
+        }
+
+        // 2c. 验证任务超时检测：如果验证任务长时间未完成，自动发送提醒或重新分配
+        const VALIDATION_TIMEOUT_MINUTES = 30; // 验证任务超过 30 分钟未完成视为超时
+        const validationTimeoutCutoff = new Date(Date.now() - VALIDATION_TIMEOUT_MINUTES * 60 * 1000).toISOString();
+
+        // 检测 in_progress 状态的验证任务（可能是卡在执行阶段）
+        const stuckValidationTasks = db.prepare(`
+          SELECT * FROM todos
+          WHERE agent_id = ? AND status = 'in_progress'
+            AND title LIKE '[验证]%'
+            AND updated_at < ?
+        `).all(agent.id, validationTimeoutCutoff);
+
+        for (const task of stuckValidationTasks) {
+          const idleMinutes = Math.floor((Date.now() - new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime()) / 60000);
+          const lastStep = task.heartbeat_step || '';
+
+          // 如果心跳步骤包含"LLM 响应中"且超过 15 分钟，可能是 LLM 调用卡住
+          if (lastStep.includes('LLM 响应中') && idleMinutes >= 15) {
+            Context.create(agent.id, {
+              sessionId: task.id,
+              role: 'system',
+              content: `[StuckTaskMonitor] 检测到验证任务「${task.title}」LLM 调用卡住（已 ${idleMinutes} 分钟无响应）。建议：\n1. 检查 LLM 服务是否正常\n2. 如果 LLM 无响应超过 5 分钟，可以手动重启 agent 进程\n3. 或调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
+              metadata: { type: 'validation_timeout', task_id: task.id, idle_minutes: idleMinutes, last_step: lastStep }
+            });
+            console.log(`[StuckTaskMonitor] 验证任务 ${task.id} LLM 调用卡住 ${idleMinutes} 分钟`);
+            totalStuck++;
+          }
+
+          // 如果任务开始后超过 VALIDATION_TIMEOUT_MINUTES 仍未进入 validating 状态
+          const createdAt = task.created_at ? new Date(task.created_at.replace(' ', 'T') + 'Z').getTime() : 0;
+          const ageMinutes = Math.floor((Date.now() - createdAt) / 60000);
+          if (ageMinutes >= VALIDATION_TIMEOUT_MINUTES && !lastStep.includes('LLM 响应中')) {
+            // 非 LLM 卡住情况，可能是执行卡住
+            Context.create(agent.id, {
+              sessionId: task.id,
+              role: 'system',
+              content: `[StuckTaskMonitor] 检测到验证任务「${task.title}」执行卡住（已运行 ${ageMinutes} 分钟，当前步骤: ${lastStep}）。建议：\n1. 检查任务是否在执行死循环\n2. 检查命令执行是否有阻塞\n3. 如无法解决，调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
+              metadata: { type: 'validation_stuck', task_id: task.id, age_minutes: ageMinutes, last_step: lastStep }
+            });
+            console.log(`[StuckTaskMonitor] 验证任务 ${task.id} 执行卡住 ${ageMinutes} 分钟`);
+            totalStuck++;
+          }
+        }
+
+        // 检测 validating 状态的验证任务（正在验证中但超时的）
+        const staleValidatingTasks = db.prepare(`
+          SELECT * FROM todos
+          WHERE agent_id = ? AND status = 'validating'
+            AND title LIKE '[验证]%'
+            AND updated_at < ?
+        `).all(agent.id, validationTimeoutCutoff);
+
+        for (const task of staleValidatingTasks) {
+          const idleMinutes = Math.floor((Date.now() - new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime()) / 60000);
+          Context.create(agent.id, {
+            sessionId: task.id,
+            role: 'system',
+            content: `[StuckTaskMonitor] 检测到验证任务「${task.title}」验证阶段超时（已 ${idleMinutes} 分钟无更新）。建议：\n1. 检查 hermes-tester 是否正常处理验证任务\n2. 验证报告提交可能失败，可以手动提交\n3. 调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
+            metadata: { type: 'validation_validating_timeout', task_id: task.id, idle_minutes: idleMinutes }
+          });
+          console.log(`[StuckTaskMonitor] 验证任务 ${task.id} 验证阶段超时 ${idleMinutes} 分钟`);
+          totalStuck++;
+        }
+
         // 3. Fix 4: 自动重置长时间 blocked 任务的尝试次数（防止全部卡死）
         const BLOCKED_RESET_HOURS = 2; // blocked 超过 2 小时且尝试次数用尽，自动重置
         const blockedResetCutoff = new Date(Date.now() - BLOCKED_RESET_HOURS * 60 * 60 * 1000).toISOString();

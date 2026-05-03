@@ -55,7 +55,7 @@ class DriveOrchestrator {
 
   shouldDrive(task) {
     if (!task) return false;
-    const drivable = ['pending', 'in_progress', 'validation_failed'].includes(task.status);
+    const drivable = ['pending', 'in_progress', 'validation_failed', 'validating'].includes(task.status);
     if (!drivable) return false;
     if (this.drivingTasks.has(task.id)) return false;
     if (task.is_template) return false;
@@ -264,6 +264,10 @@ class DriveOrchestrator {
           AND is_template = 0
           AND archived = 0
           AND updated_at <= ?
+          AND (
+            title NOT LIKE '[验证]%'
+            OR context NOT LIKE '%"type":"third_party_validation"%'
+          )
         ORDER BY updated_at ASC
         LIMIT ?
       `).all(validateCutoff, limit);

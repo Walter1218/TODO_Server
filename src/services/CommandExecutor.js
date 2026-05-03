@@ -29,8 +29,12 @@ const VALID_COMMAND_PREFIXES = [
 const INVALID_PREFIXES = [
   '📋', '📊', '🔍', '✅', '❌', '⚠️', '💡', '---', '##', '# ', '- ', '* ',
   '[', ']', '{', '}', '|', '>', '<', '=', ':', ';', '，', '。', '！', '？',
-  '验证：', '检查：', '执行：', '确认：', '注意：', '建议：', '分析：', '问题：',
-  '当前：', '状态：', '进度：', '步骤：', '说明：', '提示：', '警告：', '错误：'
+  '验证：', '验证:', '验证::', '检查：', '检查:', '检查::', '执行：', '执行:', '执行::',
+  '确认：', '确认:', '确认::', '注意：', '注意:', '注意::', '建议：', '建议:', '建议::',
+  '分析：', '分析:', '分析::', '问题：', '问题:', '问题::', '当前：', '当前:', '当前::',
+  '状态：', '状态:', '状态::', '进度：', '进度:', '进度::', '步骤：', '步骤:', '步骤::',
+  '说明：', '说明:', '说明::', '提示：', '提示:', '提示::', '警告：', '警告:', '警告::',
+  '错误：', '错误:', '错误::'
 ];
 
 class CommandExecutor {
@@ -43,11 +47,40 @@ class CommandExecutor {
       const content = match[1].trim();
       if (content) {
         const lines = content.split('\n').filter(line => line.trim() && !line.trim().startsWith('#'));
+        let currentCommand = null;
+        let currentLineIndex = -1;
         lines.forEach((line, idx) => {
-          if (line.trim()) {
-            blocks.push({ index: blocks.length, command: line.trim(), source: 'block', blockIndex: match.index, lineIndex: idx });
+          const cmd = line.trim();
+          if (cmd) {
+            const hasInvalidPrefix = INVALID_PREFIXES.some(prefix => cmd.startsWith(prefix));
+            if (hasInvalidPrefix) return;
+            
+            const hasValidPrefix = VALID_COMMAND_PREFIXES.some(prefix => cmd.startsWith(prefix) || cmd.startsWith('./') || cmd.startsWith('/'));
+            
+            if (hasValidPrefix) {
+              if (currentCommand !== null) {
+                blocks.push({ index: blocks.length, command: currentCommand, source: 'block', blockIndex: match.index, lineIndex: currentLineIndex });
+              }
+              currentCommand = cmd;
+              currentLineIndex = idx;
+            } else if (currentCommand !== null) {
+              if (cmd.startsWith('-') || cmd.startsWith('"') || cmd.startsWith("'")) {
+                if (currentCommand.endsWith('\\')) {
+                  currentCommand = currentCommand.slice(0, -1) + ' ' + cmd;
+                } else if (currentCommand.match(/\s$/) || cmd.startsWith('"') || cmd.startsWith("'")) {
+                  currentCommand += ' ' + cmd;
+                } else {
+                  currentCommand += ' ' + cmd;
+                }
+              } else {
+                currentCommand += '\n' + cmd;
+              }
+            }
           }
         });
+        if (currentCommand !== null) {
+          blocks.push({ index: blocks.length, command: currentCommand, source: 'block', blockIndex: match.index, lineIndex: currentLineIndex });
+        }
       }
     }
     return blocks;

@@ -5,6 +5,7 @@
  */
 
 const { AgentTaskFramework } = require('./framework');
+const AgentWorker = require('./agent-worker');
 
 async function main() {
   console.log('🚀 Agent TODO Framework 启动器\n');
@@ -45,8 +46,8 @@ async function main() {
     console.log('\n' + '='.repeat(50));
     console.log('✅ 智能体启动成功！\n');
 
-    // 返回框架实例供外部使用
-    return framework;
+    // 返回框架实例和配置路径供外部使用
+    return { framework, configPath };
   } catch (error) {
     console.error('\n❌ 启动失败:', error.message);
     console.error('\n请检查：');
@@ -93,8 +94,8 @@ async function chatLoop(framework) {
 // 运行
 if (require.main === module) {
   (async () => {
-    const framework = await main();
-    
+    const { framework, configPath } = await main();
+
     // 如果提供了命令行参数 --chat，则进入对话模式
     if (process.argv.includes('--chat')) {
       chatLoop(framework);
@@ -106,16 +107,26 @@ if (require.main === module) {
       console.log('   - --once 启动后退出');
       console.log('   - --smoke-test 启动后执行一次测试对话\n');
 
-      const keepAlive = setInterval(() => {}, 60 * 60 * 1000);
-      keepAlive.unref?.();
+      const config = framework.config.base || {};
+      const agentId = config.agentId;
 
-      const shutdown = () => {
-        clearInterval(keepAlive);
-        process.exit(0);
-      };
+      if (agentId) {
+        console.log(`🤖 启动 Agent Worker: ${agentId}`);
+        const worker = new AgentWorker(agentId, configPath);
+        await worker.start();
+      } else {
+        console.log('⚠️ 未指定 agentId，跳过 Agent Worker 启动');
+        const keepAlive = setInterval(() => {}, 60 * 60 * 1000);
+        keepAlive.unref?.();
 
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
+        const shutdown = () => {
+          clearInterval(keepAlive);
+          process.exit(0);
+        };
+
+        process.on('SIGINT', shutdown);
+        process.on('SIGTERM', shutdown);
+      }
     }
   })();
 }

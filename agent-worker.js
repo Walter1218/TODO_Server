@@ -17,7 +17,7 @@ const WORK_PROMPT_INTERVAL_MS = 5 * 60 * 1000; // 主动工作触发间隔：5�
 const ACTIVITY_LOG_LIMIT = 200; // 最多保留 200 条活动记录
 
 class AgentWorker {
-  constructor(agentId = null) {
+  constructor(agentId = null, configPath = null) {
     this.framework = null;
     this.heartbeatTimer = null;
     this.workTimer = null;
@@ -29,14 +29,15 @@ class AgentWorker {
     this.workLoopBusy = false;     // 防止 _workLoop 并发执行
     this.consecutiveCmdFailures = 0; // 当前任务连续命令失败次数
     this.agentId = agentId;        // 指定的 agent ID
+    this.configPath = configPath;  // 指定的配置文件路径
   }
 
   async start() {
     console.log('🚀 Agent Worker 启动中...');
 
-    // 1. 初始化框架（支持指定 agentId）
+    // 1. 初始化框架（支持指定 agentId 和配置文件路径）
     const configOverride = this.agentId ? { base: { agentId: this.agentId } } : {};
-    this.framework = AgentTaskFramework.fromConfig(null, configOverride);
+    this.framework = AgentTaskFramework.fromConfig(this.configPath, configOverride);
     await this.framework.initialize();
     
     // 显示使用的 agent ID
@@ -72,11 +73,55 @@ class AgentWorker {
   }
 
   /**
+   * 记录 focus 切换日志
+   */
+  _logFocusSwitch(reason, fromTask, toTask) {
+    const timestamp = new Date().toISOString();
+    const logPrefix = `[FocusSwitch][${reason}]`;
+
+    if (fromTask) {
+      console.log(`${logPrefix} 切换 | 来源: ${fromTask.id} (${fromTask.status}) "${fromTask.title}" | 目标: ${toTask.id} "${toTask.title}"`);
+    } else {
+      console.log(`${logPrefix} 切换 | 来源: null | 目标: ${toTask.id} "${toTask.title}"`);
+    }
+
+    try {
+      const db = getDb();
+      const sessionId = `worker_${this.framework.config.base.agentId}`;
+      const id = require('uuid').v4();
+      db.prepare(`
+        INSERT INTO contexts (id, agent_id, session_id, role, content, metadata)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(
+        id,
+        this.framework.config.base.agentId,
+        sessionId,
+        'system',
+        `[FocusSwitch] focus 切换 | 原因: ${reason} | ${fromTask ? `从 "${fromTask.title}" (${fromTask.status})` : '无来源任务'} → "${toTask.title}" (${toTask.status})`,
+        JSON.stringify({
+          type: 'focus_switch',
+          reason,
+          fromTaskId: fromTask?.id,
+          fromTaskStatus: fromTask?.status,
+          fromTaskTitle: fromTask?.title,
+          toTaskId: toTask.id,
+          toTaskStatus: toTask.status,
+          toTaskTitle: toTask.title,
+          timestamp
+        })
+      );
+    } catch (err) {
+      console.warn('[FocusSwitch] 记录上下文失败:', err.message);
+    }
+  }
+
+  /**
    * 检查 focus 任务并自动启动/恢复
    */
   async _checkAndStartFocusTask() {
     try {
       const focusTask = await this.framework.getCurrentFocusTask();
+      const previousTaskId = this.currentTaskId;
       console.log(`[_checkFocus] focusTask=${focusTask ? 'OK' : 'NULL'} | status=${focusTask?.status} | id=${focusTask?.id}`);
       if (!focusTask) {
         console.log('📭 当前无聚焦任务，等待中...');
@@ -86,7 +131,9 @@ class AgentWorker {
 
       // 如果 focus 任务是 pending，自动启动它
       if (focusTask.status === 'pending') {
+        const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
         console.log(`▶️ 自动启动任务: ${focusTask.title}`);
+        this._logFocusSwitch('task_start', prevTask?.data || prevTask, focusTask);
         await this.framework._autoStartTask(focusTask);
         this.currentTaskId = focusTask.id;
         this.lastWorkTime = Date.now();
@@ -100,7 +147,9 @@ class AgentWorker {
         const attempts = focusTask.attempt_count || 0;
         const maxAttempts = focusTask.max_attempts || 3;
         if (attempts < maxAttempts) {
+          const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
           console.log(`🔄 自动恢复 blocked 任务: ${focusTask.title} (${attempts}/${maxAttempts} → ${attempts+1}/${maxAttempts})`);
+          this._logFocusSwitch('task_recover', prevTask?.data || prevTask, focusTask);
           await this._recoverBlockedTask(focusTask);
           this.currentTaskId = focusTask.id;
           this.lastWorkTime = Date.now();
@@ -114,13 +163,32 @@ class AgentWorker {
         }
       }
 
-      // 如果 focus 任务是 in_progress，更新当前跟踪
-      if (focusTask.status === 'in_progress') {
+      // 如果 focus 任务是 in_progress 或 validating，更新当前跟踪
+      if (['in_progress', 'validating'].includes(focusTask.status)) {
         if (this.currentTaskId !== focusTask.id) {
+          const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
           console.log(`📋 当前聚焦任务: ${focusTask.title} (ID: ${focusTask.id})`);
+          this._logFocusSwitch('focus_update', prevTask?.data || prevTask, focusTask);
           this.currentTaskId = focusTask.id;
-          this.lastWorkTime = Date.now();
         }
+        this.lastWorkTime = Date.now();  // 总是更新时间，避免长时间不工作
+      }
+      
+      // 如果 focus 任务已完成，尝试切换到下一个任务
+      if (focusTask.status === 'completed') {
+        console.log(`✅ 当前 focus 任务已完成: ${focusTask.title}，尝试切换到下一个任务`);
+        this._logFocusSwitch('task_completed', focusTask, { id: 'next_task', title: '待定', status: 'pending' });
+        await this._trySwitchFocus();
+        return;
+      }
+
+      // 如果 focus 任务已取消，尝试切换到下一个任务
+      if (focusTask.status === 'cancelled') {
+        console.log(`❌ 当前 focus 任务已取消: ${focusTask.title}，尝试切换到下一个任务`);
+        this._logFocusSwitch('task_cancelled', focusTask, { id: 'next_task', title: '待定', status: 'pending' });
+        this.currentTaskId = null;
+        await this._trySwitchFocus();
+        return;
       }
     } catch (err) {
       console.error('❌ Focus 检查失败:', err.message);
@@ -172,8 +240,10 @@ class AgentWorker {
     try {
       const readyTasks = await this.framework.modules.taskManager.getReadyTasks();
       if (readyTasks && readyTasks.length > 0) {
+        const prevTask = this.currentTaskId ? await this.framework.modules.taskManager.todo.getTodo(this.currentTaskId).catch(() => null) : null;
         const nextTask = readyTasks[0];
         console.log(`🔄 切换到下一个可执行任务: ${nextTask.title}`);
+        this._logFocusSwitch('auto_switch', prevTask?.data || prevTask, nextTask);
         // 通过 focus API 设置新 focus
         await this.framework.modules.taskManager.todo.updateTodo(nextTask.id, {
           status: 'in_progress'
@@ -209,7 +279,7 @@ class AgentWorker {
       // 获取最新任务状态
       const taskResult = await this.framework.modules.taskManager.todo.getTodo(this.currentTaskId);
       const task = taskResult.data || taskResult;
-      if (!task || task.status !== 'in_progress') {
+      if (!task || !['in_progress', 'validating'].includes(task.status)) {
         this.currentTaskId = null;
         return;
       }
@@ -302,7 +372,7 @@ class AgentWorker {
         return;
       }
 
-      if (task.status !== 'in_progress') {
+      if (!['in_progress', 'validating'].includes(task.status)) {
         console.log(`[_workLoop] 任务状态 ${task.status}，尝试重新获取 focus`);
         this.currentTaskId = null;
         return;

@@ -1323,6 +1323,33 @@ router.post('/:id/validation-report', async (req, res) => {
       metadata: { type: 'third_party_validation_report', task_id: id, validator: validatorAgentId, pass, score }
     });
 
+    // 查找并更新验证任务（validatorAgentId 的验证任务，验证当前任务）
+    const db = require('../db').getDb();
+    const allValidationTasks = db.prepare(`
+      SELECT * FROM todos
+      WHERE agent_id = ?
+        AND title LIKE '[验证]%'
+        AND status = 'validating'
+    `).all(validatorAgentId);
+    
+    // 精确匹配 originalTaskId
+    const validationTasks = allValidationTasks.filter(vt => {
+      try {
+        const vtCtx = JSON.parse(vt.context || '{}');
+        return vtCtx.originalTaskId === id;
+      } catch (e) {
+        return false;
+      }
+    });
+    
+    for (const vt of validationTasks) {
+      Todo.update(validatorAgentId, vt.id, {
+        status: 'completed',
+        heartbeatStep: pass ? '✅ 验证任务已完成' : `❌ 验证任务已完成（未通过）`
+      });
+      console.log(`[ThirdPartyValidation] 验证任务 ${vt.id} 已更新为 completed`);
+    }
+
     if (pass) {
       Todo.checkAndCompleteParent(agentId, id);
 
@@ -1366,6 +1393,122 @@ router.get('/:id/report', async (req, res) => {
     }
   } catch (error) {
     console.error('Error generating task report:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+router.get('/:id/context', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+
+    const task = Todo.findById(agentId, id);
+    if (!task) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const contexts = Context.findBySession(agentId, id);
+    const notifications = Notification.findByTask(agentId, id);
+
+    let parentContext = null;
+    if (task.context) {
+      try {
+        parentContext = JSON.parse(task.context);
+      } catch (e) {
+        parentContext = { raw: task.context };
+      }
+    }
+
+    res.json({
+      success: true,
+      data: {
+        task: {
+          id: task.id,
+          title: task.title,
+          description: task.description,
+          status: task.status,
+          priority: task.priority,
+          tags: (() => {
+            try {
+              return task.tags ? JSON.parse(task.tags) : [];
+            } catch (e) {
+              return [];
+            }
+          })(),
+          acceptance_criteria: task.acceptance_criteria,
+          context: parentContext
+        },
+        history: contexts.map(c => ({
+          role: c.role,
+          content: c.content,
+          timestamp: c.created_at,
+          sessionId: c.session_id,
+          metadata: (() => {
+            try {
+              return c.metadata ? JSON.parse(c.metadata) : null;
+            } catch (e) {
+              return null;
+            }
+          })()
+        })),
+        notifications: notifications.map(n => ({
+          type: n.type,
+          message: n.message,
+          timestamp: n.created_at,
+          read: n.read_at !== null
+        }))
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching task context:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+router.post('/:id/request-help', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { issue, whatTried, urgency } = req.body;
+
+    if (!issue) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'Missing required field: issue'
+      });
+    }
+
+    const task = Todo.findById(agentId, id);
+    if (!task) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    Context.create(agentId, {
+      sessionId: id,
+      role: 'system',
+      content: `[RequestHelp] 智能体请求帮助\n问题：${issue}\n已尝试方法：${whatTried || '无'}\n紧迫程度：${urgency || 'normal'}`,
+      metadata: JSON.stringify({
+        type: 'help_request',
+        task_id: id,
+        urgency: urgency || 'normal',
+        what_tried: whatTried
+      })
+    });
+
+    Notification.create(agentId, id, 'comment',
+      `🆘 请求帮助：${issue.slice(0, 50)}...`
+    );
+
+    res.json({
+      success: true,
+      message: 'Help request submitted. A human operator will review and respond.',
+      data: {
+        taskId: id,
+        issue,
+        whatTried,
+        submittedAt: new Date().toISOString()
+      }
+    });
+  } catch (error) {
+    console.error('Error processing help request:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });

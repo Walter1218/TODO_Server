@@ -37,6 +37,17 @@ class Notification {
     return stmt.all(...params);
   }
 
+  static findByTask(agentId, taskId, limit = 50) {
+    const db = getDb();
+    const stmt = db.prepare(`
+      SELECT * FROM task_notifications 
+      WHERE agent_id = ? AND task_id = ?
+      ORDER BY created_at DESC 
+      LIMIT ?
+    `);
+    return stmt.all(agentId, taskId, limit);
+  }
+
   static markAsRead(id) {
     const db = getDb();
     const stmt = db.prepare('UPDATE task_notifications SET read = true WHERE id = ?');
