@@ -10,6 +10,7 @@
 const { AgentTaskFramework } = require('./framework');
 const { getDb } = require('./src/db');
 const CommandExecutor = require('./src/services/CommandExecutor');
+const { getTaskTypeLabel, isValidationTask, getTaskBehavior } = require('./src/utils/TaskType');
 
 const WORK_INTERVAL_MS = 30 * 1000;      // 工作轮询间隔：30秒
 const HEARTBEAT_INTERVAL_MS = 60 * 1000;  // 心跳间隔：1分钟
@@ -167,7 +168,8 @@ class AgentWorker {
       if (['in_progress', 'validating'].includes(focusTask.status)) {
         if (this.currentTaskId !== focusTask.id) {
           const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
-          console.log(`📋 当前聚焦任务: ${focusTask.title} (ID: ${focusTask.id})`);
+          const taskTypeLabel = getTaskTypeLabel(focusTask);
+          console.log(`📋 当前聚焦任务: [${taskTypeLabel}] ${focusTask.title} (ID: ${focusTask.id})`);
           this._logFocusSwitch('focus_update', prevTask?.data || prevTask, focusTask);
           this.currentTaskId = focusTask.id;
         }
@@ -388,7 +390,8 @@ class AgentWorker {
                              (task.heartbeat_step || '').includes('Worker');
 
       if (timeSinceLastWork > WORK_PROMPT_INTERVAL_MS || isWaitingState) {
-        console.log(`🤖 触发智能体工作 | 任务: ${task.title.substring(0, 40)}...`);
+        const taskTypeLabel = getTaskTypeLabel(task);
+        console.log(`🤖 触发智能体工作 | [${taskTypeLabel}] ${task.title.substring(0, 40)}...`);
         this.lastWorkTime = now;
 
         // Fix: 在调用 LLM 前只刷新 last_heartbeat，不覆盖 Hermes 的状态

@@ -9,6 +9,7 @@ const ProgressValidator = require('./ProgressValidator');
 const ValidatorService = require('./ValidatorService');
 const ValidationDispatchService = require('./ValidationDispatchService');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
+const { isValidationTask, shouldTriggerValidation, getTaskTypeLabel } = require('../utils/TaskType');
 
 const DEFAULTS = {
   intervalMs: 60 * 1000,
@@ -191,28 +192,27 @@ class DriveOrchestrator {
       if (changed) {
         const refreshedForValidation = Todo.findById(agentId, task_.id);
         if (refreshedForValidation.heartbeat_progress >= 100) {
-          const isValidationTask = refreshedForValidation.title && refreshedForValidation.title.startsWith('[验证]');
-          const isThirdPartyValidation = refreshedForValidation.context && refreshedForValidation.context.includes('"type":"third_party_validation"');
-
-          if (isValidationTask || isThirdPartyValidation) {
+          if (isValidationTask(refreshedForValidation)) {
             await Context.create(agentId, {
               sessionId: 'drive-orchestrator',
               role: 'system',
-              content: `[DriveOrchestrator] 验证任务进度达到 100%，直接标记为完成`,
+              content: `[DriveOrchestrator] ${getTaskTypeLabel(refreshedForValidation)}进度达到 100%，直接标记为完成`,
               metadata: { type: 'validation_task_complete', task_id: task_.id },
             });
             Todo.update(agentId, task_.id, { status: 'completed', heartbeatStep: '✅ 验证任务已完成' });
             return { success: true, validationTriggered: false, attempts: attempt + 1 };
           }
 
-          await Context.create(agentId, {
-            sessionId: 'drive-orchestrator',
-            role: 'system',
-            content: `[DriveOrchestrator] 任务进度达到 100%，自动触发验证流程`,
-            metadata: { type: 'auto_validation_trigger', task_id: task_.id },
-          });
-          Todo.update(agentId, task_.id, { status: 'pending_validation' });
-          return { success: true, validationTriggered: true, attempts: attempt + 1 };
+          if (shouldTriggerValidation(refreshedForValidation)) {
+            await Context.create(agentId, {
+              sessionId: 'drive-orchestrator',
+              role: 'system',
+              content: `[DriveOrchestrator] 任务进度达到 100%，自动触发验证流程`,
+              metadata: { type: 'auto_validation_trigger', task_id: task_.id },
+            });
+            Todo.update(agentId, task_.id, { status: 'pending_validation' });
+            return { success: true, validationTriggered: true, attempts: attempt + 1 };
+          }
         }
         return { success: true, attempts: attempt + 1, reply, commands: execResults, changed };
       }

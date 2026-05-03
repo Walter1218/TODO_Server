@@ -2,6 +2,7 @@ const Todo = require('../models/Todo');
 const Context = require('../models/Context');
 const Notification = require('../models/Notification');
 const FocusState = require('../models/FocusState');
+const { isValidationTask, getTaskTypeLabel } = require('../utils/TaskType');
 
 class ValidationDispatchService {
   constructor() {
@@ -10,23 +11,11 @@ class ValidationDispatchService {
 
   async dispatchValidationTask(executorAgentId, task, originalExecutionLogs) {
     const taskId = task.id;
-    const taskTitle = task.title.replace(/^\[验证\]\s*/, ''); // 去掉已有的 [验证] 前缀
+    const taskTitle = task.title.replace(/^\[验证\]\s*/, '');
     
-    // 检查原始任务是否本身就是验证任务，如果是，跳过
-    if (task.title && task.title.startsWith('[验证]')) {
-      console.log(`[ValidationDispatch] 原始任务已是验证任务，跳过: ${taskId} - ${taskTitle}`);
+    if (isValidationTask(task)) {
+      console.log(`[ValidationDispatch] 原始任务已是${getTaskTypeLabel(task)}，跳过: ${taskId} - ${taskTitle}`);
       return null;
-    }
-    
-    // 检查 context 中是否已有 third_party_validation type
-    try {
-      const taskContext = JSON.parse(task.context || '{}');
-      if (taskContext.type === 'third_party_validation') {
-        console.log(`[ValidationDispatch] 原始任务 context.type 已是 third_party_validation，跳过: ${taskId}`);
-        return null;
-      }
-    } catch (e) {
-      // context 不是 JSON，忽略
     }
 
     // 检查是否已经存在相同的验证任务（防止重复创建）
