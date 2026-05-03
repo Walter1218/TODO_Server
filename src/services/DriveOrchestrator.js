@@ -191,6 +191,20 @@ class DriveOrchestrator {
       if (changed) {
         const refreshedForValidation = Todo.findById(agentId, task_.id);
         if (refreshedForValidation.heartbeat_progress >= 100) {
+          const isValidationTask = refreshedForValidation.title && refreshedForValidation.title.startsWith('[验证]');
+          const isThirdPartyValidation = refreshedForValidation.context && refreshedForValidation.context.includes('"type":"third_party_validation"');
+
+          if (isValidationTask || isThirdPartyValidation) {
+            await Context.create(agentId, {
+              sessionId: 'drive-orchestrator',
+              role: 'system',
+              content: `[DriveOrchestrator] 验证任务进度达到 100%，直接标记为完成`,
+              metadata: { type: 'validation_task_complete', task_id: task_.id },
+            });
+            Todo.update(agentId, task_.id, { status: 'completed', heartbeatStep: '✅ 验证任务已完成' });
+            return { success: true, validationTriggered: false, attempts: attempt + 1 };
+          }
+
           await Context.create(agentId, {
             sessionId: 'drive-orchestrator',
             role: 'system',
