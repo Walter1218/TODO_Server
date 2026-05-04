@@ -236,33 +236,44 @@ function initializeSchema() {
   // Migration: update status CHECK constraint to include 'blocked'
   // SQLite doesn't support ALTER CHECK, but we can validate in application layer
 
-  // Migration: expand task_notifications type CHECK constraint to include 'recovered', 'blocked', 'stalled'
+  const ALL_NOTIFICATION_TYPES = [
+    'assigned', 'completed', 'transferred', 'comment',
+    'recovered', 'blocked', 'stalled',
+    'validation_exhausted', 'validation_timeout', 'max_attempts',
+  ];
+
+  function rebuildNotificationsTable(types) {
+    const checkExpr = types.map(t => `'${t}'`).join(', ');
+    db.exec(`
+      PRAGMA foreign_keys=OFF;
+      BEGIN TRANSACTION;
+      CREATE TABLE task_notifications_new (
+        id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        type TEXT CHECK(type IN (${checkExpr})),
+        message TEXT NOT NULL,
+        read BOOLEAN DEFAULT false,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+        FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
+      );
+      INSERT INTO task_notifications_new SELECT * FROM task_notifications;
+      DROP TABLE task_notifications;
+      ALTER TABLE task_notifications_new RENAME TO task_notifications;
+      CREATE INDEX IF NOT EXISTS idx_notifications_agent ON task_notifications(agent_id, read);
+      CREATE INDEX IF NOT EXISTS idx_notifications_task ON task_notifications(task_id);
+      COMMIT;
+      PRAGMA foreign_keys=ON;
+    `);
+  }
+
   try {
     const tblInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='task_notifications'").get();
-    if (tblInfo && tblInfo.sql && !tblInfo.sql.includes('stalled')) {
-      db.exec(`
-        PRAGMA foreign_keys=OFF;
-        BEGIN TRANSACTION;
-        CREATE TABLE task_notifications_new (
-          id TEXT PRIMARY KEY,
-          agent_id TEXT NOT NULL,
-          task_id TEXT NOT NULL,
-          type TEXT CHECK(type IN ('assigned', 'completed', 'transferred', 'comment', 'recovered', 'blocked', 'stalled')),
-          message TEXT NOT NULL,
-          read BOOLEAN DEFAULT false,
-          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-          FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
-          FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
-        );
-        INSERT INTO task_notifications_new SELECT * FROM task_notifications;
-        DROP TABLE task_notifications;
-        ALTER TABLE task_notifications_new RENAME TO task_notifications;
-        CREATE INDEX IF NOT EXISTS idx_notifications_agent ON task_notifications(agent_id, read);
-        CREATE INDEX IF NOT EXISTS idx_notifications_task ON task_notifications(task_id);
-        COMMIT;
-        PRAGMA foreign_keys=ON;
-      `);
-      console.log('[DB] Migration: task_notifications CHECK constraint updated');
+    const needsUpdate = tblInfo && tblInfo.sql && !tblInfo.sql.includes('max_attempts');
+    if (needsUpdate) {
+      rebuildNotificationsTable(ALL_NOTIFICATION_TYPES);
+      console.log('[DB] Migration: task_notifications CHECK constraint updated (added validation_exhausted, validation_timeout, max_attempts)');
     }
   } catch (err) {
     console.log('[DB] Migration: task_notifications CHECK constraint skipped:', err.message);
