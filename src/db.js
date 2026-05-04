@@ -401,6 +401,15 @@ function initializeSchema() {
   } catch (err) {
     console.log('[DB] Migration: todos status CHECK constraint failed:', err.message);
   }
+
+  try {
+    db.prepare(`ALTER TABLE agents ADD COLUMN max_concurrent_tasks INTEGER DEFAULT 5`).run();
+    console.log('[DB] Migration: agents.max_concurrent_tasks added (default 5)');
+  } catch (e) {}
+
+  try {
+    db.prepare(`UPDATE agents SET max_concurrent_tasks = 5 WHERE max_concurrent_tasks IS NULL`).run();
+  } catch (e) {}
 }
 
 module.exports = { getDb };

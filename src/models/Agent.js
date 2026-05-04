@@ -54,7 +54,7 @@ class Agent {
 
   static update(id, data) {
     const db = getDb();
-    const { name, metadata } = data;
+    const { name, metadata, maxConcurrentTasks } = data;
 
     const updates = [];
     const values = [];
@@ -67,6 +67,11 @@ class Agent {
     if (metadata !== undefined) {
       updates.push('metadata = ?');
       values.push(JSON.stringify(metadata));
+    }
+
+    if (maxConcurrentTasks !== undefined) {
+      updates.push('max_concurrent_tasks = ?');
+      values.push(maxConcurrentTasks);
     }
 
     if (updates.length === 0) {
@@ -97,6 +102,29 @@ class Agent {
     const db = getDb();
     const stmt = db.prepare('SELECT 1 FROM agents WHERE id = ?');
     return stmt.get(id) !== undefined;
+  }
+
+  static getMaxConcurrent(agentId) {
+    const db = getDb();
+    const row = db.prepare('SELECT max_concurrent_tasks FROM agents WHERE id = ?').get(agentId);
+    return row ? (row.max_concurrent_tasks || 5) : 5;
+  }
+
+  static getActiveTaskCount(agentId) {
+    const db = getDb();
+    const row = db.prepare(`
+      SELECT COUNT(*) as cnt FROM todos
+      WHERE agent_id = ? AND status IN ('in_progress', 'validating', 'pending_validation')
+        AND (is_template = 0 OR is_template IS NULL)
+        AND (archived = 0 OR archived IS NULL)
+    `).get(agentId);
+    return row ? row.cnt : 0;
+  }
+
+  static canAcceptNewTask(agentId) {
+    const active = this.getActiveTaskCount(agentId);
+    const max = this.getMaxConcurrent(agentId);
+    return { active, max, canAccept: active < max };
   }
 }
 

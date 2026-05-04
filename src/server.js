@@ -302,7 +302,12 @@ app.listen(PORT, () => {
             AND (validation_count IS NULL OR validation_count < 3)
             AND (last_heartbeat IS NULL OR last_heartbeat < ?)
         `).all(agent.id, new Date(Date.now() - STUCK_MAX_IDLE_MINUTES * 60 * 1000).toISOString());
+        const agentConcurrency = Agent.canAcceptNewTask(agent.id);
         for (const task of blockedStuck) {
+          if (!agentConcurrency.canAccept) {
+            console.log(`[StuckTaskMonitor] Agent ${agent.id} 已达并发上限(${agentConcurrency.active}/${agentConcurrency.max})，跳过恢复「${task.title}」`);
+            break;
+          }
           // 冷却期检查：2 分钟内已更新过的任务跳过（防止和 Worker 竞态恢复）
           const lastUpdate = task.updated_at ? new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
           if (Date.now() - lastUpdate < 2 * 60 * 1000) {
@@ -323,6 +328,7 @@ app.listen(PORT, () => {
             heartbeatStep: 'StuckTaskMonitor 自动恢复中（从 blocked 状态恢复），等待智能体重连...',
             lastHeartbeat: new Date().toISOString()
           });
+          agentConcurrency.active++;
 
           // 用 contexts 记录恢复事件
           Context.create(agent.id, {
@@ -780,6 +786,7 @@ app.listen(PORT, () => {
       for (const agent of agents) {
         const focus = FocusState.getFocusContext(agent.id);
         const inProgressTasks = Todo.findAllByAgent(agent.id, { status: 'in_progress' });
+        const maxConcurrent = agent.max_concurrent_tasks || 5;
 
         const snapshot = {
         agent_id: agent.id,
@@ -797,6 +804,7 @@ app.listen(PORT, () => {
           attempt_count: focus.current_task.attempt_count || 0
         } : null,
         in_progress_count: inProgressTasks.length,
+        max_concurrent: maxConcurrent,
         in_progress_tasks: inProgressTasks.map(t => ({
           id: t.id,
           title: t.title,

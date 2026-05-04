@@ -435,6 +435,13 @@ class DriveOrchestrator {
       const task = Todo.findById(agent.id, focus.current_task_id);
       if (!this.shouldDrive(task)) continue;
 
+      if (task.status === 'pending') {
+        const concurrency = Agent.canAcceptNewTask(agent.id);
+        if (!concurrency.canAccept) {
+          continue;
+        }
+      }
+
       this.drivingTasks.add(task.id);
       concurrent++;
       try {

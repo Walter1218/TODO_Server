@@ -76,7 +76,7 @@ router.get('/:id', (req, res) => {
 router.put('/:id', (req, res) => {
   try {
     const { id } = req.params;
-    const { name, metadata } = req.body;
+    const { name, metadata, maxConcurrentTasks } = req.body;
 
     if (!Agent.exists(id)) {
       return res.status(404).json({
@@ -85,7 +85,14 @@ router.put('/:id', (req, res) => {
       });
     }
 
-    const agent = Agent.update(id, { name, metadata });
+    if (maxConcurrentTasks !== undefined && (typeof maxConcurrentTasks !== 'number' || maxConcurrentTasks < 1 || maxConcurrentTasks > 20)) {
+      return res.status(400).json({
+        error: 'Validation error',
+        message: 'maxConcurrentTasks must be a number between 1 and 20'
+      });
+    }
+
+    const agent = Agent.update(id, { name, metadata, maxConcurrentTasks });
 
     res.json({
       success: true,
@@ -121,6 +128,19 @@ router.delete('/:id', (req, res) => {
 });
 
 // POST /api/agents/:id/activity — 报告智能体活动（任何组件可调用）
+router.get('/:id/concurrency', (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!Agent.exists(id)) {
+      return res.status(404).json({ error: 'Not found', message: 'Agent not found' });
+    }
+    const status = Agent.canAcceptNewTask(id);
+    res.json({ success: true, data: status });
+  } catch (error) {
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
 router.post('/:id/activity', (req, res) => {
   try {
     const { id } = req.params;

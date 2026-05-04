@@ -9,6 +9,7 @@
 
 const { AgentTaskFramework } = require('./framework');
 const { getDb } = require('./src/db');
+const Agent = require('./src/models/Agent');
 const CommandExecutor = require('./src/services/CommandExecutor');
 const { getTaskTypeLabel, isValidationTask, getTaskBehavior } = require('./src/utils/TaskType');
 
@@ -132,8 +133,14 @@ class AgentWorker {
 
       // 如果 focus 任务是 pending，自动启动它
       if (focusTask.status === 'pending') {
+        const agentId = this.framework.config.base.agentId;
+        const concurrency = Agent.canAcceptNewTask(agentId);
+        if (!concurrency.canAccept) {
+          console.log(`[_checkFocus] Agent ${agentId} 已达并发上限(${concurrency.active}/${concurrency.max})，暂不启动「${focusTask.title}」`);
+          return;
+        }
         const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
-        console.log(`▶️ 自动启动任务: ${focusTask.title}`);
+        console.log(`▶️ 自动启动任务: ${focusTask.title} (${concurrency.active + 1}/${concurrency.max})`);
         this._logFocusSwitch('task_start', prevTask?.data || prevTask, focusTask);
         await this.framework._autoStartTask(focusTask);
         this.currentTaskId = focusTask.id;
@@ -148,6 +155,12 @@ class AgentWorker {
         const attempts = focusTask.attempt_count || 0;
         const maxAttempts = focusTask.max_attempts || 3;
         if (attempts < maxAttempts) {
+          const agentId = this.framework.config.base.agentId;
+          const concurrency = Agent.canAcceptNewTask(agentId);
+          if (!concurrency.canAccept) {
+            console.log(`[_checkFocus] Agent ${agentId} 已达并发上限(${concurrency.active}/${concurrency.max})，暂不恢复「${focusTask.title}」`);
+            return;
+          }
           const prevTask = previousTaskId ? await this.framework.modules.taskManager.todo.getTodo(previousTaskId).catch(() => null) : null;
           console.log(`🔄 自动恢复 blocked 任务: ${focusTask.title} (${attempts}/${maxAttempts} → ${attempts+1}/${maxAttempts})`);
           this._logFocusSwitch('task_recover', prevTask?.data || prevTask, focusTask);
@@ -244,11 +257,17 @@ class AgentWorker {
    */
   async _trySwitchFocus() {
     try {
+      const agentId = this.framework.config.base.agentId;
+      const concurrency = Agent.canAcceptNewTask(agentId);
+      if (!concurrency.canAccept) {
+        console.log(`[_trySwitchFocus] Agent ${agentId} 已达并发上限(${concurrency.active}/${concurrency.max})，暂不切换新任务`);
+        return;
+      }
       const readyTasks = await this.framework.modules.taskManager.getReadyTasks();
       if (readyTasks && readyTasks.length > 0) {
         const prevTask = this.currentTaskId ? await this.framework.modules.taskManager.todo.getTodo(this.currentTaskId).catch(() => null) : null;
         const nextTask = readyTasks[0];
-        console.log(`🔄 切换到下一个可执行任务: ${nextTask.title}`);
+        console.log(`🔄 切换到下一个可执行任务: ${nextTask.title} (${concurrency.active + 1}/${concurrency.max})`);
         this._logFocusSwitch('auto_switch', prevTask?.data || prevTask, nextTask);
         // 通过 focus API 设置新 focus
         await this.framework.modules.taskManager.todo.updateTodo(nextTask.id, {
