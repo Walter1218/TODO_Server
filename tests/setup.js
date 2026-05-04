@@ -71,6 +71,11 @@ function initTestSchema(db) {
       archived BOOLEAN DEFAULT 0,
       next_due_at DATETIME,
       last_spawned_at DATETIME,
+      last_driven_at DATETIME,
+      validation_report TEXT DEFAULT '',
+      validated_by TEXT,
+      validation_count INTEGER DEFAULT 0,
+      validation_deadline DATETIME,
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
       FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE

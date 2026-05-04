@@ -57,9 +57,12 @@ class MiniMaxProvider extends LLMProvider {
       stream
     };
 
-    // MiniMax特定参数
     if (this.groupId) {
       requestBody.group_id = this.groupId;
+    }
+
+    if (params.tools && params.tools.length > 0) {
+      requestBody.tools = params.tools;
     }
 
     try {
@@ -83,8 +86,8 @@ class MiniMaxProvider extends LLMProvider {
 
       const data = await response.json();
       
-      // MiniMax响应格式：choices[0].message.content
       const content = data.choices?.[0]?.message?.content || '';
+      const toolCalls = data.choices?.[0]?.message?.tool_calls || null;
       
       return {
         content: content,
@@ -94,7 +97,8 @@ class MiniMaxProvider extends LLMProvider {
           totalTokens: data.usage?.total_tokens || 0
         },
         model: data.model,
-        finishReason: data.choices?.[0]?.finish_reason
+        finishReason: data.choices?.[0]?.finish_reason,
+        toolCalls
       };
     } catch (error) {
       if (error.message.includes('MiniMax API Error')) {

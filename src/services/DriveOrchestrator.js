@@ -17,8 +17,11 @@ const DEFAULTS = {
   retryBackoffMs: [0, 5000, 15000],
   driveCooldownMs: 60 * 1000,
   stallThreshold: 30 * 60 * 1000,
-  maxConcurrentDrives: 3,
-  useThirdPartyValidation: true,
+  maxConcurrentDrives: 5,
+  useThirdPartyValidation: false,
+  validationTimeoutMs: 30 * 60 * 1000,
+  maxValidationAttempts: 3,
+  validationCooldownMs: 2 * 60 * 1000,
 };
 
 class DriveOrchestrator {
@@ -30,11 +33,74 @@ class DriveOrchestrator {
     this.stallThreshold = options.stallThreshold || DEFAULTS.stallThreshold;
     this.maxConcurrentDrives = options.maxConcurrentDrives || DEFAULTS.maxConcurrentDrives;
     this.useThirdPartyValidation = options.useThirdPartyValidation !== undefined ? options.useThirdPartyValidation : DEFAULTS.useThirdPartyValidation;
+    this.validationTimeoutMs = options.validationTimeoutMs || DEFAULTS.validationTimeoutMs;
+    this.maxValidationAttempts = options.maxValidationAttempts || DEFAULTS.maxValidationAttempts;
+    this.validationCooldownMs = options.validationCooldownMs || DEFAULTS.validationCooldownMs;
     this.drivingTasks = new Set();
     this.framework = null;
     this.validator = null;
     this.validationDispatcher = null;
     this._timer = null;
+    this._tickRunning = false;
+    this._validationTimeouts = new Map();
+    this._lastGreetingCount = new Map();
+  }
+
+  detectGreetingLoop(reply, task) {
+    const greetingPatterns = [
+      '你好', '您好', '已就绪', '待命', '就绪', '已启动',
+      'hello', 'hi', 'ready', 'ready to', 'initialized',
+      '👋', '✅ 系统', '我能帮', '有什么'
+    ];
+
+    const isGreeting = greetingPatterns.some(p => reply.includes(p));
+    const hasCommand = /```bash|^\$./m.test(reply) || reply.includes('fetch_') || reply.includes('python');
+
+    if (isGreeting && !hasCommand) {
+      const count = (this._lastGreetingCount.get(task.id) || 0) + 1;
+      this._lastGreetingCount.set(task.id, count);
+      if (count >= 2) {
+        console.log(`[DriveOrchestrator] 任务 ${task.id} 检测到循环问候（第${count}次）`);
+        return true;
+      }
+    } else {
+      this._lastGreetingCount.set(task.id, 0);
+    }
+    return false;
+  }
+
+  forceExtractCommands(task) {
+    const commands = [];
+    const desc = task.description || '';
+
+    const scriptMatches = desc.match(/fetch_[\w_]+\.py/g);
+    if (scriptMatches) {
+      scriptMatches.forEach((script, idx) => {
+        const pathMatch = desc.match(new RegExp(`(/${script.replace('.py', '_v\\d*\\.py')}|${script.replace('.py', '\\.py')})`));
+        const scriptPath = pathMatch ? pathMatch[0] : script;
+        const argsMatch = desc.match(/--[\w\s]+/g);
+        const args = argsMatch ? argsMatch.join(' ') : '';
+        commands.push({
+          index: idx,
+          command: `python3 "${scriptPath}" ${args}`.trim(),
+          source: 'forced'
+        });
+      });
+    }
+
+    const duckdbMatches = desc.match(/\/[\w\/]+\.duckdb/g);
+    if (duckdbMatches) {
+      duckdbMatches.slice(0, 2).forEach((path, idx) => {
+        commands.push({
+          index: commands.length,
+          command: `python3 -c "import duckdb; conn = duckdb.connect('${path}'); print(conn.execute('SELECT table_name FROM information_schema.tables').fetchall())"`,
+          source: 'forced'
+        });
+      });
+    }
+
+    console.log(`[DriveOrchestrator] 强制提取 ${commands.length} 个命令`);
+    return commands;
   }
 
   start(framework) {
@@ -52,20 +118,83 @@ class DriveOrchestrator {
       clearInterval(this._timer);
       this._timer = null;
     }
+    for (const timer of this._validationTimeouts.values()) {
+      clearTimeout(timer);
+    }
+    this._validationTimeouts.clear();
+  }
+
+  scheduleValidationTimeoutCheck(taskId, agentId, timeoutMs) {
+    if (this._validationTimeouts.has(taskId)) {
+      return;
+    }
+    const timer = setTimeout(async () => {
+      this._validationTimeouts.delete(taskId);
+      const task = Todo.findById(agentId, taskId);
+      if (!task || task.status !== 'validating') {
+        return;
+      }
+      const deadline = task.validation_deadline ? new Date(task.validation_deadline).getTime() : 0;
+      if (Date.now() <= deadline) {
+        return;
+      }
+      console.log(`[DriveOrchestrator] 第三方验证超时，自动切换为内嵌验证: ${taskId}`);
+      try {
+        const result = await this.validator.validateTask(agentId, task);
+        if (result.pass) {
+          Todo.updateStatus(agentId, taskId, 'completed');
+        } else if (result.exhausted) {
+          Todo.update(agentId, taskId, {
+            status: 'blocked',
+            heartbeatStep: `🔒 验证次数已达上限(${this.maxValidationAttempts}次)，需要人工介入`
+          });
+        } else {
+          Todo.updateStatus(agentId, taskId, 'validation_failed');
+        }
+      } catch (err) {
+        console.error(`[DriveOrchestrator] 内嵌验证失败: ${err.message}`);
+        Todo.updateStatus(agentId, taskId, 'validation_failed');
+      }
+      Context.create(agentId, {
+        sessionId: 'validation-timeout-fallback',
+        role: 'system',
+        content: `[验证超时] 第三方验证在 ${timeoutMs / 60000} 分钟内未完成，自动切换为内嵌验证`,
+        metadata: { type: 'validation_timeout_fallback', task_id: taskId }
+      });
+      Notification.create(agentId, taskId, 'validation_timeout',
+        `任务「${task.title}」第三方验证超时，已自动切换为内嵌验证`
+      );
+    }, timeoutMs);
+    this._validationTimeouts.set(taskId, timer);
   }
 
   shouldDrive(task) {
     if (!task) return false;
-    const drivable = ['pending', 'in_progress', 'validation_failed', 'validating'].includes(task.status);
+    const drivable = ['pending', 'in_progress'].includes(task.status);
     if (!drivable) return false;
     if (this.drivingTasks.has(task.id)) return false;
     if (task.is_template) return false;
     if (task.archived) return false;
+    const vc = task.validation_count || 0;
+    if (vc >= this.maxValidationAttempts) return false;
+    if (task.parent_id && task.status === 'pending') return false;
     if (task.last_driven_at) {
       const ago = Date.now() - new Date(task.last_driven_at).getTime();
       if (ago < this.driveCooldownMs) return false;
     }
     return true;
+  }
+
+  _hasValidationExhausted(task) {
+    const vc = task.validation_count || 0;
+    if (vc >= this.maxValidationAttempts) return true;
+    return false;
+  }
+
+  _hasValidationCooldown(task) {
+    if (!task.updated_at) return false;
+    const lastUpdate = new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime();
+    return (Date.now() - lastUpdate) < this.validationCooldownMs;
   }
 
   async prepareTaskState(task) {
@@ -153,10 +282,25 @@ class DriveOrchestrator {
         metadata: { type: 'llm_reply', task_id: task_.id, reply_length: reply.length },
       });
 
+      const isGreetingLoop = this.detectGreetingLoop(reply, task_);
+      const isDataSyncTask = (task_.description || '').includes('fetch_') ||
+                              (task_.description || '').includes('duckdb') ||
+                              (task_.description || '').includes('同步');
+
       let execResults = [];
-      const { commands, results } = await CommandExecutor.extractAndRun(reply, { task: task_ });
+      let { commands, results } = await CommandExecutor.extractAndRun(reply, { task: task_ });
+
+      if (isGreetingLoop && commands.length === 0) {
+        console.log(`[DriveOrchestrator] 检测到循环问候模式，强制提取并执行命令: ${task_.id}`);
+        commands = this.forceExtractCommands(task_);
+      }
+
       if (commands.length > 0) {
-        execResults = results || [];
+        if (isGreetingLoop && results.length === 0) {
+          execResults = await CommandExecutor.executeCommands(commands, { timeoutMs: 60000 });
+        } else {
+          execResults = results || [];
+        }
         await Context.create(agentId, {
           sessionId: 'drive-orchestrator',
           role: 'system',
@@ -204,6 +348,15 @@ class DriveOrchestrator {
           }
 
           if (shouldTriggerValidation(refreshedForValidation)) {
+            if (this._hasValidationExhausted(refreshedForValidation)) {
+              await Context.create(agentId, {
+                sessionId: 'drive-orchestrator',
+                role: 'system',
+                content: `[DriveOrchestrator] 任务进度 100% 但验证已达上限(${this.maxValidationAttempts}次)，跳过验证`,
+                metadata: { type: 'validation_skip_exhausted', task_id: task_.id }
+              });
+              return { success: true, attempts: attempt + 1, reply, commands: execResults, changed, validationSkipped: true };
+            }
             await Context.create(agentId, {
               sessionId: 'drive-orchestrator',
               role: 'system',
@@ -215,6 +368,25 @@ class DriveOrchestrator {
           }
         }
         return { success: true, attempts: attempt + 1, reply, commands: execResults, changed };
+      }
+
+      if (!changed) {
+        const freshTask = Todo.findById(agentId, task_.id);
+        if (freshTask && freshTask.heartbeat_progress >= 100 && !isValidationTask(freshTask)) {
+          if (shouldTriggerValidation(freshTask)) {
+            if (this._hasValidationExhausted(freshTask)) {
+              return { success: true, attempts: attempt + 1, reply, commands: execResults, changed, validationSkipped: true };
+            }
+            await Context.create(agentId, {
+              sessionId: 'drive-orchestrator',
+              role: 'system',
+              content: `[DriveOrchestrator] 进度已达 100%（无新变化），兜底触发验证流程`,
+              metadata: { type: 'fallback_validation_trigger', task_id: task_.id },
+            });
+            Todo.update(agentId, task_.id, { status: 'pending_validation' });
+            return { success: true, validationTriggered: true, attempts: attempt + 1, changed: false };
+          }
+        }
       }
 
       lastReply = reply;
@@ -238,6 +410,16 @@ class DriveOrchestrator {
   }
 
   async tick() {
+    if (this._tickRunning) return { totalDriven: 0, totalStalled: 0 };
+    this._tickRunning = true;
+    try {
+      return await this._tickInner();
+    } finally {
+      this._tickRunning = false;
+    }
+  }
+
+  async _tickInner() {
     const db = getDb();
     const agents = Agent.findAll();
     let totalDriven = 0;
@@ -270,7 +452,7 @@ class DriveOrchestrator {
     }
 
     if (concurrent < this.maxConcurrentDrives) {
-      const validateCutoff = new Date(Date.now() - 30 * 1000).toISOString();
+      const validateCutoff = new Date(Date.now() - this.validationCooldownMs).toISOString();
       const limit = Math.max(0, this.maxConcurrentDrives - concurrent);
       const pendingValidations = db.prepare(`
         SELECT * FROM todos
@@ -278,13 +460,14 @@ class DriveOrchestrator {
           AND is_template = 0
           AND archived = 0
           AND updated_at <= ?
+          AND (validation_count IS NULL OR validation_count < ?)
           AND (
             title NOT LIKE '[验证]%'
-            OR context NOT LIKE '%"type":"third_party_validation"%'
+            OR context LIKE '%"type":"third_party_validation"%'
           )
         ORDER BY updated_at ASC
         LIMIT ?
-      `).all(validateCutoff, limit);
+      `).all(validateCutoff, this.maxValidationAttempts, limit);
 
       for (const pv of pendingValidations) {
         if (concurrent >= this.maxConcurrentDrives) break;
@@ -298,10 +481,13 @@ class DriveOrchestrator {
             const related = recent.filter(c => (c.metadata || {}).task_id === pv.id);
             const logs = related.map(c => `[${c.session_id || 'session'}][${c.role}] ${c.content}`).join('\n---\n');
             await this.validationDispatcher.dispatchValidationTask(pv.agent_id, pv, logs);
+            const deadline = new Date(Date.now() + this.validationTimeoutMs).toISOString();
             Todo.update(pv.agent_id, pv.id, {
               status: 'validating',
-              heartbeatStep: '📋 已派发第三方验证任务，等待验证报告...'
+              validationDeadline: deadline,
+              heartbeatStep: `📋 已派发第三方验证任务，等待验证报告（超时: ${new Date(deadline).toLocaleString()}）...`
             });
+            this.scheduleValidationTimeoutCheck(pv.id, pv.agent_id, this.validationTimeoutMs);
             totalDriven++;
           } else {
             const validationResult = await this.validator.validateTask(pv.agent_id, pv);
@@ -309,7 +495,18 @@ class DriveOrchestrator {
               Todo.updateStatus(pv.agent_id, pv.id, 'completed');
               totalDriven++;
             } else {
-              Todo.updateStatus(pv.agent_id, pv.id, 'validation_failed');
+              const refreshed = Todo.findById(pv.agent_id, pv.id);
+              if (this._hasValidationExhausted(refreshed)) {
+                Todo.update(pv.agent_id, pv.id, {
+                  status: 'blocked',
+                  heartbeatStep: `🔒 验证次数已达上限(${this.maxValidationAttempts}次)，需要人工介入`
+                });
+                Notification.create(pv.agent_id, pv.id, 'validation_exhausted',
+                  `任务「${pv.title}」验证失败已达 ${this.maxValidationAttempts} 次，已标记为阻塞`
+                );
+              } else {
+                Todo.updateStatus(pv.agent_id, pv.id, 'validation_failed');
+              }
               totalStalled++;
             }
           }
@@ -329,13 +526,31 @@ class DriveOrchestrator {
           AND is_template = 0
           AND archived = 0
           AND attempt_count < max_attempts
+          AND (validation_count IS NULL OR validation_count < ?)
+          AND updated_at <= ?
         ORDER BY updated_at ASC
         LIMIT ?
-      `).all(limit);
+      `).all(this.maxValidationAttempts, new Date(Date.now() - this.validationCooldownMs).toISOString(), limit);
 
       for (const ft of stalledTasks) {
         if (concurrent >= this.maxConcurrentDrives) break;
         if (this.drivingTasks.has(ft.id)) continue;
+
+        const refreshed = Todo.findById(ft.agent_id, ft.id);
+        if (!refreshed || refreshed.status !== 'validation_failed') continue;
+
+        if (this._hasValidationExhausted(refreshed)) {
+          Todo.update(ft.agent_id, ft.id, {
+            status: 'blocked',
+            heartbeatStep: `🔒 验证次数已达上限(${this.maxValidationAttempts}次)，需要人工介入`
+          });
+          Notification.create(ft.agent_id, ft.id, 'validation_exhausted',
+            `任务「${ft.title}」验证失败已达 ${this.maxValidationAttempts} 次，已标记为阻塞`
+          );
+          continue;
+        }
+
+        if (this._hasValidationCooldown(refreshed)) continue;
 
         this.drivingTasks.add(ft.id);
         concurrent++;

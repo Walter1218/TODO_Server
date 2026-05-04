@@ -43,19 +43,25 @@ class OpenAIProvider extends LLMProvider {
     chatMessages.push(...messages);
 
     try {
+      const requestBody = {
+        model,
+        messages: chatMessages,
+        temperature,
+        max_tokens: maxTokens,
+        stream
+      };
+
+      if (params.tools && params.tools.length > 0) {
+        requestBody.tools = params.tools;
+      }
+
       const response = await fetch(`${this.baseUrl}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${this.apiKey}`
         },
-        body: JSON.stringify({
-          model,
-          messages: chatMessages,
-          temperature,
-          max_tokens: maxTokens,
-          stream
-        })
+        body: JSON.stringify(requestBody)
       });
 
       if (!response.ok) {
@@ -77,7 +83,8 @@ class OpenAIProvider extends LLMProvider {
           totalTokens: data.usage?.total_tokens || 0
         },
         model: data.model,
-        finishReason: data.choices[0]?.finish_reason
+        finishReason: data.choices[0]?.finish_reason,
+        toolCalls: data.choices[0]?.message?.tool_calls || null
       };
     } catch (error) {
       if (error.message.includes('OpenAI API Error')) {

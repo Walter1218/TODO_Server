@@ -287,6 +287,7 @@ function initializeSchema() {
     { col: 'validation_report', type: 'TEXT' },
     { col: 'validated_by', type: 'TEXT' },
     { col: 'validation_count', type: 'INTEGER DEFAULT 0' },
+    { col: 'validation_deadline', type: 'DATETIME' },
   ];
 
   for (const mig of validationMigrations) {

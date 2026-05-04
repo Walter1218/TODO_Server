@@ -1183,7 +1183,7 @@
             for (const r of Object.values(this.agentData)) {
                 if (r.stats.success) {
                     const s = r.stats.data;
-                    total += s.total || 0;
+                    total += s.active_tasks || s.total || 0;
                     pending += s.pending || 0;
                     inProgress += s.in_progress || 0;
                     completed += s.completed || 0;
@@ -1358,7 +1358,7 @@
                             <div class="progress-fill ${progressClass}" style="width:${focusProgress}%"></div>
                         </div>
                         <div class="agent-meta">
-                            <span>📊 ${stats.in_progress || 0} 进行中 / ${stats.total || 0} 总任务${blockedHint ? ' · ' + blockedHint : ''}</span>
+                            <span>📊 ${stats.in_progress || 0} 进行中 / ${stats.active_tasks || stats.total || 0} 总任务${blockedHint ? ' · ' + blockedHint : ''}</span>
                             <span style="${heartbeatColor}">💓 ${heartbeatInfo}</span>
                         </div>
                         <div style="display:flex;align-items:center;gap:8px;margin-top:8px;font-size:0.75rem;">
@@ -1422,7 +1422,7 @@
                 const templates = d.templates?.success ? d.templates.data : [];
 
                 const inProgress = stats.in_progress || 0;
-                const total = stats.total || 0;
+                const total = stats.active_tasks || stats.total || 0;
                 const completed = stats.completed || 0;
                 const blocked = stats.blocked || 0;
                 const unread = notifications.filter(n => !n.read).length;
@@ -1477,7 +1477,7 @@
                     </div>` : ''}
 
                     <div class="section">
-                        <div class="section-title tab-section-title">📋 任务列表 <span class="badge" id="taskCountBadge-${agent.id}">${agentTasks.filter(t => !t.parent_id).length}</span></div>
+                        <div class="section-title tab-section-title">📋 任务列表 <span class="badge" id="taskCountBadge-${agent.id}">${agentTasks.filter(t => !t.is_template).length}</span></div>
                         <div class="filters">
                             <select id="filterStatus-${agent.id}" onchange="app.filterAgentTasks('${agent.id}')">
                                 <option value="">全部状态</option>
@@ -1549,14 +1549,14 @@
             const el = document.getElementById(`taskList-${agentId}`);
             if (!el) return;
             tasks.forEach(t => { t._agentId = agentId; t._agentName = agentName; });
-            const topTasks = tasks.filter(t => !t.parent_id);
-            if (topTasks.length === 0) {
+            const displayTasks = tasks.filter(t => !t.is_template);
+            if (displayTasks.length === 0) {
                 el.innerHTML = '<div class="empty-state" style="padding:20px;font-size:0.85rem;">📭 暂无任务</div>';
                 return;
             }
             const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
             const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
-            topTasks.sort((a, b) => {
+            displayTasks.sort((a, b) => {
                 const sa = statusOrder[a.status] || 99;
                 const sb = statusOrder[b.status] || 99;
                 if (sa !== sb) return sa - sb;
@@ -1564,7 +1564,7 @@
                 const pb = priorityOrder[b.priority] || 99;
                 return pa - pb;
             });
-            el.innerHTML = topTasks.map(t => this.renderTask(t)).join('');
+            el.innerHTML = displayTasks.map(t => this.renderTask(t)).join('');
         },
 
         filterAgentTasks(agentId) {
@@ -1589,7 +1589,7 @@
                 tasks = tasks.filter(t => t.title.toLowerCase().includes(q) || (t.description && t.description.toLowerCase().includes(q)));
             }
             const badge = document.getElementById(`taskCountBadge-${agentId}`);
-            if (badge) badge.textContent = tasks.filter(t => !t.parent_id).length;
+            if (badge) badge.textContent = tasks.length;
             const agent = this.agents.find(a => a.id === agentId);
             this.renderAgentTasks(agentId, tasks, agent?.name || agentId);
         },

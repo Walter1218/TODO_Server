@@ -96,7 +96,7 @@ class LLMManager {
    * @returns {Promise<{content, usage, finishReason, toolCalls?}>}
    */
   async chat(params) {
-    const { messages, system, userContent, tools } = params;
+    const { messages, system, userContent, tools, maxTokens, temperature } = params;
 
     if (!this.provider) {
       return this.mockChat(params);
@@ -111,6 +111,8 @@ class LLMManager {
       if (tools && tools.length > 0) {
         requestParams.tools = tools;
       }
+      if (maxTokens !== undefined) requestParams.maxTokens = maxTokens;
+      if (temperature !== undefined) requestParams.temperature = temperature;
       const result = await this.provider.chat(requestParams);
 
       return {
@@ -128,6 +130,8 @@ class LLMManager {
         try {
           const fbParams = { messages, system };
           if (tools && tools.length > 0) fbParams.tools = tools;
+          if (maxTokens !== undefined) fbParams.maxTokens = maxTokens;
+          if (temperature !== undefined) fbParams.temperature = temperature;
           const fallbackResult = await this.fallbackProvider.chat(fbParams);
 
           console.log(`✅ Fallback LLM 响应成功`);
@@ -264,6 +268,85 @@ class LLMManager {
    */
   hasProvider() {
     return this.provider !== null || this.fallbackProvider !== null;
+  }
+
+  /**
+   * 获取当前 LLM 状态（用于 API 暴露）
+   */
+  getStatus() {
+    const testConnection = async (provider, timeoutMs = 8000) => {
+      if (!provider) return null;
+      try {
+        return await Promise.race([
+          provider.testConnection(),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('timeout')), timeoutMs)
+          )
+        ]);
+      } catch {
+        return { success: false, message: 'connection test failed' };
+      }
+    };
+
+    return {
+      primary: this.provider ? this.provider.getModelInfo() : null,
+      fallback: this.fallbackProvider ? this.fallbackProvider.getModelInfo() : null,
+      hasProvider: this.hasProvider(),
+      conversationHistoryLength: this.conversationHistory.length
+    };
+  }
+
+  /**
+   * 运行时热替换 LLM Provider
+   *
+   * 流程: 创建新 Provider → 测试连接 → 原子切换 → 释放旧 Provider
+   *
+   * @param {Object} newConfig - 新的 LLM 配置 { provider, apiKey, model, baseUrl, ... }
+   * @param {Object} [options] - 可选 { keepFallback: boolean, testTimeoutMs: number }
+   * @returns {Promise<{success, previous, current, message}>}
+   */
+  async swapProvider(newConfig, options = {}) {
+    const { keepFallback = false, testTimeoutMs = 10000 } = options;
+
+    if (!newConfig || !newConfig.provider) {
+      throw new Error('swapProvider requires config with provider field');
+    }
+
+    const LLMFactory = require('./LLMFactory');
+
+    let newProvider;
+    try {
+      newProvider = LLMFactory.createFromConfig(newConfig);
+    } catch (err) {
+      throw new Error(`创建新 Provider 失败: ${err.message}`);
+    }
+
+    const testResult = await Promise.race([
+      newProvider.testConnection(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`连接测试超时 (${testTimeoutMs}ms)`)), testTimeoutMs)
+      )
+    ]).catch(err => ({ success: false, message: err.message }));
+
+    if (!testResult.success) {
+      throw new Error(`新 Provider 连接测试失败: ${testResult.message}`);
+    }
+
+    const previousInfo = this.provider ? this.provider.getModelInfo() : null;
+    const oldProvider = this.provider;
+    const oldFallback = this.fallbackProvider;
+
+    this.provider = newProvider;
+    this.fallbackProvider = null;
+
+    this.framework.log(`🔄 LLM Provider 已切换: ${previousInfo?.provider || 'none'} → ${newConfig.provider}`);
+
+    return {
+      success: true,
+      previous: previousInfo,
+      current: this.provider.getModelInfo(),
+      message: `Provider 已切换为 ${newConfig.provider} / ${newConfig.model || 'default'}`
+    };
   }
 }
 

@@ -9,6 +9,7 @@ const projectsRouter = require('./routes/projects');
 const focusRouter = require('./routes/focus');
 const contextsRouter = require('./routes/contexts');
 const notificationsRouter = require('./routes/notifications');
+const llmRouter = require('./routes/llm');
 const Agent = require('./models/Agent');
 const Todo = require('./models/Todo');
 const Notification = require('./models/Notification');
@@ -101,6 +102,7 @@ app.use('/api/agents/:agentId/projects', projectsRouter);
 app.use('/api/agents/:agentId/focus', focusRouter);
 app.use('/api/agents/:agentId/contexts', contextsRouter);
 app.use('/api/agents/:agentId/notifications', notificationsRouter);
+app.use('/api/llm', llmRouter);
 
 app.use((req, res) => {
   res.status(404).json({
@@ -150,6 +152,8 @@ app.listen(PORT, () => {
       retryBackoffMs: [0, 5000, 15000],
       driveCooldownMs: 60 * 1000,
       stallThreshold: 30 * 60 * 1000,
+      useThirdPartyValidation: false,
+      validationTimeoutMs: 30 * 60 * 1000,
     });
     driveOrchestrator.start(driveFramework);
     app.set('driveOrchestrator', driveOrchestrator);
@@ -161,25 +165,39 @@ app.listen(PORT, () => {
   const STUCK_CHECK_INTERVAL_MS = 3 * 60 * 1000;
   const STUCK_MAX_IDLE_MINUTES = 15; // 无心跳超过 15 分钟视为卡住
   const PROGRESS_STALL_MINUTES = 15; // progress 超过 15 分钟未变化视为停滞
+  const HERMES_TESTER_ID = process.env.VALIDATOR_AGENT_ID || 'hermes-tester';
+  const HERMES_STALE_THRESHOLD_MS = 30 * 60 * 1000;
 
   setInterval(() => {
     try {
+      const db = getDb(); // 在 try 块开始时声明一次
       const agents = Agent.findAll();
       let totalStuck = 0;
+
+      const hermesAgent = db.prepare('SELECT * FROM agents WHERE id = ?').get(HERMES_TESTER_ID);
+      if (hermesAgent) {
+        const recentHermesTasks = db.prepare(`
+          SELECT MAX(updated_at) as last_update FROM todos WHERE agent_id = ? AND status IN ('validating', 'in_progress')
+        `).get(HERMES_TESTER_ID);
+        const lastUpdate = recentHermesTasks.last_update ? new Date(recentHermesTasks.last_update.replace(' ', 'T') + 'Z').getTime() : 0;
+        if (lastUpdate > 0 && Date.now() - lastUpdate > HERMES_STALE_THRESHOLD_MS) {
+          const staleMinutes = Math.round((Date.now() - lastUpdate) / 60000);
+          console.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 健康警告：超过 ${staleMinutes} 分钟没有更新验证任务`);
+          const validatingCount = db.prepare(`
+            SELECT COUNT(*) as count FROM todos WHERE agent_id = ? AND status = 'validating'
+          `).get(HERMES_TESTER_ID).count;
+          if (validatingCount > 0) {
+            console.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 有 ${validatingCount} 个验证任务卡住中，可能未正常运行`);
+          }
+        }
+      }
 
       for (const agent of agents) {
         // 1. 检测无心跳卡住，自动恢复（看门狗模式：不消耗 attempt_count）
         // 动态阈值：基于 LLM 预估耗时和当前进度计算
         const inProgressTasks = Todo.findAllInProgress(agent.id);
-        for (const rawTask of inProgressTasks) {
-          const task = {
-            ...rawTask,
-            tags: JSON.parse(rawTask.tags || '[]'),
-            dependencies: JSON.parse(rawTask.dependencies || '[]'),
-            attempt_log: JSON.parse(rawTask.attempt_log || '[]'),
-            heartbeat_blockers: JSON.parse(rawTask.heartbeat_blockers || '[]')
-          };
-
+        for (const task of inProgressTasks) {
+          // Todo.findAllInProgress 已经解析了 JSON 字段，不需要再次解析
           // 冷却期检查：任务刚被更新（5分钟内），跳过检测
           // 防止任务刚启动就被误判为卡住
           const lastUpdate = task.updated_at ? new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
@@ -220,11 +238,34 @@ app.listen(PORT, () => {
           const currentAttempts = task.attempt_count || 0;
           const maxAttempts = task.max_attempts || 3;
 
+          const vc1a = task.validation_count || 0;
+
           if (currentAttempts < maxAttempts) {
-            // Fix A: 自动恢复不消耗 attempt_count，只重置状态 + 更新 last_heartbeat
+            let newStatus = 'in_progress';
+            let heartbeatStep = 'StuckTaskMonitor 自动恢复中，等待智能体重连...';
+            
+            if (vc1a >= 3 && task.status === 'in_progress') {
+              Todo.update(agent.id, task.id, {
+                status: 'blocked',
+                heartbeatStep: `🔒 验证次数已耗尽(${vc1a})且无心跳，保持 blocked`,
+                lastHeartbeat: new Date().toISOString()
+              });
+              console.log(`[StuckTaskMonitor] 任务 ${task.id} 验证已耗尽(${vc1a})且无心跳，标记 blocked`);
+              totalStuck++;
+              continue;
+            }
+
+            if (task.status === 'pending_validation') {
+              newStatus = 'pending_validation';
+              heartbeatStep = 'StuckTaskMonitor 自动恢复（从 pending_validation），等待验证流程继续...';
+            } else if (task.status === 'validating') {
+              newStatus = 'pending_validation';
+              heartbeatStep = 'StuckTaskMonitor 自动恢复（从 validating 超时），重新进入验证流程...';
+            }
+            
             Todo.update(agent.id, task.id, {
-              status: 'in_progress',
-              heartbeatStep: 'StuckTaskMonitor 自动恢复中，等待智能体重连...',
+              status: newStatus,
+              heartbeatStep: heartbeatStep,
               lastHeartbeat: new Date().toISOString()  // 更新心跳时间，防止短时间内重复触发
             });
 
@@ -232,8 +273,8 @@ app.listen(PORT, () => {
             Context.create(agent.id, {
               sessionId: 'auto-recover',
               role: 'system',
-              content: `[StuckTaskMonitor] 任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），已自动恢复为 in_progress（attempt_count 不变: ${currentAttempts}/${maxAttempts}）`,
-              metadata: { type: 'auto_recover', task_id: task.id, attempt_count: currentAttempts, threshold_minutes: thresholdMinutes, idle_minutes: idleMinutes }
+              content: `[StuckTaskMonitor] 任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），已从 ${task.status} 自动恢复为 ${newStatus}（attempt_count 不变: ${currentAttempts}/${maxAttempts}）`,
+              metadata: { type: 'auto_recover', task_id: task.id, original_status: task.status, new_status: newStatus, attempt_count: currentAttempts, threshold_minutes: thresholdMinutes, idle_minutes: idleMinutes }
             });
             Context.pruneBySession(agent.id, 'auto-recover', 50);
 
@@ -254,11 +295,11 @@ app.listen(PORT, () => {
 
         // 1b. 处理已 blocked 且长时间无心跳的任务（真正"卡住"的 blocked 任务）
         // 关键：只恢复 last_heartbeat 超过阈值的任务，避免和 Worker 的正常 blocked 判断冲突
-        const db = getDb();
         const blockedStuck = db.prepare(`
           SELECT * FROM todos
           WHERE agent_id = ? AND status = 'blocked'
             AND attempt_count < max_attempts
+            AND (validation_count IS NULL OR validation_count < 3)
             AND (last_heartbeat IS NULL OR last_heartbeat < ?)
         `).all(agent.id, new Date(Date.now() - STUCK_MAX_IDLE_MINUTES * 60 * 1000).toISOString());
         for (const task of blockedStuck) {
@@ -271,12 +312,16 @@ app.listen(PORT, () => {
 
           const currentAttempts = task.attempt_count || 0;
           const maxAttempts = task.max_attempts || 3;
+          const vc = task.validation_count || 0;
+          if (vc >= 3) {
+            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 验证次数已耗尽(${vc})，保持 blocked`);
+            continue;
+          }
 
-          // Fix A: 从 blocked 恢复也不消耗 attempt_count
           Todo.update(agent.id, task.id, {
             status: 'in_progress',
             heartbeatStep: 'StuckTaskMonitor 自动恢复中（从 blocked 状态恢复），等待智能体重连...',
-            lastHeartbeat: new Date().toISOString()  // 更新心跳时间，防止短时间内重复触发
+            lastHeartbeat: new Date().toISOString()
           });
 
           // 用 contexts 记录恢复事件
@@ -389,13 +434,44 @@ app.listen(PORT, () => {
 
         for (const task of staleValidatingTasks) {
           const idleMinutes = Math.floor((Date.now() - new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime()) / 60000);
-          Context.create(agent.id, {
-            sessionId: task.id,
-            role: 'system',
-            content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」验证阶段超时（已 ${idleMinutes} 分钟无更新）。建议：\n1. 检查 hermes-tester 是否正常处理验证任务\n2. 验证报告提交可能失败，可以手动提交\n3. 调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
-            metadata: { type: 'validation_validating_timeout', task_id: task.id, idle_minutes: idleMinutes }
-          });
-          console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证阶段超时 ${idleMinutes} 分钟`);
+          const deadline = task.validation_deadline ? new Date(task.validation_deadline).getTime() : 0;
+          const isDeadlineExceeded = deadline > 0 && Date.now() > deadline;
+          if (isDeadlineExceeded) {
+            const vc = task.validation_count || 0;
+            if (vc >= 3) {
+              Todo.update(agent.id, task.id, {
+                status: 'blocked',
+                heartbeatStep: `🔒 验证次数已达上限(${vc}次)，需要人工介入`
+              });
+              Notification.create(agent.id, task.id, 'validation_exhausted',
+                `任务「${task.title}」验证超时且已达次数上限(${vc}次)，已标记为阻塞`
+              );
+              console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时且达上限，标记阻塞`);
+            } else {
+              Todo.update(agent.id, task.id, {
+                status: 'pending_validation',
+                heartbeatStep: 'StuckTaskMonitor：验证超时，重新进入验证队列...'
+              });
+              Context.create(agent.id, {
+                sessionId: task.id,
+                role: 'system',
+                content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」验证超时（已 ${idleMinutes} 分钟），已重新进入验证队列等待内嵌验证`,
+                metadata: { type: 'validation_validating_timeout', task_id: task.id, idle_minutes: idleMinutes, action: 'requeue' }
+              });
+              Notification.create(agent.id, task.id, 'validation_timeout',
+                `任务「${task.title}」第三方验证超时，已重新进入验证队列`
+              );
+              console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时 ${idleMinutes} 分钟，已重新入队`);
+            }
+          } else {
+            Context.create(agent.id, {
+              sessionId: task.id,
+              role: 'system',
+              content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」验证阶段等待中（已 ${idleMinutes} 分钟无更新）。hermes-tester 正在处理中...`,
+              metadata: { type: 'validation_validating_pending', task_id: task.id, idle_minutes: idleMinutes }
+            });
+            console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证等待中 ${idleMinutes} 分钟`);
+          }
           totalStuck++;
         }
 
@@ -409,13 +485,26 @@ app.listen(PORT, () => {
             AND updated_at < ?
         `).all(agent.id, blockedResetCutoff);
         for (const task of blockedExhausted) {
-          // 冷却期检查
           const lastUpdate = task.updated_at ? new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
           if (Date.now() - lastUpdate < 10 * 60 * 1000) {
-            continue; // 10 分钟内更新过，跳过
+            continue;
           }
 
-          const newLog = [...JSON.parse(task.attempt_log || '[]'), {
+          const isValidationExhausted = (task.heartbeat_step || '').includes('验证次数已达上限')
+            || (task.validation_count || 0) >= 3;
+          if (isValidationExhausted) {
+            continue;
+          }
+
+          // 安全解析 attempt_log
+          let attemptLogArray;
+          try {
+            attemptLogArray = JSON.parse(task.attempt_log || '[]');
+          } catch {
+            attemptLogArray = [];
+          }
+          
+          const newLog = [...attemptLogArray, {
             timestamp: new Date().toISOString(),
             success: false,
             reason: `系统自动重置：任务已 blocked 超过 ${BLOCKED_RESET_HOURS} 小时，重置尝试次数`,
@@ -540,70 +629,80 @@ app.listen(PORT, () => {
       const overdueCutoff = new Date(Date.now() - CRON_START_GRACE_MINUTES * 60 * 1000).toISOString();
       const notifyCutoff = new Date(Date.now() - CRON_NAG_COOLDOWN_MINUTES * 60 * 1000).toISOString();
 
-      const overdue = db.prepare(`
-        SELECT t.*, p.title AS template_title, p.schedule AS template_schedule
-        FROM todos t
-        JOIN todos p ON p.id = t.parent_id AND p.agent_id = t.agent_id
-        WHERE t.status = 'pending'
-          AND (t.is_template = 0 OR t.is_template IS NULL)
-          AND t.parent_id IS NOT NULL
-          AND p.is_template = 1
-          AND (t.archived = 0 OR t.archived IS NULL)
-          AND t.created_at <= ?
-          AND (t.last_heartbeat IS NULL OR t.last_heartbeat = '')
-        ORDER BY t.created_at ASC
-        LIMIT 50
-      `).all(overdueCutoff);
+      let overdue;
+      try {
+        overdue = db.prepare(`
+          SELECT t.*, p.title AS template_title, p.schedule AS template_schedule
+          FROM todos t
+          JOIN todos p ON p.id = t.parent_id AND p.agent_id = t.agent_id
+          WHERE t.status = 'pending'
+            AND (t.is_template = 0 OR t.is_template IS NULL)
+            AND t.parent_id IS NOT NULL
+            AND p.is_template = 1
+            AND (t.archived = 0 OR t.archived IS NULL)
+            AND t.created_at <= ?
+            AND (t.last_heartbeat IS NULL OR t.last_heartbeat = '')
+          ORDER BY t.created_at ASC
+          LIMIT 50
+        `).all(overdueCutoff);
+      } catch (sqlErr) {
+        console.error('[CronExecutionMonitor] SQL 查询出错:', sqlErr.message);
+        return;
+      }
 
       let totalNagged = 0;
 
       for (const task of overdue) {
-        const alreadyNotified = db.prepare(`
-          SELECT id FROM task_notifications
-          WHERE task_id = ?
-            AND type = 'stalled'
-            AND message LIKE '[CronMonitor]%'
-            AND created_at >= ?
-          LIMIT 1
-        `).get(task.id, notifyCutoff);
-        if (alreadyNotified) continue;
+        try {
+          const alreadyNotified = db.prepare(`
+            SELECT id FROM task_notifications
+            WHERE task_id = ?
+              AND type = 'stalled'
+              AND message LIKE '[CronMonitor]%'
+              AND created_at >= ?
+            LIMIT 1
+          `).get(task.id, notifyCutoff);
+          if (alreadyNotified) continue;
 
-        const executorId = task.assigned_agent_id || task.agent_id;
-        const msg = `[CronMonitor] 定时实例超过 ${CRON_START_GRACE_MINUTES} 分钟仍未开始（无心跳）：「${task.title}」(ID: ${task.id})`;
+          const executorId = task.assigned_agent_id || task.agent_id;
+          const msg = `[CronMonitor] 定时实例超过 ${CRON_START_GRACE_MINUTES} 分钟仍未开始（无心跳）：「${task.title}」(ID: ${task.id})`;
 
-        if (Agent.exists(executorId)) {
-          Notification.create(executorId, task.id, 'stalled', msg);
-        }
-        if (task.agent_id && task.agent_id !== executorId && Agent.exists(task.agent_id)) {
-          Notification.create(task.agent_id, task.id, 'stalled', msg);
-        }
-        if (CRON_MONITOR_OPS_AGENT_ID && CRON_MONITOR_OPS_AGENT_ID !== executorId && CRON_MONITOR_OPS_AGENT_ID !== task.agent_id && Agent.exists(CRON_MONITOR_OPS_AGENT_ID)) {
-          Notification.create(CRON_MONITOR_OPS_AGENT_ID, task.id, 'stalled', msg);
-        }
-
-        Context.create(task.agent_id, {
-          sessionId: 'cron-monitor',
-          role: 'system',
-          content: `${msg}\n模板: ${task.template_title || '(unknown)'}\nschedule: ${task.template_schedule || '(none)'}`,
-          metadata: { type: 'cron_overdue', task_id: task.id, template_id: task.parent_id }
-        });
-        Context.pruneBySession(task.agent_id, 'cron-monitor', 50);
-
-        if (executorId === task.agent_id) {
-          const current = FocusState.findByAgent(executorId);
-          if (!current || current.current_task_id !== task.id) {
-            FocusState.createOrUpdate(executorId, { currentTaskId: task.id, focusMode: 'cron-monitor' });
+          if (Agent.exists(executorId)) {
+            Notification.create(executorId, task.id, 'stalled', msg);
           }
-        }
+          if (task.agent_id && task.agent_id !== executorId && Agent.exists(task.agent_id)) {
+            Notification.create(task.agent_id, task.id, 'stalled', msg);
+          }
+          if (CRON_MONITOR_OPS_AGENT_ID && CRON_MONITOR_OPS_AGENT_ID !== executorId && CRON_MONITOR_OPS_AGENT_ID !== task.agent_id && Agent.exists(CRON_MONITOR_OPS_AGENT_ID)) {
+            Notification.create(CRON_MONITOR_OPS_AGENT_ID, task.id, 'stalled', msg);
+          }
 
-        totalNagged++;
+          Context.create(task.agent_id, {
+            sessionId: 'cron-monitor',
+            role: 'system',
+            content: `${msg}\n模板: ${task.template_title || '(unknown)'}\nschedule: ${task.template_schedule || '(none)'}`,
+            metadata: { type: 'cron_overdue', task_id: task.id, template_id: task.parent_id }
+          });
+          Context.pruneBySession(task.agent_id, 'cron-monitor', 50);
+
+          if (executorId === task.agent_id) {
+            const current = FocusState.findByAgent(executorId);
+            if (!current || current.current_task_id !== task.id) {
+              FocusState.createOrUpdate(executorId, { currentTaskId: task.id, focusMode: 'auto' });
+            }
+          }
+
+          totalNagged++;
+        } catch (taskErr) {
+          console.error(`[CronExecutionMonitor] 任务 ${task.id} 处理失败: ${taskErr.message}`);
+        }
       }
 
       if (totalNagged > 0) {
         console.log(`[CronExecutionMonitor] 本次标记/提醒 ${totalNagged} 个未按时启动的定时实例（阈值 ${CRON_START_GRACE_MINUTES}min）`);
       }
     } catch (err) {
-      console.error('[CronExecutionMonitor] 扫描出错:', err.message);
+      console.error('[CronExecutionMonitor] 扫描出错:', err.message, err.stack?.split('\n').slice(0, 3).join(' '));
     }
   }, CRON_MONITOR_INTERVAL_MS);
 
@@ -683,31 +782,31 @@ app.listen(PORT, () => {
         const inProgressTasks = Todo.findAllByAgent(agent.id, { status: 'in_progress' });
 
         const snapshot = {
-          agent_id: agent.id,
-          agent_name: agent.name,
-          timestamp: new Date().toISOString(),
-          focus_task: focus?.current_task ? {
-            id: focus.current_task.id,
-            title: focus.current_task.title,
-            status: focus.current_task.status,
-            progress: focus.current_task.heartbeat_progress || 0,
-            step: focus.current_task.heartbeat_step || '',
-            blockers: Array.isArray(focus.current_task.heartbeat_blockers)
-              ? focus.current_task.heartbeat_blockers
-              : JSON.parse(focus.current_task.heartbeat_blockers || '[]'),
-            attempt_count: focus.current_task.attempt_count || 0
-          } : null,
-          in_progress_count: inProgressTasks.length,
-          in_progress_tasks: inProgressTasks.map(t => ({
-            id: t.id,
-            title: t.title,
-            progress: t.heartbeat_progress || 0,
-            step: t.heartbeat_step || '',
-            blockers: Array.isArray(t.heartbeat_blockers)
-              ? t.heartbeat_blockers
-              : JSON.parse(t.heartbeat_blockers || '[]')
-          }))
-        };
+        agent_id: agent.id,
+        agent_name: agent.name,
+        timestamp: new Date().toISOString(),
+        focus_task: focus?.current_task ? {
+          id: focus.current_task.id,
+          title: focus.current_task.title,
+          status: focus.current_task.status,
+          progress: focus.current_task.heartbeat_progress || 0,
+          step: focus.current_task.heartbeat_step || '',
+          blockers: Array.isArray(focus.current_task.heartbeat_blockers)
+            ? focus.current_task.heartbeat_blockers
+            : [],
+          attempt_count: focus.current_task.attempt_count || 0
+        } : null,
+        in_progress_count: inProgressTasks.length,
+        in_progress_tasks: inProgressTasks.map(t => ({
+          id: t.id,
+          title: t.title,
+          progress: t.heartbeat_progress || 0,
+          step: t.heartbeat_step || '',
+          blockers: Array.isArray(t.heartbeat_blockers)
+            ? t.heartbeat_blockers
+            : []
+        }))
+      };
 
         Context.create(agent.id, {
           sessionId: 'work-snapshot',
@@ -760,13 +859,33 @@ app.listen(PORT, () => {
         `).all(agent.id, minCutoff, maxCutoff);
 
         for (const rawTask of idleTasks) {
-          const task = {
-            ...rawTask,
-            tags: JSON.parse(rawTask.tags || '[]'),
-            dependencies: JSON.parse(rawTask.dependencies || '[]'),
-            attempt_log: JSON.parse(rawTask.attempt_log || '[]'),
-            heartbeat_blockers: JSON.parse(rawTask.heartbeat_blockers || '[]')
-          };
+          let task;
+          try {
+            // 安全解析 JSON 字段，处理可能的非 JSON 格式
+            const parseJson = (str, defaultValue) => {
+              if (!str) return defaultValue;
+              try {
+                return JSON.parse(str);
+              } catch {
+                // 如果不是 JSON，尝试作为逗号分隔字符串处理
+                if (typeof str === 'string' && !str.startsWith('[')) {
+                  return str.split(',').map(s => s.trim()).filter(Boolean);
+                }
+                return defaultValue;
+              }
+            };
+            
+            task = {
+              ...rawTask,
+              tags: parseJson(rawTask.tags, []),
+              dependencies: parseJson(rawTask.dependencies, []),
+              attempt_log: parseJson(rawTask.attempt_log, []),
+              heartbeat_blockers: parseJson(rawTask.heartbeat_blockers, [])
+            };
+          } catch (e) {
+            console.warn(`[StuckTaskMonitor] 任务 ${rawTask.id} JSON 解析错误，跳过: ${e.message}`);
+            continue;
+          }
 
           // 检查该任务是否已在 10 分钟内被 LLM 推断过
           const recentInference = db.prepare(`
@@ -787,12 +906,13 @@ app.listen(PORT, () => {
           // 收集最近活动记录
           const recentContexts = Context.findRecentByAgent(agent.id, 15);
           const activityLines = recentContexts.map(c => {
-            const meta = typeof c.metadata === 'string' ? JSON.parse(c.metadata || '{}') : c.metadata;
+            const meta = typeof c.metadata === 'string' ? {} : c.metadata;
             return `[${c.created_at}] ${meta.type || 'activity'}: ${c.content.substring(0, 120)}`;
           }).join('\n');
 
           // 收集执行记录
-          const attemptLines = task.attempt_log.slice(-5).map((a, i) => {
+          const attemptsArray = Array.isArray(task.attempt_log) ? task.attempt_log : [];
+          const attemptLines = attemptsArray.slice(-5).map((a, i) => {
             return `${i + 1}. [${a.success ? '成功' : '失败'}] ${a.reason || ''} — ${a.output || ''}`;
           }).join('\n') || '无执行记录';
 

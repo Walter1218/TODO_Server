@@ -214,7 +214,11 @@ class AgentWorker {
       const oldBlockers = Array.isArray(task.heartbeat_blockers)
         ? task.heartbeat_blockers
         : JSON.parse(task.heartbeat_blockers || '[]');
-      const newLog = [...(task.attempt_log || []), {
+      // 安全解析 attempt_log，处理可能的 JSON 字符串
+      const attemptLog = Array.isArray(task.attempt_log) 
+        ? task.attempt_log 
+        : JSON.parse(task.attempt_log || '[]');
+      const newLog = [...attemptLog, {
         timestamp: new Date().toISOString(),
         success: false,
         reason: `Worker 自动恢复: 任务 blocked 但还有重试次数，触发第 ${currentAttempts + 1} 次尝试`,
@@ -559,7 +563,10 @@ class AgentWorker {
     const blockers = Array.isArray(task.heartbeat_blockers)
       ? task.heartbeat_blockers
       : JSON.parse(task.heartbeat_blockers || '[]');
-    const attempts = task.attempt_log || [];
+    // 安全解析 attempt_log，处理可能的 JSON 字符串
+    const attempts = Array.isArray(task.attempt_log) 
+      ? task.attempt_log 
+      : JSON.parse(task.attempt_log || '[]');
 
     let prompt = `你是 TODO Server 的智能体工作进程。你的职责是**实际执行任务**，而不是只汇报状态。\n\n`;
     prompt += `## 任务信息\n`;
@@ -576,9 +583,10 @@ class AgentWorker {
       prompt += `\n## 阻塞项\n${blockers.map(b => `- ${b}`).join('\n')}\n`;
     }
 
-    if (attempts.length > 0) {
+    const attemptsArray = Array.isArray(attempts) ? attempts : [];
+    if (attemptsArray.length > 0) {
       prompt += `\n## 历史尝试记录\n`;
-      attempts.slice(-3).forEach((a, i) => {
+      attemptsArray.slice(-3).forEach((a, i) => {
         prompt += `${i + 1}. [${a.success ? '成功' : '失败'}] ${a.reason || ''}\n`;
       });
     }

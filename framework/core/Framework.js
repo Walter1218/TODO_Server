@@ -1197,6 +1197,26 @@ ${checklist ? `验收标准：\n${checklist}\n` : ''}
   }
 
   /**
+   * 运行时切换 LLM Provider（快捷方法）
+   */
+  async swapLLMProvider(newConfig, options = {}) {
+    if (!this.modules.llmManager) {
+      throw new Error('LLM Manager 未初始化');
+    }
+    return this.modules.llmManager.swapProvider(newConfig, options);
+  }
+
+  /**
+   * 获取 LLM 状态
+   */
+  getLLMStatus() {
+    if (!this.modules.llmManager) {
+      return { hasProvider: false, primary: null, fallback: null };
+    }
+    return this.modules.llmManager.getStatus();
+  }
+
+  /**
    * 日志
    */
   log(message) {

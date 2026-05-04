@@ -11,6 +11,10 @@ class FocusState {
 
   static createOrUpdate(agentId, data) {
     const db = getDb();
+    if (data.focusMode && !['auto', 'manual', 'pinned'].includes(data.focusMode)) {
+      console.error(`[FocusState] 非法 focusMode 值: "${data.focusMode}" (agent: ${agentId})，已修正为 'auto'`);
+      data.focusMode = 'auto';
+    }
     const existing = this.findByAgent(agentId);
 
     if (existing) {

@@ -2,6 +2,20 @@ const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db');
 const Context = require('./Context');
 
+// 安全解析 JSON 字段，处理可能的非 JSON 格式
+const safeParseJson = (str, defaultValue = []) => {
+  if (!str) return defaultValue;
+  try {
+    return JSON.parse(str);
+  } catch {
+    // 如果不是 JSON，尝试作为逗号分隔字符串处理
+    if (typeof str === 'string' && !str.startsWith('[')) {
+      return str.split(',').map(s => s.trim()).filter(Boolean);
+    }
+    return defaultValue;
+  }
+};
+
 class Todo {
   static create(agentId, data) {
     const db = getDb();
@@ -66,10 +80,10 @@ class Todo {
     const todo = stmt.get(id, agentId);
 
     if (todo) {
-      todo.tags = JSON.parse(todo.tags || '[]');
-      todo.dependencies = JSON.parse(todo.dependencies || '[]');
-      todo.attempt_log = JSON.parse(todo.attempt_log || '[]');
-      todo.heartbeat_blockers = JSON.parse(todo.heartbeat_blockers || '[]');
+      todo.tags = safeParseJson(todo.tags);
+      todo.dependencies = safeParseJson(todo.dependencies);
+      todo.attempt_log = safeParseJson(todo.attempt_log);
+      todo.heartbeat_blockers = safeParseJson(todo.heartbeat_blockers);
     }
 
     return todo;
@@ -81,10 +95,10 @@ class Todo {
     const todo = stmt.get(agentId, title);
 
     if (todo) {
-      todo.tags = JSON.parse(todo.tags || '[]');
-      todo.dependencies = JSON.parse(todo.dependencies || '[]');
-      todo.attempt_log = JSON.parse(todo.attempt_log || '[]');
-      todo.heartbeat_blockers = JSON.parse(todo.heartbeat_blockers || '[]');
+      todo.tags = safeParseJson(todo.tags);
+      todo.dependencies = safeParseJson(todo.dependencies);
+      todo.attempt_log = safeParseJson(todo.attempt_log);
+      todo.heartbeat_blockers = safeParseJson(todo.heartbeat_blockers);
     }
 
     return todo;
@@ -149,10 +163,10 @@ class Todo {
 
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -185,7 +199,8 @@ class Todo {
       expectedDurationMinutes,
       validationReport,
       validatedBy,
-      validationCount
+      validationCount,
+      validationDeadline
     } = data;
 
     const updates = [];
@@ -323,6 +338,11 @@ class Todo {
       values.push(validationCount);
     }
 
+    if (validationDeadline !== undefined) {
+      updates.push('validation_deadline = ?');
+      values.push(validationDeadline);
+    }
+
     if (schedule !== undefined) {
       updates.push('schedule = ?');
       values.push(schedule);
@@ -396,13 +416,17 @@ class Todo {
     const stmt = db.prepare(`
       SELECT
         COUNT(*) as total,
-        SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) as cancelled,
-        SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) as blocked,
-        SUM(CASE WHEN priority = 'critical' AND status != 'completed' AND status != 'cancelled' THEN 1 ELSE 0 END) as critical_pending,
-        SUM(CASE WHEN priority = 'high' AND status != 'completed' AND status != 'cancelled' THEN 1 ELSE 0 END) as high_pending
+        SUM(CASE WHEN is_template = 0 THEN 1 ELSE 0 END) as active_tasks,
+        SUM(CASE WHEN status = 'pending' AND is_template = 0 THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'in_progress' AND is_template = 0 THEN 1 ELSE 0 END) as in_progress,
+        SUM(CASE WHEN status = 'completed' AND is_template = 0 THEN 1 ELSE 0 END) as completed,
+        SUM(CASE WHEN status = 'cancelled' AND is_template = 0 THEN 1 ELSE 0 END) as cancelled,
+        SUM(CASE WHEN status = 'blocked' AND is_template = 0 THEN 1 ELSE 0 END) as blocked,
+        SUM(CASE WHEN status = 'pending_validation' AND is_template = 0 THEN 1 ELSE 0 END) as pending_validation,
+        SUM(CASE WHEN status = 'validating' AND is_template = 0 THEN 1 ELSE 0 END) as validating,
+        SUM(CASE WHEN status = 'validation_failed' AND is_template = 0 THEN 1 ELSE 0 END) as validation_failed,
+        SUM(CASE WHEN priority = 'critical' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 THEN 1 ELSE 0 END) as critical_pending,
+        SUM(CASE WHEN priority = 'high' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 THEN 1 ELSE 0 END) as high_pending
       FROM todos
       WHERE agent_id = ?
     `);
@@ -424,8 +448,8 @@ class Todo {
 
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies)
     }));
   }
 
@@ -457,7 +481,7 @@ class Todo {
         const row = stmt.get(currentId, agentId);
 
         if (row) {
-          const deps = JSON.parse(row.dependencies || '[]');
+          const deps = safeParseJson(row.dependencies);
           for (const d of deps) {
             if (!visited.has(d)) {
               stack.push(d);
@@ -559,7 +583,7 @@ class Todo {
     const readyTasks = this.getReadyTasks(agentId);
     const criticalTasks = allTodos.filter(t => t.priority === 'critical' && t.status !== 'completed' && t.status !== 'cancelled');
 
-    const activeTasks = allTodos.filter(t => t.status === 'in_progress');
+    const activeTasks = allTodos.filter(t => ['in_progress', 'validating', 'pending_validation'].includes(t.status));
 
     const todosByProject = {};
     allTodos.forEach(todo => {
@@ -592,8 +616,8 @@ class Todo {
 
     return {
       overview: {
-        total: stats.total,
-        active: stats.pending + stats.in_progress,
+        total: stats.active_tasks || stats.total,
+        active: stats.pending + stats.in_progress + (stats.pending_validation || 0) + (stats.validating || 0),
         completed: stats.completed,
         blocked: blockedTasks.length
       },
@@ -693,7 +717,8 @@ class Todo {
       });
     }
 
-    if (stats.completed > 0 && stats.pending === 0 && stats.in_progress === 0) {
+    if (stats.completed > 0 && stats.pending === 0 && stats.in_progress === 0 && 
+        (stats.pending_validation || 0) === 0 && (stats.validating || 0) === 0) {
       suggestions.push({
         type: 'all_done',
         message: `🎉 所有任务已完成！`,
@@ -768,10 +793,10 @@ class Todo {
     const todos = stmt.all(agentId, parentId);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -806,10 +831,10 @@ class Todo {
     const todos = stmt.all(agentId, cutoff);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -820,15 +845,15 @@ class Todo {
     const db = getDb();
     const stmt = db.prepare(`
       SELECT * FROM todos
-      WHERE agent_id = ? AND status = 'in_progress'
+      WHERE agent_id = ? AND status IN ('in_progress', 'validating', 'pending_validation')
     `);
     const todos = stmt.all(agentId);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -837,7 +862,7 @@ class Todo {
     const cutoff = new Date(Date.now() - stallMinutes * 60 * 1000).toISOString();
     const stmt = db.prepare(`
       SELECT * FROM todos
-      WHERE agent_id = ? AND status = 'in_progress'
+      WHERE agent_id = ? AND status IN ('in_progress', 'validating', 'pending_validation')
         AND last_heartbeat IS NOT NULL
         AND last_heartbeat < ?
         AND (updated_at IS NULL OR updated_at < ?)
@@ -845,10 +870,10 @@ class Todo {
     const todos = stmt.all(agentId, cutoff, cutoff);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -882,10 +907,10 @@ class Todo {
     const todos = stmt.all(agentId);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -899,10 +924,10 @@ class Todo {
     const todos = stmt.all(agentId);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -959,10 +984,10 @@ class Todo {
     const todos = stmt.all(agentId);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -977,10 +1002,10 @@ class Todo {
     const todos = stmt.all(agentId, now);
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
@@ -1128,10 +1153,10 @@ class Todo {
     const todos = stmt.all(agentId, templateId, 'pending');
     return todos.map(todo => ({
       ...todo,
-      tags: JSON.parse(todo.tags || '[]'),
-      dependencies: JSON.parse(todo.dependencies || '[]'),
-      attempt_log: JSON.parse(todo.attempt_log || '[]'),
-      heartbeat_blockers: JSON.parse(todo.heartbeat_blockers || '[]')
+      tags: safeParseJson(todo.tags),
+      dependencies: safeParseJson(todo.dependencies),
+      attempt_log: safeParseJson(todo.attempt_log),
+      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
     }));
   }
 
