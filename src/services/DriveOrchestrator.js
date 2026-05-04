@@ -576,6 +576,44 @@ class DriveOrchestrator {
       }
     }
 
+    if (concurrent < this.maxConcurrentDrives) {
+      const limit = Math.max(0, this.maxConcurrentDrives - concurrent);
+      const unassignedTasks = db.prepare(`
+        SELECT * FROM todos
+        WHERE status = 'pending'
+          AND (assigned_agent_id IS NULL OR assigned_agent_id = '')
+          AND is_template = 0
+          AND archived = 0
+          AND (parent_id IS NULL OR parent_id = '')
+        ORDER BY
+          CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END,
+          created_at ASC
+        LIMIT ?
+      `).all(limit * 3);
+
+      for (const ut of unassignedTasks) {
+        if (concurrent >= this.maxConcurrentDrives) break;
+
+        let assignedAgent = null;
+        for (const agent of agents) {
+          const concurrency = Agent.canAcceptNewTask(agent.id);
+          if (concurrency.canAccept) {
+            assignedAgent = agent;
+            break;
+          }
+        }
+
+        if (assignedAgent) {
+          db.prepare(`UPDATE todos SET assigned_agent_id = ?, updated_at = datetime('now') WHERE id = ?`).run(assignedAgent.id, ut.id);
+          FocusState.setIfNone(assignedAgent.id, ut.id);
+          console.log(`[DriveOrchestrator] 自动分配未归属任务「${ut.title}」到 Agent ${assignedAgent.id}`);
+          Notification.create(assignedAgent.id, ut.id, 'assigned',
+            `任务「${ut.title}」已自动分配给 Agent ${assignedAgent.id}`
+          );
+        }
+      }
+    }
+
     if (totalDriven > 0 || totalStalled > 0) {
       console.log(`[DriveOrchestrator] tick 完成: 驱动 ${totalDriven} 个任务，${totalStalled} 个任务卡住`);
     }

@@ -1982,6 +1982,7 @@
                             </div>
                         </div>
                         ` : ''}
+                        ${t.completion_report ? this.renderCompletionReport(t.completion_report) : ''}
                         <div id="subtasks-${t.id}"></div>
                         <div class="detail-row">
                             <div class="detail-col">
@@ -2636,6 +2637,49 @@
                 blocked: '已卡住',
             };
             return map[status] || status;
+        },
+
+        renderCompletionReport(reportJson) {
+            try {
+                const report = typeof reportJson === 'string' ? JSON.parse(reportJson) : reportJson;
+                const typeLabels = { inspection: '🔍 巡检报告', script: '📋 脚本执行报告', code_change: '💻 代码变更报告', generic: '📝 任务报告' };
+                const typeLabel = typeLabels[report.type] || '📝 任务报告';
+                const overallEmoji = { healthy: '✅', warning: '⚠️', error: '❌', ok: '✅', critical: '🔴' };
+
+                let html = `<div class="detail-row"><div class="detail-col"><div class="detail-label">${typeLabel}</div><div class="detail-value">`;
+                html += `<div style="background:linear-gradient(135deg,#f0f9ff,#e0f2fe);border:1px solid #bae6fd;border-radius:10px;padding:14px;">`;
+
+                if (report.userSummary) {
+                    html += `<div style="background:#e0f2fe;padding:8px 12px;border-radius:6px;font-size:13px;color:#0c4a6e;margin-bottom:10px;"><strong>摘要:</strong> ${this.escape(report.userSummary)}</div>`;
+                }
+
+                if (report.overall) {
+                    html += `<div style="margin-bottom:8px;font-size:13px;">整体状态: <strong>${overallEmoji[report.overall] || ''} ${report.overall}</strong></div>`;
+                }
+
+                if (report.summary && !report.userSummary) {
+                    html += `<div style="background:#e0f2fe;padding:8px 12px;border-radius:6px;font-size:13px;color:#0c4a6e;margin-bottom:10px;">${this.escape(report.summary)}</div>`;
+                }
+
+                if (report.sections && report.sections.length > 0) {
+                    for (const sec of report.sections) {
+                        html += `<div style="margin-bottom:8px;"><div style="font-weight:600;font-size:13px;color:#0c4a6e;margin-bottom:4px;">${this.escape(sec.label)}</div><ul style="margin:0 0 0 18px;font-size:13px;color:#334155;">`;
+                        for (const item of sec.items) {
+                            html += `<li>${this.escape(item)}</li>`;
+                        }
+                        html += `</ul></div>`;
+                    }
+                }
+
+                if (report.generatedAt) {
+                    html += `<div style="font-size:11px;color:#94a3b8;margin-top:8px;">生成时间: ${this.formatDate(report.generatedAt)}</div>`;
+                }
+
+                html += `</div></div></div></div>`;
+                return html;
+            } catch (e) {
+                return '';
+            }
         },
 
         notifIcon(type) {

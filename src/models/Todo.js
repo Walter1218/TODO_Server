@@ -800,6 +800,32 @@ class Todo {
     }));
   }
 
+  static cancelOrphanChildren(agentId) {
+    const db = getDb();
+    const orphaned = db.prepare(`
+      SELECT t.id, t.title, t.parent_id FROM todos t
+      WHERE t.agent_id = ?
+        AND t.parent_id IS NOT NULL AND t.parent_id != ''
+        AND t.status IN ('blocked', 'in_progress', 'pending', 'validation_failed')
+        AND (t.archived IS NULL OR t.archived = 0)
+        AND (t.is_template IS NULL OR t.is_template = 0)
+    `).all(agentId);
+
+    let cancelled = 0;
+    for (const t of orphaned) {
+      const parent = db.prepare('SELECT status FROM todos WHERE id = ?').get(t.parent_id);
+      if (parent && parent.status === 'completed') {
+        db.prepare(`
+          UPDATE todos SET status = 'cancelled', updated_at = datetime('now'),
+            heartbeat_step = '父任务已完成，自动清理孤儿子任务'
+          WHERE id = ?
+        `).run(t.id);
+        cancelled++;
+      }
+    }
+    return cancelled;
+  }
+
   static checkAndCompleteParent(agentId, childId) {
     const db = getDb();
     const child = this.findById(agentId, childId);
@@ -956,6 +982,19 @@ class Todo {
       UPDATE todos SET archived = 1, updated_at = CURRENT_TIMESTAMP
       WHERE agent_id = ? AND status IN ('completed', 'cancelled')
         AND completed_at < ? AND (archived = 0 OR archived IS NULL)
+    `);
+    const result = stmt.run(agentId, cutoff);
+    return result.changes;
+  }
+
+  static cancelStalePending(agentId, hoursOld = 48) {
+    const db = getDb();
+    const cutoff = new Date(Date.now() - hoursOld * 60 * 60 * 1000).toISOString();
+    const stmt = db.prepare(`
+      UPDATE todos SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+      WHERE agent_id = ? AND status = 'pending'
+        AND created_at < ? AND (parent_id IS NULL OR parent_id = '')
+        AND (is_template = 0 OR is_template IS NULL)
     `);
     const result = stmt.run(agentId, cutoff);
     return result.changes;

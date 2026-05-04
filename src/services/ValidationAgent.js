@@ -13,6 +13,9 @@ const MAX_OUTPUT_LENGTH = 1000;
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 
+const TUSHARE_DATA_DIR = process.env.TUSHARE_DATA_DIR || '/Users/onetwo/.openclaw/workspace/tushare_warehouse/data/';
+const BACKUP_DIR = process.env.BACKUP_DIR || '/Users/onetwo/a_share_warehouse/backups';
+
 const DANGEROUS_PATTERNS = [
   /\brm\s+(-\w*\s+)*\//,
   /\bdel\s+/i,
@@ -131,6 +134,12 @@ const SYSTEM_PROMPT = `You are a rigorous QA validation agent. Your job is to ve
 - Backup files expected by the task are missing
 - Script outputs show errors
 
+## Warning Tolerance (Important)
+- For inspection tasks: warning status with 0 errors is NORMAL, NOT a failure
+- Data lag during holidays (五一, 国庆, etc.) is expected behavior, not a system fault
+- If the task reports "overall: warning" but no critical errors, mark it as PASS (score >= 75)
+- Only mark as FAIL if there are actual data integrity issues or missing tables
+
 ## Convergence Rules (Important)
 - Rounds 1–2: Check task requirements + verify most critical data artifact.
 - Rounds 3–4: Cross-check secondary artifacts (files, DBs).
@@ -168,7 +177,8 @@ class ValidationAgent {
     const combined = titleLower + ' ' + descLower;
 
     if (!hasAttempted) {
-      console.log(`[ValidationAgent] 快速路径: attempt_count=0，检查 description 结果证据`);
+      const taskCategory = task.task_category || 'general';
+      console.log(`[ValidationAgent] 快速路径: attempt_count=0, category=${taskCategory}，检查 description 结果证据`);
 
       const hasResultInDesc = descLower.includes('整体状态') ||
         descLower.includes('overall') ||
@@ -197,7 +207,6 @@ class ValidationAgent {
       const quickEvidence = [];
 
       try {
-        const TUSHARE_DATA_DIR = '/Users/onetwo/.openclaw/workspace/tushare_warehouse/data/';
         if (combined.includes('duckdb') || combined.includes('数据') || combined.includes('巡检') || combined.includes('tushare')) {
           if (fs.existsSync(TUSHARE_DATA_DIR)) {
             const duckdbFiles = fs.readdirSync(TUSHARE_DATA_DIR).filter(f => f.endsWith('.duckdb'));
@@ -207,15 +216,14 @@ class ValidationAgent {
           }
         }
         if (combined.includes('backup') || combined.includes('备份') || combined.includes('sync') || combined.includes('同步')) {
-          const backupDir = path.resolve('/Users/onetwo/a_share_warehouse/backups');
-          if (fs.existsSync(backupDir)) {
-            const backups = fs.readdirSync(backupDir);
-            quickEvidence.push({ tool: 'check_file', args: { path: backupDir }, result: JSON.stringify({ exists: true, backupCount: backups.length, latest: backups.sort().pop() }).substring(0, MAX_OUTPUT_LENGTH) });
+          if (fs.existsSync(BACKUP_DIR)) {
+            const backups = fs.readdirSync(BACKUP_DIR);
+            quickEvidence.push({ tool: 'check_file', args: { path: BACKUP_DIR }, result: JSON.stringify({ exists: true, backupCount: backups.length, latest: backups.sort().pop() }).substring(0, MAX_OUTPUT_LENGTH) });
           }
-          const syncDataDir = path.resolve('/Users/onetwo/.openclaw/workspace/tushare_warehouse/data');
+          const syncDataDir = path.resolve(TUSHARE_DATA_DIR);
           if (fs.existsSync(syncDataDir)) {
-            const res = await this._checkFile({ path: syncDataDir });
-            quickEvidence.push({ tool: 'check_file', args: { path: syncDataDir }, result: JSON.stringify(res).substring(0, MAX_OUTPUT_LENGTH) });
+            const syncRes = await this._checkFile({ path: syncDataDir });
+            quickEvidence.push({ tool: 'check_file', args: { path: syncDataDir }, result: JSON.stringify(syncRes).substring(0, MAX_OUTPUT_LENGTH) });
           }
         }
         if (quickEvidence.length > 0) {

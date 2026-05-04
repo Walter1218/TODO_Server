@@ -46,7 +46,8 @@ class TaskReportService {
         assignedAgentId: task.assigned_agent_id,
         tags: task.tags || [],
         acceptanceCriteria: task.acceptance_criteria || null,
-        criteriaConfirmed: task.criteria_confirmed === 1
+        criteriaConfirmed: task.criteria_confirmed === 1,
+        completionReport: task.completion_report || null
       }
     };
   }
@@ -337,6 +338,28 @@ class TaskReportService {
       md += `\n`;
       md += `- 验证次数: ${validation.validationCount}\n`;
       md += `- 最终验证者: ${validation.validatedBy || '-'}\n\n`;
+    }
+
+    const completionReport = report.basic.completionReport;
+    if (completionReport) {
+      try {
+        const cr = typeof completionReport === 'string' ? JSON.parse(completionReport) : completionReport;
+        md += `## 完成报告\n\n`;
+        if (cr.type) md += `- 类型: ${cr.type}\n`;
+        if (cr.userSummary) md += `- 摘要: ${cr.userSummary}\n`;
+        if (cr.summary) md += `- ${cr.summary}\n`;
+        if (cr.overall) md += `- 整体状态: ${cr.overall}\n`;
+        md += `\n`;
+        if (cr.sections && cr.sections.length > 0) {
+          for (const sec of cr.sections) {
+            md += `**${sec.label}**\n`;
+            for (const item of sec.items) {
+              md += `- ${item}\n`;
+            }
+            md += `\n`;
+          }
+        }
+      } catch (e) {}
     }
 
     if (timeline.length > 0) {

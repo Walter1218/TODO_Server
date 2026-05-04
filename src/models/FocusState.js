@@ -9,6 +9,12 @@ class FocusState {
     return stmt.get(agentId);
   }
 
+  static setIfNone(agentId, taskId) {
+    const existing = this.findByAgent(agentId);
+    if (existing && existing.current_task_id) return existing;
+    return this.createOrUpdate(agentId, { currentTaskId: taskId, focusMode: 'manual' });
+  }
+
   static createOrUpdate(agentId, data) {
     const db = getDb();
     if (data.focusMode && !['auto', 'manual', 'pinned'].includes(data.focusMode)) {

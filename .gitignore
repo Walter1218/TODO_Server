@@ -46,3 +46,4 @@ debug-*.js
 # API密钥（使用config.example.json）
 # API密钥（使用config.example.json）
 # 不要提交包含真实密钥的配置文件
+data.todo.db

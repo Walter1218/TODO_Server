@@ -542,14 +542,17 @@ app.listen(PORT, () => {
 
   console.log(`[StuckTaskMonitor] 已启动，每 ${STUCK_CHECK_INTERVAL_MS / 1000}s 检查一次，无心跳阈值 ${STUCK_MAX_IDLE_MINUTES} 分钟，进度停滞阈值 ${PROGRESS_STALL_MINUTES} 分钟`);
 
-  // 自动归档旧任务：每天归档一次超过 30 天的 completed/cancelled 任务
+  // 自动归档旧任务：每天归档一次超过 30 天的 completed/cancelled 任务 + 清理超时 pending
   const ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
   const ARCHIVE_DAYS_OLD = 30;
+  const STALE_PENDING_HOURS = 48;
 
   setInterval(() => {
     try {
       const agents = Agent.findAll();
       let totalArchived = 0;
+      let totalCancelled = 0;
+      let totalOrphans = 0;
 
       for (const agent of agents) {
         const archived = Todo.archiveOldCompleted(agent.id, ARCHIVE_DAYS_OLD);
@@ -557,17 +560,29 @@ app.listen(PORT, () => {
           console.log(`[CleanupMonitor] Agent ${agent.id}: 归档了 ${archived} 个超过 ${ARCHIVE_DAYS_OLD} 天的旧任务`);
           totalArchived += archived;
         }
+
+        const cancelled = Todo.cancelStalePending(agent.id, STALE_PENDING_HOURS);
+        if (cancelled > 0) {
+          console.log(`[CleanupMonitor] Agent ${agent.id}: 取消了 ${cancelled} 个超过 ${STALE_PENDING_HOURS}h 的 pending 任务`);
+          totalCancelled += cancelled;
+        }
+
+        const orphans = Todo.cancelOrphanChildren(agent.id);
+        if (orphans > 0) {
+          console.log(`[CleanupMonitor] Agent ${agent.id}: 清理了 ${orphans} 个孤儿子任务（父任务已完成）`);
+          totalOrphans += orphans;
+        }
       }
 
-      if (totalArchived > 0) {
-        console.log(`[CleanupMonitor] 本次共归档 ${totalArchived} 个旧任务`);
+      if (totalArchived > 0 || totalCancelled > 0 || totalOrphans > 0) {
+        console.log(`[CleanupMonitor] 本次: 归档 ${totalArchived}, 取消过期 ${totalCancelled}, 清理孤儿 ${totalOrphans}`);
       }
     } catch (err) {
       console.error('[CleanupMonitor] 归档旧任务时出错:', err.message);
     }
   }, ARCHIVE_INTERVAL_MS);
 
-  console.log(`[CleanupMonitor] 已启动，每 ${ARCHIVE_INTERVAL_MS / 1000 / 60 / 60}h 归档一次，阈值 ${ARCHIVE_DAYS_OLD} 天`);
+  console.log(`[CleanupMonitor] 已启动，每 ${ARCHIVE_INTERVAL_MS / 1000 / 60 / 60}h 清理一次，归档阈值 ${ARCHIVE_DAYS_OLD} 天，pending 过期 ${STALE_PENDING_HOURS}h`);
 
   // 定时调度任务引擎：每分钟检查到期的模板任务并生成实例
   const SCHEDULER_INTERVAL_MS = 60 * 1000;
@@ -1010,6 +1025,24 @@ ${attemptLines}
                 console.log(`[LLMInferencer] 任务 ${task.id} 自动标记为 completed`);
 
               } else if (suggestedStatus === 'blocked' && isWorking === false) {
+                const taskDesc = (task.description || '').toLowerCase();
+                const hasResultEvidence = taskDesc.includes('整体状态') ||
+                  taskDesc.includes('overall') ||
+                  taskDesc.includes('巡检汇总') ||
+                  taskDesc.includes('巡检结果') ||
+                  taskDesc.includes('healthy') ||
+                  (taskDesc.includes('warning') && taskDesc.includes('滞后')) ||
+                  (taskDesc.includes('duckdb') && taskDesc.includes('行'));
+                if (hasResultEvidence) {
+                  Todo.update(agent.id, task.id, {
+                    status: 'completed',
+                    heartbeatStep: 'LLM 推断完成（description 包含结果证据）：' + (inference.reason || '')
+                  });
+                  Notification.create(agent.id, task.id, 'completed',
+                    `任务「${task.title}」被标记为已完成（description 包含巡检结果/执行报告）`
+                  );
+                  console.log(`[LLMInferencer] 任务 ${task.id} description 包含结果证据，标记为 completed 而非 blocked`);
+                } else {
                 // LLM 判断任务已卡住，提前标记 blocked
                 const newLog = [...task.attempt_log, {
                   timestamp: new Date().toISOString(),
@@ -1027,6 +1060,7 @@ ${attemptLines}
                   `任务「${task.title}」被 LLM 推断为已卡住（置信度 ${Math.round(confidence * 100)}%），原因：${inference.reason || ''}`
                 );
                 console.log(`[LLMInferencer] 任务 ${task.id} 提前标记为 blocked`);
+                }
 
               } else if (isWorking === true && inference.current_action) {
                 // LLM 判断仍在工作，更新心跳步骤

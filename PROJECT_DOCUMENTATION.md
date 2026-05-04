@@ -25,6 +25,9 @@
 - **Agent-to-Agent 自驱校验**：Worker 执行，Validator 验收，Orchestrator 编排，彻底跳出 Human-in-the-loop（支持第三方 Agent 独立验证）
 - **LLM Agent Loop**：`ValidationAgent` 采用多轮工具调用（ReAct 模式）独立验证任务，最多 10 轮迭代，支持 RESULT-FIRST 验证策略、事实快速路径、系统日志过滤、收敛规则和强制判定兜底
 - **结构化驱动工具**：`StructuredDriveTools` 提供 `updateProgress`、`proposeCompletion`、`confirmCompletion`、`askForHelp` 等结构化工具，替代脆弱的文本解析
+- **任务分类与完成报告**：`task_category` 自动分类（inspection/script/code_change/general），`CompletionReportBuilder` 自动生成详细完成报告（数据位置、时间覆盖、完成度、产出物列表等）
+- **孤儿子任务自动清理**：CleanupMonitor 自动检测父任务已完成但子任务仍在 pending/in_progress/blocked 的孤儿子任务并取消
+- **Per-Agent 并发控制**：每个 Agent 可配置最大并发任务数（`max_concurrent_tasks`），Dispatch 全流程检查并发槽位
 - **LLM Provider 热插拔**：运行时通过 API 切换 LLM Provider（OpenAI / Anthropic / MiniMax / Ollama），无需重启服务，支持主备自动切换
 
 ### 1.3 技术栈
@@ -66,6 +69,7 @@ TODO_Server/
 │       ├── ValidatorService.js   # Agent-to-Agent 自动化校验服务
 │       ├── ValidationAgent.js    # 内嵌验证智能体（LLM + 工具调用）
 │       ├── ValidationDispatchService.js # 第三方验证任务派发服务
+│       ├── CompletionReportBuilder.js   # 任务完成报告生成器（按类型自动构建）
 │       └── TaskReportService.js  # 任务流程报告生成服务
 ├── sdk/
 │   └── agent-todo-sdk.js         # JavaScript SDK（完整 CRUD + 协作 + 调度）
@@ -197,6 +201,8 @@ npm run setup:hermes
 - 4 级优先级：`critical` / `high` / `medium` / `low`
 - 标签系统、上下文字段、位置排序
 - 子任务（`parent_id`）+ 自动完成父任务检测
+- 任务自动分类（`task_category`：inspection/script/code_change/general）
+- 任务完成报告（`completion_report`：按类型自动生成详细报告）
 - 任务搜索（标题/描述/上下文模糊匹配）
 
 ### 4.2 依赖管理
@@ -280,7 +286,7 @@ POST /api/agents/:id/focus/auto
 | DailyScheduler | 60s | 检查到期的模板任务并生成实例 |
 | CronExecutionMonitor | 60s | 检测未按时启动的定时实例 |
 | AssignmentDriver | 60s | 自动聚焦已指派但未执行的任务 |
-| CleanupMonitor | 24h | 归档超过 30 天的 completed/cancelled 任务 |
+| CleanupMonitor | 24h | 归档超过 30 天的 completed/cancelled 任务 + 取消超 48h 过期 pending 任务 + 清理孤儿子任务（父任务已完成） |
 
 ---
 

@@ -15,6 +15,7 @@
 
 const Todo = require('../models/Todo');
 const Context = require('../models/Context');
+const CompletionReportBuilder = require('../services/CompletionReportBuilder');
 
 const TOOL_DEFINITIONS = [
   {
@@ -70,6 +71,18 @@ const TOOL_DEFINITIONS = [
           evidence: {
             type: "string",
             description: "验收证据，说明如何验证每条标准"
+          },
+          completionDetails: {
+            type: "object",
+            description: "详细完成信息（可选，用于生成用户可见的完成报告）",
+            properties: {
+              dataLocation: { type: "string", description: "产出物位置（如数据文件路径、代码文件路径、报告链接等）" },
+              timeCoverage: { type: "string", description: "数据时间覆盖范围（如 '2024-01-01 至 2024-04-30'）" },
+              completionRate: { type: "string", description: "完成度（如 '100%' 或 '15/16 表完成'）" },
+              missingData: { type: "string", description: "缺失数据说明（如 '2 个交易日数据延迟'）" },
+              summary: { type: "string", description: "一句话概括完成结果" },
+              artifacts: { type: "array", items: { type: "string" }, description: "产出物列表（文件路径、URL等）" }
+            }
           }
         },
         required: ["summary"]
@@ -100,6 +113,18 @@ const TOOL_DEFINITIONS = [
           evidence: {
             type: "string",
             description: "验收证据（可选）"
+          },
+          completionDetails: {
+            type: "object",
+            description: "详细完成信息（可选）",
+            properties: {
+              dataLocation: { type: "string", description: "产出物位置" },
+              timeCoverage: { type: "string", description: "数据时间覆盖范围" },
+              completionRate: { type: "string", description: "完成度" },
+              missingData: { type: "string", description: "缺失数据说明" },
+              summary: { type: "string", description: "一句话概括" },
+              artifacts: { type: "array", items: { type: "string" }, description: "产出物列表" }
+            }
           }
         },
         required: ["summary", "reason"]
@@ -185,6 +210,33 @@ function buildStructuredDrivePrompt(task, opts = {}) {
   return lines.join('\n');
 }
 
+function mergeCompletionReport(autoReport, userDetails, userSummary) {
+  const report = { ...autoReport };
+  if (userDetails) {
+    if (!report.sections) report.sections = [];
+    if (userDetails.dataLocation) {
+      report.sections.push({ label: '产出位置', items: [userDetails.dataLocation] });
+    }
+    if (userDetails.timeCoverage) {
+      report.sections.push({ label: '时间覆盖', items: [userDetails.timeCoverage] });
+    }
+    if (userDetails.completionRate) {
+      report.sections.push({ label: '完成度', items: [userDetails.completionRate] });
+    }
+    if (userDetails.missingData) {
+      report.sections.push({ label: '数据缺失', items: [userDetails.missingData] });
+    }
+    if (userDetails.artifacts && userDetails.artifacts.length > 0) {
+      report.sections.push({ label: '产出物', items: userDetails.artifacts });
+    }
+  }
+  if (userSummary) {
+    report.userSummary = userSummary;
+  }
+  report.generatedAt = new Date().toISOString();
+  return report;
+}
+
 async function executeToolCall(toolCall, agentId, taskId, sessionId) {
   const { name, arguments: rawArgs } = toolCall.function || toolCall;
   const args = typeof rawArgs === 'string' ? JSON.parse(rawArgs) : rawArgs;
@@ -254,7 +306,10 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
   }
 
   if (name === 'proposeCompletion') {
-    const { summary, criteriaMet, evidence } = args;
+    const { summary, criteriaMet, evidence, completionDetails } = args;
+
+    const autoReport = CompletionReportBuilder.build(task, agentId);
+    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary);
 
     const criteriaText = Array.isArray(criteriaMet) && criteriaMet.length > 0
       ? `验收标准满足情况：\n${criteriaMet.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
@@ -270,6 +325,8 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       heartbeatStep: '🧾 已提交验收申请（待自动校验）'
     });
 
+    CompletionReportBuilder.storeReport(taskId, agentId, finalReport);
+
     if (criteriaText) {
       Todo.update(agentId, taskId, { context: criteriaText });
     }
@@ -278,19 +335,23 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       sessionId: sessionId || 'completion-proposal',
       role: 'system',
       content: `[proposeCompletion] 任务「${task.title}」提交验收申请，criteriaMet=${JSON.stringify(criteriaMet || [])}`,
-      metadata: { type: 'task_completion_proposal', task_id: taskId, criteria_met: criteriaMet || [] }
+      metadata: { type: 'task_completion_proposal', task_id: taskId, criteria_met: criteriaMet || [], completion_report: finalReport }
     });
 
     return {
       success: true,
       action: 'task_pending_validation',
       summary,
+      completionReport: finalReport,
       criteriaMet: criteriaMet || []
     };
   }
 
   if (name === 'confirmCompletion') {
-    const { summary, reason, criteriaMet, evidence } = args;
+    const { summary, reason, criteriaMet, evidence, completionDetails } = args;
+
+    const autoReport = CompletionReportBuilder.build(task, agentId);
+    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary);
 
     const criteriaText = Array.isArray(criteriaMet) && criteriaMet.length > 0
       ? `验收标准满足情况：\n${criteriaMet.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
@@ -306,6 +367,8 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       heartbeatStep: '✅ 已完成（强制完成）'
     });
 
+    CompletionReportBuilder.storeReport(taskId, agentId, finalReport);
+
     if (criteriaText) {
       Todo.update(agentId, taskId, { context: criteriaText });
     }
@@ -314,13 +377,14 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       sessionId: sessionId || 'confirm-completion',
       role: 'system',
       content: `[confirmCompletion] 任务「${task.title}」被强制标记为完成，reason=${reason || ''}`,
-      metadata: { type: 'task_force_completion', task_id: taskId, reason: reason || '', criteria_met: criteriaMet || [] }
+      metadata: { type: 'task_force_completion', task_id: taskId, reason: reason || '', criteria_met: criteriaMet || [], completion_report: finalReport }
     });
 
     return {
       success: true,
       action: 'task_force_completed',
       summary,
+      completionReport: finalReport,
       reason: reason || '',
       criteriaMet: criteriaMet || []
     };

@@ -410,6 +410,32 @@ function initializeSchema() {
   try {
     db.prepare(`UPDATE agents SET max_concurrent_tasks = 5 WHERE max_concurrent_tasks IS NULL`).run();
   } catch (e) {}
+
+  try {
+    db.prepare(`ALTER TABLE todos ADD COLUMN task_category TEXT DEFAULT 'general'`).run();
+    console.log('[DB] Migration: todos.task_category added (default general)');
+  } catch (e) {}
+
+  try {
+    const todoRows = db.prepare(`SELECT id, title, description FROM todos WHERE task_category IS NULL OR task_category = 'general'`).all();
+    for (const row of todoRows) {
+      const combined = ((row.title || '') + ' ' + (row.description || '')).toLowerCase();
+      let category = 'general';
+      if (combined.includes('巡检') || combined.includes('inspection') || combined.includes('质量检查') || combined.includes('monitor')) {
+        category = 'inspection';
+      } else if (combined.includes('备份') || combined.includes('backup') || combined.includes('同步') || combined.includes('sync') || combined.includes('tushare')) {
+        category = 'script';
+      } else if (combined.includes('fix') || combined.includes('修复') || combined.includes('调整') || combined.includes('优化')) {
+        category = 'code_change';
+      }
+      db.prepare(`UPDATE todos SET task_category = ? WHERE id = ?`).run(category, row.id);
+    }
+  } catch (e) {}
+
+  try {
+    db.prepare(`ALTER TABLE todos ADD COLUMN completion_report TEXT`).run();
+    console.log('[DB] Migration: todos.completion_report added');
+  } catch (e) {}
 }
 
 module.exports = { getDb };
