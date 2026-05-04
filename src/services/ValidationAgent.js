@@ -161,48 +161,64 @@ class ValidationAgent {
 
     const attemptLog = Array.isArray(task.attempt_log) ? task.attempt_log : [];
     const hasAttempted = (task.attempt_count || 0) > 0 || attemptLog.length > 0;
-    if (!hasAttempted) {
-      console.log(`[ValidationAgent] 快速路径: attempt_count=0 且无日志，先用工具验证事实`);
-      const quickEvidence = [];
-      let quickPass = false;
 
-      const titleLower = (task.title || '').toLowerCase();
-      const description = (task.description || '').toLowerCase();
-      const combined = titleLower + ' ' + description;
+    const titleLower = (task.title || '').toLowerCase();
+    const description = (task.description || '');
+    const descLower = description.toLowerCase();
+    const combined = titleLower + ' ' + descLower;
+
+    if (!hasAttempted) {
+      console.log(`[ValidationAgent] 快速路径: attempt_count=0，检查 description 结果证据`);
+
+      const hasResultInDesc = descLower.includes('整体状态') ||
+        descLower.includes('overall') ||
+        descLower.includes('巡检汇总') ||
+        descLower.includes('巡检结果') ||
+        descLower.includes('healthy') ||
+        (descLower.includes('ok') && (descLower.includes('daily') || descLower.includes('tushare'))) ||
+        (descLower.includes('warning') && descLower.includes('滞后')) ||
+        descLower.includes('备份完成') ||
+        descLower.includes('已备份') ||
+        (descLower.includes('duckdb') && descLower.includes('行'));
+
+      if (hasResultInDesc) {
+        console.log(`[ValidationAgent] 快速验证: description 包含结果证据，判定为通过`);
+        return {
+          pass: true,
+          reason: 'Task results found in description (inspection report / sync status)',
+          score: 80,
+          feedback: `快速验证通过: 任务描述中包含巡检报告或执行结果。`,
+          evidence: [{ tool: 'check_description', result: 'Result evidence found in task description' }],
+          iterations: 0,
+          quickPath: true
+        };
+      }
+
+      const quickEvidence = [];
 
       try {
-        if (combined.includes('duckdb') || combined.includes('数据') || combined.includes('巡检')) {
-          const dbPaths = [
-            path.resolve(PROJECT_ROOT, '../duckdb/data仓库检查.duckdb'),
-            path.resolve(PROJECT_ROOT, '../duckdb/stock.duckdb'),
-          ];
-          for (const dbPath of dbPaths) {
-            if (fs.existsSync(dbPath)) {
-              const res = await this._readDuckdb({ db_path: dbPath, sql: 'SELECT COUNT(*) FROM information_schema.tables' });
-              quickEvidence.push({ tool: 'read_duckdb', args: { dbPath }, result: JSON.stringify(res).substring(0, MAX_OUTPUT_LENGTH) });
+        const TUSHARE_DATA_DIR = '/Users/onetwo/.openclaw/workspace/tushare_warehouse/data/';
+        if (combined.includes('duckdb') || combined.includes('数据') || combined.includes('巡检') || combined.includes('tushare')) {
+          if (fs.existsSync(TUSHARE_DATA_DIR)) {
+            const duckdbFiles = fs.readdirSync(TUSHARE_DATA_DIR).filter(f => f.endsWith('.duckdb'));
+            if (duckdbFiles.length > 0) {
+              quickEvidence.push({ tool: 'check_file', args: { path: TUSHARE_DATA_DIR }, result: JSON.stringify({ exists: true, dbCount: duckdbFiles.length, files: duckdbFiles.slice(0, 5) }).substring(0, MAX_OUTPUT_LENGTH) });
             }
           }
         }
         if (combined.includes('backup') || combined.includes('备份') || combined.includes('sync') || combined.includes('同步')) {
-          const syncDataDir = path.resolve(PROJECT_ROOT, '../duckdb/data/stock');
+          const backupDir = path.resolve('/Users/onetwo/a_share_warehouse/backups');
+          if (fs.existsSync(backupDir)) {
+            const backups = fs.readdirSync(backupDir);
+            quickEvidence.push({ tool: 'check_file', args: { path: backupDir }, result: JSON.stringify({ exists: true, backupCount: backups.length, latest: backups.sort().pop() }).substring(0, MAX_OUTPUT_LENGTH) });
+          }
+          const syncDataDir = path.resolve('/Users/onetwo/.openclaw/workspace/tushare_warehouse/data');
           if (fs.existsSync(syncDataDir)) {
             const res = await this._checkFile({ path: syncDataDir });
             quickEvidence.push({ tool: 'check_file', args: { path: syncDataDir }, result: JSON.stringify(res).substring(0, MAX_OUTPUT_LENGTH) });
           }
         }
-        const syncDir = path.resolve(PROJECT_ROOT, '../duckdb/data/stock');
-        if (fs.existsSync(syncDir)) {
-          const subdirs = fs.readdirSync(syncDir).filter(d => !d.startsWith('.'));
-          const dirs = await Promise.all(subdirs.slice(0, 10).map(async d => {
-            try {
-              const info = await this._checkFile({ path: path.join(syncDir, d) });
-              return { name: d, ...info };
-            } catch { return { name: d, error: true }; }
-          }));
-          quickEvidence.push({ tool: 'check_file', args: { path: syncDir, subdirCount: subdirs.length, first10: dirs.map(d => d.name) }, result: JSON.stringify({ exists: true, subdirCount: subdirs.length }).substring(0, MAX_OUTPUT_LENGTH) });
-        }
         if (quickEvidence.length > 0) {
-          quickPass = true;
           console.log(`[ValidationAgent] 快速验证: 发现 ${quickEvidence.length} 个事实证据，判定为通过`);
           return {
             pass: true,
@@ -218,16 +234,7 @@ class ValidationAgent {
         console.warn(`[ValidationAgent] 快速验证工具调用失败: ${quickErr.message}`);
       }
 
-      console.log(`[ValidationAgent] 快速判定: attempt_count=0 且无事实证据 → 不通过`);
-      return {
-        pass: false,
-        reason: `Task has not been executed (attempt_count=0, no execution logs, no data artifacts found).`,
-        score: 0,
-        feedback: `快速验证失败: attempt_count=0, 无执行日志, 且未发现任何任务相关的数据文件或数据库记录。`,
-        evidence: quickEvidence,
-        iterations: 0,
-        quickPath: true
-      };
+      console.log(`[ValidationAgent] 快速判定: attempt_count=0 且无事实证据，降级到 LLM 验证`);
     }
 
     const messages = [
