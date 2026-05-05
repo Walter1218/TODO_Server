@@ -1088,15 +1088,17 @@ class Todo {
 
     const newId = uuidv4();
     const assignedAt = template.assigned_agent_id ? new Date().toISOString() : null;
+    const taskCategory = template.task_category || 'general';
     const stmt = db.prepare(`
       INSERT INTO todos (
         id, agent_id, project_id, parent_id, title, description, priority,
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
-        origin_agent_id, assigned_agent_id, assigned_at, schedule, is_template, status, created_at, updated_at,
+        origin_agent_id, assigned_agent_id, assigned_at, schedule, is_template, status,
+        task_category, created_at, updated_at,
         transferred_from
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
     `);
 
     stmt.run(
@@ -1105,6 +1107,7 @@ class Todo {
       template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
       template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
       agentId, template.assigned_agent_id || null, assignedAt, null, 0, 'pending',
+      taskCategory,
       replacedTask ? replacedTask.id : (replacesId || null)
     );
 

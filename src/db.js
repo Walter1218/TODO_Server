@@ -436,6 +436,94 @@ function initializeSchema() {
     db.prepare(`ALTER TABLE todos ADD COLUMN completion_report TEXT`).run();
     console.log('[DB] Migration: todos.completion_report added');
   } catch (e) {}
+
+  try {
+    const tblInfo = db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='todos'").get();
+    if (tblInfo && tblInfo.sql && !tblInfo.sql.includes("'failed'")) {
+      console.log('[DB] Migration: Adding failed/validating to todos status CHECK...');
+      const ALL_STATUSES = "('pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed', 'validating', 'failed')";
+      const cols = [
+        'id', 'agent_id', 'project_id', 'parent_id', 'title', 'description', 'status', 'priority',
+        'context', 'tags', 'dependencies', 'acceptance_criteria', 'criteria_confirmed',
+        'max_attempts', 'attempt_count', 'attempt_log', 'last_heartbeat',
+        'heartbeat_progress', 'heartbeat_step', 'heartbeat_blockers', 'position',
+        'created_at', 'updated_at', 'completed_at', 'expected_duration_minutes',
+        'schedule', 'is_template', 'origin_agent_id', 'assigned_agent_id',
+        'assignment_note', 'assigned_at', 'transferred_from', 'archived',
+        'next_due_at', 'last_spawned_at', 'last_driven_at',
+        'validation_report', 'validated_by', 'validation_count', 'validation_deadline',
+        'task_category', 'completion_report'
+      ];
+      const colList = cols.join(', ');
+      db.exec(`
+        PRAGMA foreign_keys=OFF;
+        BEGIN TRANSACTION;
+        CREATE TABLE todos_new (
+          id TEXT PRIMARY KEY,
+          agent_id TEXT NOT NULL,
+          project_id TEXT,
+          parent_id TEXT,
+          title TEXT NOT NULL,
+          description TEXT DEFAULT '',
+          status TEXT DEFAULT 'pending' CHECK(status IN ${ALL_STATUSES}),
+          priority TEXT DEFAULT 'medium' CHECK(priority IN ('low', 'medium', 'high', 'critical')),
+          context TEXT DEFAULT '',
+          tags TEXT DEFAULT '[]',
+          dependencies TEXT DEFAULT '[]',
+          acceptance_criteria TEXT DEFAULT '',
+          criteria_confirmed BOOLEAN DEFAULT false,
+          max_attempts INTEGER DEFAULT 3,
+          attempt_count INTEGER DEFAULT 0,
+          attempt_log TEXT DEFAULT '[]',
+          last_heartbeat DATETIME,
+          heartbeat_progress REAL DEFAULT 0,
+          heartbeat_step TEXT DEFAULT '',
+          heartbeat_blockers TEXT DEFAULT '[]',
+          position INTEGER DEFAULT 0,
+          created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+          completed_at DATETIME,
+          expected_duration_minutes INTEGER,
+          schedule TEXT,
+          is_template BOOLEAN DEFAULT 0,
+          origin_agent_id TEXT,
+          assigned_agent_id TEXT,
+          assignment_note TEXT DEFAULT '',
+          assigned_at DATETIME,
+          transferred_from TEXT,
+          archived BOOLEAN DEFAULT 0,
+          next_due_at DATETIME,
+          last_spawned_at DATETIME,
+          last_driven_at DATETIME,
+          validation_report TEXT,
+          validated_by TEXT,
+          validation_count INTEGER DEFAULT 0,
+          validation_deadline DATETIME,
+          task_category TEXT DEFAULT 'general',
+          completion_report TEXT,
+          FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+          FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
+          FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
+        );
+        INSERT INTO todos_new (${colList})
+        SELECT ${colList} FROM todos;
+        DROP TABLE todos;
+        ALTER TABLE todos_new RENAME TO todos;
+        CREATE INDEX IF NOT EXISTS idx_todos_agent_id ON todos(agent_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_project_id ON todos(project_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_status ON todos(status);
+        CREATE INDEX IF NOT EXISTS idx_todos_priority ON todos(priority);
+        CREATE INDEX IF NOT EXISTS idx_todos_created_at ON todos(created_at);
+        CREATE INDEX IF NOT EXISTS idx_todos_parent_id ON todos(parent_id);
+        CREATE INDEX IF NOT EXISTS idx_todos_template_due ON todos(is_template, next_due_at);
+        COMMIT;
+        PRAGMA foreign_keys=ON;
+      `);
+      console.log('[DB] Migration: todos status CHECK updated with failed/validating');
+    }
+  } catch (err) {
+    console.log('[DB] Migration: failed/validating CHECK update skipped:', err.message);
+  }
 }
 
 module.exports = { getDb };

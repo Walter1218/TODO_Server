@@ -550,6 +550,51 @@
             padding-left: 12px;
             margin-top: 4px;
         }
+        /* ── Date Group Styling ── */
+        .task-date-group {
+            margin-bottom: 8px;
+        }
+        .task-date-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: linear-gradient(135deg, #f1f5f9 0%, #e8ecf1 100%);
+            border-radius: 8px;
+            margin-bottom: 6px;
+            border-left: 3px solid #6366f1;
+            cursor: pointer;
+            user-select: none;
+        }
+        .task-date-header:hover {
+            background: linear-gradient(135deg, #e8ecf1 0%, #dfe4ec 100%);
+        }
+        .task-date-label {
+            font-size: 0.82rem;
+            font-weight: 600;
+            color: #334155;
+        }
+        .task-date-count {
+            font-size: 0.72rem;
+            color: var(--text-muted);
+            background: rgba(99,102,241,0.08);
+            padding: 1px 8px;
+            border-radius: 10px;
+        }
+        .task-date-toggle {
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            transition: transform 0.2s;
+        }
+        .task-date-toggle.collapsed { transform: rotate(-90deg); }
+        .task-date-group-items {
+            display: flex;
+            flex-direction: column;
+            gap: 0;
+        }
+        .task-date-group-items.collapsed {
+            display: none;
+        }
         .task-children .task-item.child-task {
             margin-top: 4px;
             box-shadow: none;
@@ -1554,17 +1599,7 @@
                 el.innerHTML = '<div class="empty-state" style="padding:20px;font-size:0.85rem;">📭 暂无任务</div>';
                 return;
             }
-            const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
-            const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
-            displayTasks.sort((a, b) => {
-                const sa = statusOrder[a.status] || 99;
-                const sb = statusOrder[b.status] || 99;
-                if (sa !== sb) return sa - sb;
-                const pa = priorityOrder[a.priority] || 99;
-                const pb = priorityOrder[b.priority] || 99;
-                return pa - pb;
-            });
-            el.innerHTML = displayTasks.map(t => this.renderTask(t)).join('');
+            el.innerHTML = this.renderTaskDateGroups(displayTasks, 'agent-' + agentId);
         },
 
         filterAgentTasks(agentId) {
@@ -1779,17 +1814,8 @@
                 }
             }
 
-            // 4. 排序顶层任务
-            const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
-            const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
-            const displayTop = Array.from(displayTopMap.values()).sort((a, b) => {
-                const sa = statusOrder[a.status] || 99;
-                const sb = statusOrder[b.status] || 99;
-                if (sa !== sb) return sa - sb;
-                const pa = priorityOrder[a.priority] || 99;
-                const pb = priorityOrder[b.priority] || 99;
-                return pa - pb;
-            });
+            // 4. 收集需要显示的顶层任务
+            const displayTop = Array.from(displayTopMap.values());
 
             // 5. 统计总数（顶层 + 可见子任务）
             let totalCount = displayTop.length;
@@ -1800,8 +1826,8 @@
             }
             document.getElementById('taskCountBadge').textContent = totalCount;
 
-            // 6. 渲染：只渲染顶层任务，子任务由 renderTask 内部处理
-            const html = displayTop.map(t => this.renderTask(t)).join('');
+            // 6. 渲染：按日期分组渲染顶层任务，子任务由 renderTask 内部处理
+            const html = this.renderTaskDateGroups(displayTop, 'global');
             document.getElementById('taskList').innerHTML = html || '<div class="empty-state"><div class="empty-state-icon">📭</div>没有符合条件的任务</div>';
         },
 
@@ -2637,6 +2663,65 @@
                 blocked: '已卡住',
             };
             return map[status] || status;
+        },
+
+        groupTasksByDate(tasks) {
+            const groups = new Map();
+            const today = new Date();
+            today.setHours(0, 0, 0, 0);
+            const yesterday = new Date(today);
+            yesterday.setDate(yesterday.getDate() - 1);
+
+            for (const t of tasks) {
+                const raw = t.created_at;
+                if (!raw) { groups.set('unknown', { label: '📅 未知日期', order: -1, items: [] }); continue; }
+                const d = new Date(raw.replace(' ', 'T') + (raw.includes('Z') || raw.includes('+') ? '' : 'Z'));
+                d.setHours(0, 0, 0, 0);
+                let key, label, order;
+                if (d.getTime() === today.getTime()) { key = 'today'; label = '📅 今天'; order = 0; }
+                else if (d.getTime() === yesterday.getTime()) { key = 'yesterday'; label = '📅 昨天'; order = 1; }
+                else { key = d.toISOString().slice(0, 10); label = '📅 ' + key; order = 2; }
+                if (!groups.has(key)) groups.set(key, { label, order, items: [] });
+                groups.get(key).items.push(t);
+            }
+            return [...groups.values()].sort((a, b) => a.order - b.order);
+        },
+
+        toggleDateGroup(groupId) {
+            const items = document.getElementById('dateGroupItems-' + groupId);
+            const toggle = document.getElementById('dateToggle-' + groupId);
+            if (!items) return;
+            items.classList.toggle('collapsed');
+            if (toggle) toggle.classList.toggle('collapsed');
+        },
+
+        renderTaskDateGroups(tasks, containerId) {
+            const groups = this.groupTasksByDate(tasks);
+            const statusOrder = { blocked: 0, in_progress: 1, pending: 2, completed: 3, cancelled: 4 };
+            const priorityOrder = { critical: 0, high: 1, medium: 2, low: 3 };
+
+            return groups.map((g, i) => {
+                g.items.sort((a, b) => {
+                    const sa = statusOrder[a.status] || 99;
+                    const sb = statusOrder[b.status] || 99;
+                    if (sa !== sb) return sa - sb;
+                    const pa = priorityOrder[a.priority] || 99;
+                    const pb = priorityOrder[b.priority] || 99;
+                    return pa - pb;
+                });
+                const gid = containerId + '-g' + i;
+                return `
+                    <div class="task-date-group">
+                        <div class="task-date-header" onclick="app.toggleDateGroup('${gid}')">
+                            <span class="task-date-toggle" id="dateToggle-${gid}">▼</span>
+                            <span class="task-date-label">${g.label}</span>
+                            <span class="task-date-count">${g.items.length} 个任务</span>
+                        </div>
+                        <div class="task-date-group-items" id="dateGroupItems-${gid}">
+                            ${g.items.map(t => this.renderTask(t)).join('')}
+                        </div>
+                    </div>`;
+            }).join('');
         },
 
         renderCompletionReport(reportJson) {

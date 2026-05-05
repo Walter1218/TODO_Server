@@ -268,12 +268,15 @@ GET  /api/agents/:id/contexts/summary  # 会话摘要
 ```
 
 ### 11. 自动运维监控
-- **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked
+- **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked（通知带 30 分钟冷却去重）
+- **ZombieDetector**：每 10 分钟检测无心跳 >2h 的 `in_progress` 任务，标记为 `blocked`，防止 StuckTaskMonitor 弹跳循环
 - **AssignmentDriver**：指派/转交后立即 auto-focus 到目标 agent；每 60 秒兜底扫描已指派但超过 5 分钟仍为 `pending` 的任务，自动强制 focus + 通知
-- **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证；
-- **ValidatorService**：检测到 `pending_validation` 任务时自动执行异步校验逻辑，闭环 Agent-to-Agent 协作。
+- **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证
+- **ValidatorService**：检测到 `pending_validation` 任务时自动执行异步校验逻辑，闭环 Agent-to-Agent 协作
 - **LLMInferencer**：每 5 分钟扫描 idle 5-15 分钟的任务，LLM 推断真实状态（completed/blocked/in_progress），置信度 ≥0.75 自动执行
-- **WorkSnapshotMonitor**：每 30 秒采集工作快照到 contexts
+- **WorkSnapshotMonitor**：每 2 分钟采集工作快照到 contexts（保留上限 30 条/会话）
+- **CronExecutionMonitor**：每 60 秒检测未按时启动的定时实例
+- **GlobalCleanup**：每 6 小时清理过期 contexts（>7 天）、已读 notifications（>3 天），按 session 类型强制保留上限
 - **CleanupMonitor**：每天自动归档超过 30 天的 `completed`/`cancelled` 任务（软删除，`archived=1`）
 - **DailyScheduler**：每分钟检查到期的模板任务并生成实例
 - **手动管理**：`POST /archive-old?days=30` 手动归档，`DELETE /archived` 物理清理已归档任务

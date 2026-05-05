@@ -1,6 +1,6 @@
 # Agent TODO Server 项目文档
 
-> 最后更新：2026-05-04
+> 最后更新：2026-05-05
 > 本文档为项目唯一主文档，其他独立文档已废弃，内容已合并至此。
 
 ---
@@ -278,11 +278,13 @@ POST /api/agents/:id/focus/auto
 
 | 监控模块 | 间隔 | 功能 |
 |---------|------|------|
-| StuckTaskMonitor | 3min | 基于动态阈值检测无心跳任务，自动恢复/标记 blocked |
+| StuckTaskMonitor | 3min | 基于动态阈值检测无心跳任务，自动恢复/标记 blocked（通知带 30min 冷却去重） |
+| ZombieDetector | 10min | 检测无心跳 >2h 的 in_progress 任务标记为 blocked，防止弹跳循环 |
 | DriveOrchestrator | 60s | 扫描所有有 focus 的任务，自动 drive + 验证，maxConcurrent=5 |
 | ValidatorService | 随 Drive | 检测到 `pending_validation` 任务时自动调用 ValidationAgent 执行异步校验 |
 | LLMInferencer | 5min | LLM 推断 idle 5-15 分钟的任务真实状态，高置信度自动标记 |
-| WorkSnapshotMonitor | 30s | 采集所有 Agent 工作快照到 contexts |
+| WorkSnapshotMonitor | 2min | 采集所有 Agent 工作快照到 contexts（保留上限 30 条/会话） |
+| GlobalCleanup | 6h | 清理过期 contexts（>7 天）、已读 notifications（>3 天），按 session 类型强制保留上限 |
 | DailyScheduler | 60s | 检查到期的模板任务并生成实例 |
 | CronExecutionMonitor | 60s | 检测未按时启动的定时实例 |
 | AssignmentDriver | 60s | 自动聚焦已指派但未执行的任务 |

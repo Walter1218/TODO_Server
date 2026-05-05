@@ -513,7 +513,7 @@ router.patch('/:id/status', async (req, res) => {
       });
     }
 
-    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed'];
+    const validStatuses = ['pending', 'in_progress', 'completed', 'cancelled', 'blocked', 'pending_validation', 'validation_failed', 'failed'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({
         error: 'Validation error',
@@ -532,7 +532,7 @@ router.patch('/:id/status', async (req, res) => {
 
     const appliedStatus = (status === 'completed' && !forceComplete) ? 'pending_validation' : status;
 
-    if (appliedStatus === 'completed') {
+    if (appliedStatus === 'completed' && !forceComplete) {
       const unmetCriteria = [];
       if (todo.acceptance_criteria && !todo.criteria_confirmed) {
         const criteria = todo.acceptance_criteria.split('\n').filter(l => l.trim());

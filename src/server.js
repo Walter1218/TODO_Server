@@ -161,6 +161,21 @@ app.listen(PORT, () => {
     console.error('[Framework] 加载失败:', err.message);
   }
 
+  // 通知去重冷却缓存（taskId+type -> 上次通知时间戳），防止相同类型通知反复刷屏
+  const _notifCooldown = new Map();
+  function _shouldNotify(taskId, type, cooldownMs = 30 * 60 * 1000) {
+    const key = `${taskId}:${type}`;
+    const last = _notifCooldown.get(key) || 0;
+    if (Date.now() - last < cooldownMs) return false;
+    _notifCooldown.set(key, Date.now());
+    if (_notifCooldown.size > 5000) {
+      const oldest = [..._notifCooldown.entries()].sort((a, b) => a[1] - b[1]).slice(0, 2500);
+      _notifCooldown.clear();
+      oldest.forEach(([k, v]) => _notifCooldown.set(k, v));
+    }
+    return true;
+  }
+
   // 自动处理卡住的任务：每 3 分钟检查一次
   const STUCK_CHECK_INTERVAL_MS = 3 * 60 * 1000;
   const STUCK_MAX_IDLE_MINUTES = 15; // 无心跳超过 15 分钟视为卡住
@@ -285,9 +300,11 @@ app.listen(PORT, () => {
           } else {
             // 真正的工作尝试次数已耗尽，保持 blocked
             Todo.updateStatus(agent.id, task.id, 'blocked');
-            Notification.create(agent.id, task.id, 'blocked',
-              `任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），且工作尝试次数已耗尽（${currentAttempts}/${maxAttempts}），需要人工介入`
-            );
+            if (_shouldNotify(task.id, 'blocked', 30 * 60 * 1000)) {
+              Notification.create(agent.id, task.id, 'blocked',
+                `任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），且工作尝试次数已耗尽（${currentAttempts}/${maxAttempts}），需要人工介入`
+              );
+            }
             console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 尝试次数耗尽，保持 blocked`);
           }
           totalStuck++;
@@ -349,12 +366,13 @@ app.listen(PORT, () => {
         // 2. 检测进度停滞（有心跳但 progress 长时间未变化）
         const stalledTasks = Todo.findProgressStalledTasks(agent.id, PROGRESS_STALL_MINUTES);
         for (const task of stalledTasks) {
-          // 只通知，不自动改状态（可能是正常的长时任务）
-          const lastStep = task.heartbeat_step || '无';
-          Notification.create(agent.id, task.id, 'stalled',
-            `任务「${task.title}」进度停滞：已 ${PROGRESS_STALL_MINUTES} 分钟无进展，当前步骤：${lastStep}`
-          );
-          console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 进度停滞 ${PROGRESS_STALL_MINUTES} 分钟`);
+          if (_shouldNotify(task.id, 'stalled', 30 * 60 * 1000)) {
+            const lastStep = task.heartbeat_step || '无';
+            Notification.create(agent.id, task.id, 'stalled',
+              `任务「${task.title}」进度停滞：已 ${PROGRESS_STALL_MINUTES} 分钟无进展，当前步骤：${lastStep}`
+            );
+            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 进度停滞 ${PROGRESS_STALL_MINUTES} 分钟`);
+          }
         }
 
         // 2b. 检测验证任务连续失败并发送纠正指导
@@ -791,9 +809,9 @@ app.listen(PORT, () => {
 
   console.log(`[AssignmentDriver] 已启动，每 ${ASSIGN_DRIVER_INTERVAL_MS / 1000}s 扫描已指派但未执行的任务（超时阈值 ${ASSIGN_STALE_MINUTES} 分钟）`);
 
-  // 工作快照轮询：每 30 秒采集所有 Agent 工作状态
-  const SNAPSHOT_INTERVAL_MS = 30 * 1000;
-  const SNAPSHOT_MAX_RETAIN = 100;
+  // 工作快照轮询：每 2 分钟采集所有 Agent 工作状态（原 30s 产生过量 context 记录）
+  const SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000;
+  const SNAPSHOT_MAX_RETAIN = 30;
 
   setInterval(() => {
     try {
@@ -1083,6 +1101,103 @@ ${attemptLines}
   console.log(`[LLMInferencer] 已启动，每 ${INFERENCE_INTERVAL_MS / 60000}min 运行一次，` +
     `触发阈值 ${INFERENCE_MIN_IDLE_MS / 60000}-${INFERENCE_MAX_IDLE_MS / 60000}min，` +
     `置信度阈值 ${INFERENCE_CONFIDENCE_THRESHOLD}`);
+
+  // ==================== 全局数据清理引擎 ====================
+  // 每 6 小时自动清理膨胀的 contexts 和 notifications，控制数据库体积
+  const GLOBAL_CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  const CONTEXT_MAX_AGE_DAYS = 7;
+  const NOTIFICATION_MAX_AGE_DAYS = 3;
+  const SNAPSHOT_PRUNE_KEEP = 20;
+  const INFERENCE_PRUNE_KEEP = 20;
+  const DRIVE_ORCHESTRATOR_PRUNE_KEEP = 100;
+  const WORKER_PRUNE_KEEP = 50;
+
+  setInterval(() => {
+    try {
+      const db = getDb();
+      const agents = Agent.findAll();
+      let totalCleaned = 0;
+
+      for (const agent of agents) {
+        const prunedCtx = Context.pruneOldContexts(agent.id, CONTEXT_MAX_AGE_DAYS);
+        totalCleaned += prunedCtx;
+        Context.pruneBySession(agent.id, 'work-snapshot', SNAPSHOT_PRUNE_KEEP);
+        Context.pruneBySession(agent.id, 'llm-inference', INFERENCE_PRUNE_KEEP);
+        Context.pruneBySession(agent.id, 'drive-orchestrator', DRIVE_ORCHESTRATOR_PRUNE_KEEP);
+        Context.pruneBySession(agent.id, 'auto-recover', 20);
+        Context.pruneBySession(agent.id, 'cron-monitor', 20);
+        Context.pruneBySession(agent.id, 'assignment-driver', 20);
+        const workerSession = 'worker_' + agent.id;
+        Context.pruneBySession(agent.id, workerSession, WORKER_PRUNE_KEEP);
+      }
+
+      const notifCutoff = new Date(Date.now() - NOTIFICATION_MAX_AGE_DAYS * 24 * 3600 * 1000).toISOString();
+      const delNotif = db.prepare(`DELETE FROM task_notifications WHERE created_at < ? AND read = 1`).run(notifCutoff);
+      totalCleaned += delNotif.changes;
+
+      if (totalCleaned > 0) {
+        console.log(`[GlobalCleanup] 已清理 ${totalCleaned} 条过期数据`);
+      }
+    } catch (err) {
+      console.error('[GlobalCleanup] 清理出错:', err.message);
+    }
+  }, GLOBAL_CLEANUP_INTERVAL_MS);
+
+  console.log(`[GlobalCleanup] 已启动，每 ${GLOBAL_CLEANUP_INTERVAL_MS / 3600000}h 清理一次（contexts 保留 ${CONTEXT_MAX_AGE_DAYS} 天，notifications 保留 ${NOTIFICATION_MAX_AGE_DAYS} 天已读）`);
+
+  // ==================== 僵尸任务检测 ====================
+  // 每 10 分钟检测 in_progress 但超过 2 小时无心跳的任务，自动标记 blocked
+  const ZOMBIE_INTERVAL_MS = 10 * 60 * 1000;
+  const ZOMBIE_THRESHOLD_MINUTES = 120;
+
+  setInterval(() => {
+    try {
+      const db = getDb();
+      const agents = Agent.findAll();
+      let totalZombies = 0;
+
+      for (const agent of agents) {
+        const cutoff = new Date(Date.now() - ZOMBIE_THRESHOLD_MINUTES * 60 * 1000).toISOString();
+        const zombies = db.prepare(`
+          SELECT * FROM todos
+          WHERE agent_id = ? AND status = 'in_progress'
+            AND is_template = 0 AND archived = 0
+            AND (last_heartbeat IS NULL OR last_heartbeat < ?)
+            AND updated_at < ?
+        `).all(agent.id, cutoff, cutoff);
+
+        for (const task of zombies) {
+          const idleMin = task.last_heartbeat
+            ? Math.round((Date.now() - new Date(task.last_heartbeat.replace(' ', 'T') + 'Z').getTime()) / 60000)
+            : 9999;
+          if (_shouldNotify(task.id, 'zombie_blocked', 60 * 60 * 1000)) {
+            Todo.update(agent.id, task.id, {
+              status: 'blocked',
+              heartbeatStep: `🧟 僵尸任务（${idleMin} 分钟无心跳，超过 ${ZOMBIE_THRESHOLD_MINUTES} 分钟阈值）`
+            });
+            Notification.create(agent.id, task.id, 'blocked',
+              `🧟 任务「${task.title}」超过 ${ZOMBIE_THRESHOLD_MINUTES} 分钟无心跳，自动标记为 blocked`
+            );
+            Context.create(agent.id, {
+              sessionId: 'zombie-detector',
+              role: 'system',
+              content: `[ZombieDetector] 任务「${task.title}」超过 ${idleMin} 分钟无心跳，自动标记为 blocked`,
+              metadata: { type: 'zombie_detect', task_id: task.id, idle_minutes: idleMin }
+            });
+            totalZombies++;
+          }
+        }
+      }
+
+      if (totalZombies > 0) {
+        console.log(`[ZombieDetector] 本次标记 ${totalZombies} 个僵尸任务为 blocked`);
+      }
+    } catch (err) {
+      console.error('[ZombieDetector] 检测出错:', err.message);
+    }
+  }, ZOMBIE_INTERVAL_MS);
+
+  console.log(`[ZombieDetector] 已启动，每 ${ZOMBIE_INTERVAL_MS / 60000}min 检测无心跳超 ${ZOMBIE_THRESHOLD_MINUTES}min 的僵尸任务`);
 });
 
 module.exports = app;
