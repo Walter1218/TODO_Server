@@ -8,6 +8,7 @@ const CommandExecutor = require('./CommandExecutor');
 const ProgressValidator = require('./ProgressValidator');
 const ValidatorService = require('./ValidatorService');
 const ValidationDispatchService = require('./ValidationDispatchService');
+const TaskReportService = require('./TaskReportService');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
 const { isValidationTask, shouldTriggerValidation, getTaskTypeLabel } = require('../utils/TaskType');
 
@@ -44,6 +45,79 @@ class DriveOrchestrator {
     this._tickRunning = false;
     this._validationTimeouts = new Map();
     this._lastGreetingCount = new Map();
+  }
+
+  async consultTask(agentId, taskId, task, question, opts = {}) {
+    const llmManager = this.framework?.modules?.llmManager;
+    if (!llmManager || !llmManager.hasProvider || !llmManager.hasProvider()) {
+      return null;
+    }
+
+    const dedupeMinutes = opts.dedupeMinutes ?? 30;
+    try {
+      const db = getDb();
+      const last = db.prepare(`
+        SELECT created_at FROM contexts
+        WHERE agent_id = ? AND session_id = 'consult-auto'
+          AND metadata LIKE ?
+        ORDER BY created_at DESC LIMIT 1
+      `).get(agentId, `%"task_id":"${taskId}"%`);
+      if (last && last.created_at) {
+        const lastMs = new Date(last.created_at.replace(' ', 'T') + 'Z').getTime();
+        if (Date.now() - lastMs < dedupeMinutes * 60 * 1000) {
+          return { skipped: true };
+        }
+      }
+    } catch (e) {}
+
+    const report = await TaskReportService.generateReport(agentId, taskId);
+    const attempts = Array.isArray(task.attempt_log) ? task.attempt_log.slice(-10) : [];
+    const blockers = Array.isArray(task.heartbeat_blockers) ? task.heartbeat_blockers : [];
+
+    const prompt = `你是一个资深运维/数据工程排障助手。你将接手一个自动化任务（由智能体驱动执行），目前出现失败或阻塞。\n\n` +
+      `# 任务信息\n` +
+      `- 标题: ${task.title}\n` +
+      `- 状态: ${task.status}\n` +
+      `- 优先级: ${task.priority}\n` +
+      `- 进度: ${task.heartbeat_progress || 0}%\n` +
+      `- 最后步骤: ${task.heartbeat_step || ''}\n` +
+      `- 阻塞项: ${blockers.length ? blockers.join('；') : '无'}\n` +
+      `- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}\n\n` +
+      `# 最近尝试记录（最多10条）\n` +
+      `${attempts.map(a => `- [${a.timestamp}] ${a.success ? '成功' : '失败'} | ${a.reason || ''} | ${String(a.output || '').slice(0, 300)}`).join('\n') || '无'}\n\n` +
+      `# 执行与上下文摘要\n` +
+      `${JSON.stringify(report.execution || {}, null, 2)}\n\n` +
+      `# 用户问题\n` +
+      `${question || '请诊断核心卡点，并给出最小可落地的修复步骤（按优先级排序），以及需要补齐的环境/配置清单。'}\n\n` +
+      `请只返回 JSON：\n` +
+      `{\"summary\":\"...\",\"root_causes\":[\"...\"],\"fix_steps\":[\"...\"],\"preflight_checklist\":[\"...\"],\"template_improvements\":[\"...\"]}`;
+
+    const result = await llmManager.chat({
+      messages: [{ role: 'user', content: prompt }],
+      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。'
+    });
+
+    const reply = result.content || '';
+    const jsonMatch = reply.match(/\{[\s\S]*\}/);
+    let parsed = null;
+    if (jsonMatch) {
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (e) {}
+    }
+
+    await Context.create(agentId, {
+      sessionId: 'consult-auto',
+      role: 'system',
+      content: `[ConsultAuto] task=${taskId}\nquestion=${(question || '').slice(0, 200)}\nreply=${reply.slice(0, 1600)}`,
+      metadata: { type: 'consult_auto', task_id: taskId }
+    });
+    Context.pruneBySession(agentId, 'consult-auto', 50);
+
+    const summary = parsed?.summary ? String(parsed.summary).slice(0, 160) : reply.slice(0, 160);
+    Notification.create(agentId, taskId, 'comment', `🧠 排障建议：${summary}`);
+
+    return { reply, parsed };
   }
 
   detectGreetingLoop(reply, task) {
@@ -249,6 +323,37 @@ class DriveOrchestrator {
         await new Promise(resolve => setTimeout(resolve, this.retryBackoffMs[attempt] || 0));
       }
 
+      const preflight = CommandExecutor.preflightFromTask(task_);
+      if (preflight && preflight.blockers && preflight.blockers.length > 0) {
+        const msg = `Preflight 阻塞：${preflight.blockers.join('；')}`;
+        Todo.recordAttempt(agentId, task_.id, {
+          success: false,
+          reason: 'Preflight 检测到环境缺失',
+          output: msg
+        });
+        const latest = Todo.findById(agentId, task_.id);
+        const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...preflight.blockers])];
+        Todo.update(agentId, task_.id, {
+          status: 'blocked',
+          heartbeatStep: `⛔ Preflight 阻塞：${preflight.blockers.join('；')}`,
+          heartbeatBlockers: mergedBlockers
+        });
+        await Context.create(agentId, {
+          sessionId: task_.id,
+          role: 'system',
+          content: `[Preflight] 任务已阻塞：${preflight.blockers.join('；')}`,
+          metadata: { type: 'preflight_blocked', task_id: task_.id, blockers: preflight.blockers, spec: preflight.spec, notes: preflight.notes }
+        });
+        Notification.create(agentId, task_.id, 'blocked',
+          `任务「${task_.title}」Preflight 阻塞：${preflight.blockers.join('；')}`
+        );
+        try {
+          const blockedTask = Todo.findById(agentId, task_.id);
+          await this.consultTask(agentId, task_.id, blockedTask, 'Preflight 检测到环境缺失导致阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
+        } catch (e) {}
+        return { success: false, attempts: attempt + 1, blocked: true, blockers: preflight.blockers, preflight: true };
+      }
+
       const before = ProgressValidator.snapshot(task_);
 
       const prompt = buildDrivePrompt(task_, { isManual: false, retryContext });
@@ -307,6 +412,41 @@ class DriveOrchestrator {
           content: `[DriveOrchestrator] 命令执行结果:\n${CommandExecutor.buildExecutionSummary(execResults)}`,
           metadata: { type: 'command_exec', task_id: task_.id, commands_count: commands.length },
         });
+
+        const attemptSummary = CommandExecutor.summarizeAttemptFromResults(execResults);
+        Todo.recordAttempt(agentId, task_.id, {
+          success: attemptSummary.success,
+          reason: attemptSummary.reason,
+          output: attemptSummary.output
+        });
+
+        if (!attemptSummary.success && attemptSummary.blockers && attemptSummary.blockers.length > 0) {
+          const latest = Todo.findById(agentId, task_.id);
+          const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...attemptSummary.blockers])];
+          Todo.update(agentId, task_.id, {
+            status: 'blocked',
+            heartbeatStep: `⛔ 环境缺失/阻塞：${attemptSummary.blockers.join('；')}`,
+            heartbeatBlockers: mergedBlockers
+          });
+
+          Context.create(agentId, {
+            sessionId: task_.id,
+            role: 'system',
+            content: `[AutoPreflight] 检测到环境缺失，任务已标记为 blocked：${attemptSummary.blockers.join('；')}`,
+            metadata: { type: 'env_blocked', task_id: task_.id, blockers: attemptSummary.blockers }
+          });
+
+          Notification.create(agentId, task_.id, 'blocked',
+            `任务「${task_.title}」环境缺失，已阻塞：${attemptSummary.blockers.join('；')}`
+          );
+
+          try {
+            const blockedTask = Todo.findById(agentId, task_.id);
+            await this.consultTask(agentId, task_.id, blockedTask, '任务已被环境缺失阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
+          } catch (e) {}
+
+          return { success: false, attempts: attempt + 1, reply, commands: execResults, blocked: true, blockers: attemptSummary.blockers };
+        }
       }
 
       const parsed = parseHeartbeatReply(task_, reply);
@@ -405,6 +545,11 @@ class DriveOrchestrator {
     Todo.update(agentId, task_.id, {
       heartbeatStep: '⚠️ 等待人工介入',
     });
+
+    try {
+      const stalledTask = Todo.findById(agentId, task_.id);
+      await this.consultTask(agentId, task_.id, stalledTask, '任务多轮驱动无进展。请基于执行记录推断卡点并给出下一步排障与修复路径（优先给最小变更方案）。');
+    } catch (e) {}
 
     return { success: false, attempts: this.maxRetries, reply: lastReply, commands: lastResults, stalled: true };
   }

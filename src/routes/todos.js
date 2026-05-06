@@ -7,6 +7,7 @@ const Notification = require('../models/Notification');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
 const CommandExecutor = require('../services/CommandExecutor');
 const ProgressValidator = require('../services/ProgressValidator');
+const TaskReportService = require('../services/TaskReportService');
 
 const router = express.Router({ mergeParams: true });
 
@@ -859,6 +860,36 @@ router.post('/:id/drive', async (req, res) => {
 
     // 3. 执行前快照
     const refreshedTask = Todo.findById(agentId, id);
+    const preflight = CommandExecutor.preflightFromTask(refreshedTask);
+    if (preflight && preflight.blockers && preflight.blockers.length > 0) {
+      const msg = `Preflight 阻塞：${preflight.blockers.join('；')}`;
+      Todo.recordAttempt(agentId, id, { success: false, reason: 'Preflight 检测到环境缺失', output: msg });
+      const latest = Todo.findById(agentId, id);
+      const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...preflight.blockers])];
+      Todo.update(agentId, id, {
+        status: 'blocked',
+        heartbeatStep: `⛔ Preflight 阻塞：${preflight.blockers.join('；')}`,
+        heartbeatBlockers: mergedBlockers
+      });
+      Context.create(agentId, {
+        sessionId: id,
+        role: 'system',
+        content: `[Preflight] 任务已阻塞：${preflight.blockers.join('；')}`,
+        metadata: { type: 'preflight_blocked', task_id: id, blockers: preflight.blockers, spec: preflight.spec, notes: preflight.notes }
+      });
+      Notification.create(agentId, id, 'blocked',
+        `任务「${refreshedTask.title}」Preflight 阻塞：${preflight.blockers.join('；')}`
+      );
+      return res.json({
+        success: true,
+        data: {
+          task: Todo.findById(agentId, id),
+          preflight_blocked: true,
+          blockers: preflight.blockers,
+          notes: preflight.notes || []
+        }
+      });
+    }
     const before = ProgressValidator.snapshot(refreshedTask);
 
     // 4. 构建 Work Prompt
@@ -879,6 +910,32 @@ router.post('/:id/drive', async (req, res) => {
         content: `[手动驱动] 命令执行结果:\n${CommandExecutor.buildExecutionSummary(commandsExecuted)}`,
         metadata: { type: 'command_exec', task_id: id, commands_count: commands.length }
       });
+
+      const attemptSummary = CommandExecutor.summarizeAttemptFromResults(commandsExecuted);
+      Todo.recordAttempt(agentId, id, {
+        success: attemptSummary.success,
+        reason: attemptSummary.reason,
+        output: attemptSummary.output
+      });
+
+      if (!attemptSummary.success && attemptSummary.blockers && attemptSummary.blockers.length > 0) {
+        const latest = Todo.findById(agentId, id);
+        const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...attemptSummary.blockers])];
+        Todo.update(agentId, id, {
+          status: 'blocked',
+          heartbeatStep: `⛔ 环境缺失/阻塞：${attemptSummary.blockers.join('；')}`,
+          heartbeatBlockers: mergedBlockers
+        });
+        Context.create(agentId, {
+          sessionId: id,
+          role: 'system',
+          content: `[AutoPreflight] 检测到环境缺失，任务已标记为 blocked：${attemptSummary.blockers.join('；')}`,
+          metadata: { type: 'env_blocked', task_id: id, blockers: attemptSummary.blockers }
+        });
+        Notification.create(agentId, id, 'blocked',
+          `任务「${refreshedTask.title}」环境缺失，已阻塞：${attemptSummary.blockers.join('；')}`
+        );
+      }
     }
 
     // 7. 解析 heartbeat 变更（结合命令执行结果）
@@ -1512,6 +1569,86 @@ router.post('/:id/request-help', async (req, res) => {
     });
   } catch (error) {
     console.error('Error processing help request:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
+router.post('/:id/consult', async (req, res) => {
+  try {
+    const { agentId, id } = req.params;
+    const { question } = req.body || {};
+
+    const framework = req.app.get('driveFramework');
+    const llmManager = getLlmManager(req);
+    if (!framework || !framework.initialized || !llmManager || !llmManager.hasProvider || !llmManager.hasProvider()) {
+      return res.status(503).json({
+        error: 'Service unavailable',
+        message: 'LLM not available, cannot consult'
+      });
+    }
+
+    const task = Todo.findById(agentId, id);
+    if (!task) {
+      return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
+    }
+
+    const report = await TaskReportService.generateReport(agentId, id);
+    const attempts = Array.isArray(task.attempt_log) ? task.attempt_log.slice(-10) : [];
+    const blockers = Array.isArray(task.heartbeat_blockers) ? task.heartbeat_blockers : [];
+
+    const prompt = `你是一个资深运维/数据工程排障助手。你将接手一个自动化任务（由智能体驱动执行），目前出现失败或阻塞。\n\n` +
+      `# 任务信息\n` +
+      `- 标题: ${task.title}\n` +
+      `- 状态: ${task.status}\n` +
+      `- 优先级: ${task.priority}\n` +
+      `- 进度: ${task.heartbeat_progress || 0}%\n` +
+      `- 最后步骤: ${task.heartbeat_step || ''}\n` +
+      `- 阻塞项: ${blockers.length ? blockers.join('；') : '无'}\n` +
+      `- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}\n\n` +
+      `# 最近尝试记录（最多10条）\n` +
+      `${attempts.map(a => `- [${a.timestamp}] ${a.success ? '成功' : '失败'} | ${a.reason || ''} | ${String(a.output || '').slice(0, 300)}`).join('\n') || '无'}\n\n` +
+      `# 执行与上下文摘要\n` +
+      `${JSON.stringify(report.execution || {}, null, 2)}\n\n` +
+      `# 用户问题\n` +
+      `${question || '请诊断核心卡点，并给出最小可落地的修复步骤（按优先级排序），以及需要补齐的环境/配置清单。'}\n\n` +
+      `请只返回 JSON：\n` +
+      `{\"summary\":\"...\",\"root_causes\":[\"...\"],\"fix_steps\":[\"...\"],\"preflight_checklist\":[\"...\"],\"template_improvements\":[\"...\"]}`;
+
+    const result = await llmManager.chat({
+      messages: [{ role: 'user', content: prompt }],
+      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。'
+    });
+
+    const reply = result.content || '';
+    const jsonMatch = reply.match(/\{[\s\S]*\}/);
+    let parsed = null;
+    if (jsonMatch) {
+      try {
+        parsed = JSON.parse(jsonMatch[0]);
+      } catch (e) {}
+    }
+
+    Context.create(agentId, {
+      sessionId: id,
+      role: 'system',
+      content: `[Consult] question=${(question || '').slice(0, 200)}\nreply=${reply.slice(0, 1200)}`,
+      metadata: {
+        type: 'consult',
+        task_id: id
+      }
+    });
+
+    res.json({
+      success: true,
+      data: {
+        taskId: id,
+        question: question || null,
+        reply,
+        parsed
+      }
+    });
+  } catch (error) {
+    console.error('Error consulting task:', error);
     res.status(500).json({ error: 'Internal server error', message: error.message });
   }
 });

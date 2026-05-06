@@ -1,4 +1,6 @@
-const { exec } = require('child_process');
+const { exec, execSync } = require('child_process');
+const fs = require('fs');
+const path = require('path');
 const util = require('util');
 const execAsync = util.promisify(exec);
 
@@ -38,6 +40,197 @@ const INVALID_PREFIXES = [
 ];
 
 class CommandExecutor {
+  static _truncate(text, maxLen = 800) {
+    if (!text) return '';
+    const s = String(text);
+    if (s.length <= maxLen) return s;
+    return s.slice(0, maxLen) + '...(truncated)';
+  }
+
+  static _uniq(arr) {
+    return [...new Set((arr || []).filter(Boolean))];
+  }
+
+  static detectEnvironmentBlockers(output) {
+    const text = (output || '').toString();
+    if (!text) return [];
+    const blockers = [];
+
+    const cdMissing = text.match(/cd:\s*([^:\n]+):\s*No such file or directory/i);
+    if (cdMissing && cdMissing[1]) blockers.push(`缺少目录: ${cdMissing[1].trim()}`);
+
+    const fileMissing1 = text.match(/(?:cat|ls|head|tail):\s*([^:\n]+):\s*No such file or directory/i);
+    if (fileMissing1 && fileMissing1[1]) blockers.push(`缺少文件: ${fileMissing1[1].trim()}`);
+
+    const fileMissing2 = text.match(/python(?:3)?:\s*can't open file\s+'([^']+)'/i);
+    if (fileMissing2 && fileMissing2[1]) blockers.push(`缺少脚本: ${fileMissing2[1].trim()}`);
+
+    const fileMissing3 = text.match(/\[Errno 2\].*No such file or directory.*(?:'([^']+)'|\"([^\"]+)\")/i);
+    const missPath = (fileMissing3 && (fileMissing3[1] || fileMissing3[2])) ? (fileMissing3[1] || fileMissing3[2]).trim() : null;
+    if (missPath) blockers.push(`缺少路径: ${missPath}`);
+
+    const cmdNotFound = text.match(/(?:^|\n)([^:\n]+):\s*command not found/);
+    if (cmdNotFound && cmdNotFound[1]) blockers.push(`缺少命令: ${cmdNotFound[1].trim()}`);
+
+    const pyMissingMod = text.match(/ModuleNotFoundError:\s*No module named ['"]([^'"]+)['"]/);
+    if (pyMissingMod && pyMissingMod[1]) blockers.push(`缺少Python包: ${pyMissingMod[1].trim()}`);
+
+    const pyImportErr = text.match(/ImportError:\s*cannot import name ['"]([^'"]+)['"]/);
+    if (pyImportErr && pyImportErr[1]) blockers.push(`Python导入失败: ${pyImportErr[1].trim()}`);
+
+    if (/permission denied/i.test(text)) blockers.push('权限不足: Permission denied');
+
+    return this._uniq(blockers);
+  }
+
+  static summarizeAttemptFromResults(results, opts = {}) {
+    const maxOut = opts.maxOutputLen ?? 1200;
+    const maxCmd = opts.maxCommandLen ?? 160;
+    const rs = Array.isArray(results) ? results : [];
+    const failed = rs.filter(r => r && r.success === false);
+    const success = failed.length === 0;
+
+    if (rs.length === 0) {
+      return {
+        success: true,
+        reason: '无命令执行',
+        output: '',
+        blockers: []
+      };
+    }
+
+    if (success) {
+      const first = rs[0];
+      const cmd = (first.command || '').toString().slice(0, maxCmd);
+      const out = rs.map(r => this._truncate(r.output, 200)).join('\n---\n');
+      return {
+        success: true,
+        reason: `命令执行成功（${rs.length}条）`,
+        output: this._truncate(out, maxOut),
+        blockers: []
+      };
+    }
+
+    const firstFail = failed[0];
+    const failCmd = (firstFail.command || '').toString().slice(0, maxCmd);
+    const out = this._truncate(firstFail.output || '', maxOut);
+    const blockers = this.detectEnvironmentBlockers(firstFail.output || '');
+    return {
+      success: false,
+      reason: `命令执行失败: ${failCmd}`,
+      output: out,
+      blockers
+    };
+  }
+
+  static extractPreflightSpec(description) {
+    if (!description || typeof description !== 'string') return null;
+
+    const lines = description.split('\n').map(l => l.trim()).filter(Boolean);
+    const spec = {
+      cwd: null,
+      scripts: [],
+      requiresBins: [],
+      requiresEnv: [],
+      requiresPaths: []
+    };
+
+    for (const line of lines) {
+      const m = line.match(/^([A-Z_]+)\s*=\s*(.+)$/);
+      if (!m) continue;
+      const key = m[1].toUpperCase();
+      const val = m[2].trim();
+      if (!val) continue;
+
+      if (key === 'CWD') spec.cwd = val;
+      if (key === 'SCRIPT' || key === 'SCRIPTS') spec.scripts.push(...val.split(',').map(s => s.trim()).filter(Boolean));
+      if (key === 'REQUIRES_BIN' || key === 'REQUIRES_BINS') spec.requiresBins.push(...val.split(',').map(s => s.trim()).filter(Boolean));
+      if (key === 'REQUIRES_ENV' || key === 'REQUIRES_ENVS') spec.requiresEnv.push(...val.split(',').map(s => s.trim()).filter(Boolean));
+      if (key === 'REQUIRES_PATH' || key === 'REQUIRES_PATHS') spec.requiresPaths.push(...val.split(',').map(s => s.trim()).filter(Boolean));
+    }
+
+    spec.scripts = this._uniq(spec.scripts);
+    spec.requiresBins = this._uniq(spec.requiresBins);
+    spec.requiresEnv = this._uniq(spec.requiresEnv);
+    spec.requiresPaths = this._uniq(spec.requiresPaths);
+
+    const any = spec.cwd || spec.scripts.length || spec.requiresBins.length || spec.requiresEnv.length || spec.requiresPaths.length;
+    return any ? spec : null;
+  }
+
+  static _safeBinName(name) {
+    if (!name) return null;
+    const s = String(name).trim();
+    if (!/^[A-Za-z0-9._+-]+$/.test(s)) return null;
+    return s;
+  }
+
+  static _exists(p) {
+    try {
+      return fs.existsSync(p);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  static _resolvePath(p, cwd) {
+    if (!p) return null;
+    let s = String(p).trim();
+    if (!s) return null;
+    if (s.startsWith('~/')) s = path.join(process.env.HOME || '', s.slice(2));
+    if (path.isAbsolute(s)) return s;
+    if (cwd) return path.join(cwd, s);
+    return s;
+  }
+
+  static evaluatePreflight(spec) {
+    if (!spec) return { blockers: [], notes: [] };
+    const blockers = [];
+    const notes = [];
+
+    const cwd = spec.cwd ? this._resolvePath(spec.cwd, null) : null;
+    if (cwd && !this._exists(cwd)) blockers.push(`缺少目录: ${cwd}`);
+
+    for (const s of (spec.scripts || [])) {
+      const full = this._resolvePath(s, cwd);
+      if (full && !this._exists(full)) blockers.push(`缺少脚本: ${full}`);
+    }
+
+    for (const p of (spec.requiresPaths || [])) {
+      const full = this._resolvePath(p, cwd);
+      if (full && !this._exists(full)) blockers.push(`缺少路径: ${full}`);
+    }
+
+    for (const e of (spec.requiresEnv || [])) {
+      const envName = String(e).trim();
+      if (!envName) continue;
+      if (!process.env[envName]) blockers.push(`缺少环境变量: ${envName}`);
+    }
+
+    for (const b of (spec.requiresBins || [])) {
+      const bin = this._safeBinName(b);
+      if (!bin) {
+        notes.push(`忽略不安全的 REQUIRES_BIN: ${String(b).trim()}`);
+        continue;
+      }
+      try {
+        const out = execSync(`command -v ${bin}`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+        if (!out) blockers.push(`缺少命令: ${bin}`);
+      } catch (e) {
+        blockers.push(`缺少命令: ${bin}`);
+      }
+    }
+
+    return { blockers: this._uniq(blockers), notes: this._uniq(notes) };
+  }
+
+  static preflightFromTask(task) {
+    const spec = this.extractPreflightSpec(task?.description || '');
+    if (!spec) return null;
+    const { blockers, notes } = this.evaluatePreflight(spec);
+    return { spec, blockers, notes };
+  }
+
   static extractBashBlocks(reply) {
     if (!reply || typeof reply !== 'string') return [];
     const blocks = [];
@@ -155,11 +348,34 @@ class CommandExecutor {
       const startMs = Date.now();
       try {
         const { stdout, stderr } = await execAsync(command, { timeout: timeoutMs, cwd });
-        const output = stdout.trim() || stderr.trim() || '(无输出)';
-        results.push({ index, command, output, success: true, duration: Date.now() - startMs });
+        const stdoutText = stdout != null ? String(stdout) : '';
+        const stderrText = stderr != null ? String(stderr) : '';
+        const output = stdoutText.trim() || stderrText.trim() || '(无输出)';
+        results.push({
+          index,
+          command,
+          output,
+          stdout: stdoutText,
+          stderr: stderrText,
+          exitCode: 0,
+          success: true,
+          duration: Date.now() - startMs
+        });
       } catch (execErr) {
-        const errOutput = execErr.stdout?.trim() || execErr.stderr?.trim() || execErr.message;
-        results.push({ index, command, output: errOutput, success: false, duration: Date.now() - startMs });
+        const stdoutText = execErr.stdout != null ? String(execErr.stdout) : '';
+        const stderrText = execErr.stderr != null ? String(execErr.stderr) : '';
+        const errOutput = stdoutText.trim() || stderrText.trim() || execErr.message;
+        const exitCode = typeof execErr.code === 'number' ? execErr.code : null;
+        results.push({
+          index,
+          command,
+          output: errOutput,
+          stdout: stdoutText,
+          stderr: stderrText,
+          exitCode,
+          success: false,
+          duration: Date.now() - startMs
+        });
       }
     }
     return results;

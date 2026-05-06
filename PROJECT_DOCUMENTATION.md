@@ -273,6 +273,12 @@ POST /api/agents/:id/focus/auto
 - **实例 → 报告**：Hermes cron job 通过 `GET /todos/scheduled/pending` 查询待执行实例
 - spawn 时自动创建 `task_notification`（assigned 类型），通知 agent 有新实例待执行
 - 手动触发模板实例化：`POST /todos/:id/spawn`
+- **模板执行规范（推荐）**：在模板任务 description 中添加 `EXEC_SPEC`，让服务端可在驱动前做 Preflight（缺目录/缺脚本/缺命令/缺环境变量直接 blocked 并给出 blockers）
+  - `CWD=/abs/path`
+  - `SCRIPT=relative/or/abs/script.py`（可用逗号分隔多个）
+  - `REQUIRES_BIN=python3,duckdb`（可选）
+  - `REQUIRES_ENV=TUSHARE_TOKEN`（可选）
+  - `REQUIRES_PATH=data/foo.duckdb`（可选，多项逗号分隔）
 
 ### 4.8 自动运维监控
 
@@ -320,6 +326,8 @@ POST /api/agents/:id/focus/auto
 | POST | `/api/agents/:id/todos/:id/spawn` | 模板实例化 |
 | POST | `/api/agents/:id/todos/:id/report` | cron job 写入执行报告 |
 | POST | `/api/agents/:id/todos/:id/propose-completion` | 申请验收 |
+| POST | `/api/agents/:id/todos/:id/request-help` | 智能体请求人工协助（留痕 + 通知） |
+| POST | `/api/agents/:id/todos/:id/consult` | 疑难杂症咨询（LLM 诊断与修复建议） |
 | GET | `/api/agents/:id/todos/:id/report` | 获取任务流程报告 |
 | GET | `/api/agents/:id/todos/assigned` | 指派给我的 |
 | GET | `/api/agents/:id/todos/created` | 我创建的 |
@@ -924,10 +932,13 @@ if (isValidationTask(task)) {
 |--------|------|------|
 | 增强驱动 Prompt | `src/utils/driveHelper.js` | 添加明确的命令输出格式要求 |
 | 扩展命令提取 | `src/services/CommandExecutor.js` | 支持从任务描述中提取步骤命令 |
+| 命令失败结构化留痕 + 自动阻塞 | `src/services/DriveOrchestrator.js` | 命令执行结果写回 attempt_log；检测到缺少目录/脚本/命令等环境问题时直接标记 blocked 并写入 blockers |
 | 支持 validation_failed 重试 | `src/services/DriveOrchestrator.js` | 自动重试并携带校验反馈给 LLM |
 | 100%进度自动触发验证 | `src/services/DriveOrchestrator.js` | 进度达到100%时自动转为 pending_validation |
 | 验证反馈传递给重试 | `src/services/DriveOrchestrator.js` | buildRetryContext 包含验证失败反馈 |
 | 第三方验证机制 | `src/services/ValidationDispatchService.js` | 派发独立验证任务给第三方 Agent |
+| 疑难杂症咨询接口 | `src/routes/todos.js` | 增加 /consult：基于任务执行记录生成排障结论、修复步骤与 preflight 清单 |
+| 自动触发排障咨询（blocked/stalled） | `src/services/DriveOrchestrator.js` | 当任务因环境缺失被阻塞或多轮无进展时，自动调用 LLM 生成排障建议并写入 contexts/notifications |
 
 ### 10.8 改进后的执行流程
 
