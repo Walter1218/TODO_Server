@@ -319,7 +319,8 @@ POST /api/agents/:id/focus/auto
 
 - 使用 `pm2` 运行生产实例。在 `ecosystem.config.js` 中已增加 `env_production` 配置节点。
 - 启动生产环境命令：`pm2 start ecosystem.config.js --env production`。
-- 日志统一存放于 `logs/` 目录，建议在生产环境结合 PM2 日志轮转插件（如 `pm2-logrotate`）管理日志体积。
+- **结构化日志系统**：已全局引入 `pino` 替代 `console.log`。开发环境使用 `pino-pretty` 提供易读的彩色终端输出；生产环境默认输出 JSON 结构化日志。
+- **日志轮转**：日志统一存放于 `logs/` 目录。生产环境建议通过内置脚本 `npm run pm2:install-logrotate` 一键安装并配置 `pm2-logrotate`，实现日志按 10M 切割、保留 7 天并自动压缩。
 
 ### 5.4 进阶部署规划（待实施任务）
 
@@ -330,9 +331,6 @@ POST /api/agents/:id/focus/auto
   - 配置 SSL 证书开启 HTTPS，防止 `X-Agent-Secret` 和数据在公网传输中被窃听。
 - **API 限流（Rate Limiting）**：
   - 引入限流中间件（如 `express-rate-limit`），限制单 IP 或单 Agent 的高频恶意请求，防止服务雪崩。
-- **结构化日志系统**：
-  - 将基础的 `console.log` 升级为 `winston` 或 `pino` 等结构化日志库。
-  - 结合 `pm2-logrotate` 等插件实现日志的自动轮转、按天切割与压缩存档。
 - **容器化部署（Docker）**：
   - 编写 `Dockerfile` 与 `docker-compose.yml`，将运行环境、依赖、PM2 进程管理统一打包。
   - 映射外部 Volume 持久化 SQLite 数据目录与日志目录，实现服务的无状态化与一键部署。
