@@ -7,7 +7,11 @@ module.exports = {
       autorestart: true,
       max_memory_restart: '1G',
       env: {
-        NODE_ENV: 'development'
+        NODE_ENV: 'development',
+      },
+      env_production: {
+        NODE_ENV: 'production',
+        DB_PATH: './data/prod/todo.db'
       }
     },
     {
@@ -18,6 +22,9 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: 'development'
+      },
+      env_production: {
+        NODE_ENV: 'production'
       }
     },
     {
@@ -28,6 +35,9 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: 'development'
+      },
+      env_production: {
+        NODE_ENV: 'production'
       }
     },
     {
@@ -38,6 +48,9 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: 'development'
+      },
+      env_production: {
+        NODE_ENV: 'production'
       }
     },
     {
@@ -48,6 +61,9 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: 'development'
+      },
+      env_production: {
+        NODE_ENV: 'production'
       }
     }
   ]

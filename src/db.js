@@ -1,20 +1,26 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 
-const dbPath = path.join(__dirname, '..', 'data', 'todo.db');
-
 let db;
 
 function getDb() {
   if (module.exports._testDb) return module.exports._testDb;
   if (!db) {
     const fs = require('fs');
-    const dataDir = path.join(__dirname, '..', 'data');
+    
+    // 优先使用环境变量中的数据库路径，否则回退到默认的 data/todo.db
+    // 遵守生产环境与开发环境数据隔离规则
+    const defaultDbPath = path.join(__dirname, '..', 'data', 'todo.db');
+    const resolvedDbPath = process.env.DB_PATH 
+      ? path.resolve(process.cwd(), process.env.DB_PATH) 
+      : defaultDbPath;
+      
+    const dataDir = path.dirname(resolvedDbPath);
     if (!fs.existsSync(dataDir)) {
       fs.mkdirSync(dataDir, { recursive: true });
     }
 
-    db = new Database(dbPath);
+    db = new Database(resolvedDbPath);
     db.pragma('journal_mode = WAL');
     initializeSchema();
   }

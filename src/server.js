@@ -27,7 +27,13 @@ if (!require('fs').existsSync(logsDir)) {
   require('fs').mkdirSync(logsDir, { recursive: true });
 }
 
-app.use(cors());
+// CORS Configuration
+const corsOptions = {
+  origin: process.env.NODE_ENV === 'production' 
+    ? (process.env.CORS_ORIGIN || false) // 在生产环境中，如果没有配置 CORS_ORIGIN 则禁用跨域，或者填入具体的域名白名单
+    : '*', // 开发环境允许所有跨域
+};
+app.use(cors(corsOptions));
 app.use(express.json());
 
 app.use((req, res, next) => {

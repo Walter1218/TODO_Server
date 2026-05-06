@@ -1,6 +1,6 @@
 # Agent TODO Server 项目文档
 
-> 最后更新：2026-05-06
+> 最后更新：2026-05-07
 > 本文档为项目唯一主文档，其他独立文档已废弃，内容已合并至此。
 
 ---
@@ -299,9 +299,49 @@ POST /api/agents/:id/focus/auto
 
 ---
 
-## 五、API 速查
+## 五、部署与服务器环境
 
-### 5.1 智能体
+本服务支持从本地开发环境平滑迁移至服务器生产环境。在进行生产环境部署时，需遵循以下规范：
+
+### 5.1 数据与环境隔离（强制规范）
+
+为保障数据安全与环境独立，系统严格隔离开发与生产环境的数据：
+- **开发环境**：默认数据库路径为 `data/todo.db`。
+- **生产环境**：需通过设置环境变量 `DB_PATH` 指向独立的持久化目录（例如 `data/prod/todo.db`）。
+- 服务已支持通过 `.env` 或 `.env.production` 动态加载配置。
+
+### 5.2 生产环境安全配置
+
+- **CORS 跨域限制**：在 `production` 模式下，需通过配置 `CORS_ORIGIN` 环境变量来限制 API 访问源，防止恶意跨域调用。
+- **Agent 鉴权**：API 调用需校验 `X-Agent-Secret`，确保公网部署时该密钥的复杂度和保密性。
+
+### 5.3 进程与日志管理
+
+- 使用 `pm2` 运行生产实例。在 `ecosystem.config.js` 中已增加 `env_production` 配置节点。
+- 启动生产环境命令：`pm2 start ecosystem.config.js --env production`。
+- 日志统一存放于 `logs/` 目录，建议在生产环境结合 PM2 日志轮转插件（如 `pm2-logrotate`）管理日志体积。
+
+### 5.4 进阶部署规划（待实施任务）
+
+为保障服务在公网生产环境的高可用与高安全性，计划在后续实施以下进阶部署规范：
+
+- **反向代理与 HTTPS**：
+  - 配置 Nginx 或 Caddy 进行反向代理，隐藏内部 Node.js 端口（3000）。
+  - 配置 SSL 证书开启 HTTPS，防止 `X-Agent-Secret` 和数据在公网传输中被窃听。
+- **API 限流（Rate Limiting）**：
+  - 引入限流中间件（如 `express-rate-limit`），限制单 IP 或单 Agent 的高频恶意请求，防止服务雪崩。
+- **结构化日志系统**：
+  - 将基础的 `console.log` 升级为 `winston` 或 `pino` 等结构化日志库。
+  - 结合 `pm2-logrotate` 等插件实现日志的自动轮转、按天切割与压缩存档。
+- **容器化部署（Docker）**：
+  - 编写 `Dockerfile` 与 `docker-compose.yml`，将运行环境、依赖、PM2 进程管理统一打包。
+  - 映射外部 Volume 持久化 SQLite 数据目录与日志目录，实现服务的无状态化与一键部署。
+
+---
+
+## 六、API 速查
+
+### 6.1 智能体
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -309,7 +349,7 @@ POST /api/agents/:id/focus/auto
 | GET | `/api/agents/:id` | 查询智能体 |
 | DELETE | `/api/agents/:id` | 删除智能体 |
 
-### 5.2 任务
+### 6.2 任务
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -341,7 +381,7 @@ POST /api/agents/:id/focus/auto
 | POST | `/api/agents/:id/todos/archive-old` | 归档旧任务 |
 | DELETE | `/api/agents/:id/todos/archived` | 删除已归档任务 |
 
-### 5.3 聚焦
+### 6.3 聚焦
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -349,7 +389,7 @@ POST /api/agents/:id/focus/auto
 | PUT | `/api/agents/:id/focus` | 手动设置聚焦 |
 | POST | `/api/agents/:id/focus/auto` | 自动聚焦 |
 
-### 5.4 项目
+### 6.4 项目
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -358,7 +398,7 @@ POST /api/agents/:id/focus/auto
 | GET | `/api/agents/:id/projects/:id` | 获取项目 |
 | GET | `/api/agents/:id/projects/:id/board` | 项目看板 |
 
-### 5.5 通知
+### 6.5 通知
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
@@ -366,7 +406,7 @@ POST /api/agents/:id/focus/auto
 | POST | `/api/agents/:id/notifications/:id/read` | 标记已读 |
 | POST | `/api/agents/:id/notifications/read-all` | 全部已读 |
 
-### 5.6 上下文
+### 6.6 上下文
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
