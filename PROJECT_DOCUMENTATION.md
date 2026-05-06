@@ -322,18 +322,22 @@ POST /api/agents/:id/focus/auto
 - **结构化日志系统**：已全局引入 `pino` 替代 `console.log`。开发环境使用 `pino-pretty` 提供易读的彩色终端输出；生产环境默认输出 JSON 结构化日志。
 - **日志轮转**：日志统一存放于 `logs/` 目录。生产环境建议通过内置脚本 `npm run pm2:install-logrotate` 一键安装并配置 `pm2-logrotate`，实现日志按 10M 切割、保留 7 天并自动压缩。
 
-### 5.4 进阶部署规划（待实施任务）
+### 5.4 进阶安全与容器化部署（已实施）
 
-为保障服务在公网生产环境的高可用与高安全性，计划在后续实施以下进阶部署规范：
+为保障服务在公网生产环境的高可用与高安全性，系统已集成以下高级部署规范：
 
-- **反向代理与 HTTPS**：
-  - 配置 Nginx 或 Caddy 进行反向代理，隐藏内部 Node.js 端口（3000）。
-  - 配置 SSL 证书开启 HTTPS，防止 `X-Agent-Secret` 和数据在公网传输中被窃听。
+- **反向代理与 HTTPS (Nginx)**：
+  - 已提供标准 Nginx 配置文件位于 `deploy/nginx/todo-server.conf`。
+  - 支持将内部 Node.js 端口（3000）进行反向代理，并预置了强制 HTTPS 跳转和主流 SSL 安全配置。
 - **API 限流（Rate Limiting）**：
-  - 引入限流中间件（如 `express-rate-limit`），限制单 IP 或单 Agent 的高频恶意请求，防止服务雪崩。
+  - 已在应用层（`src/server.js`）集成 `express-rate-limit` 中间件。
+  - **生产环境 (`production`)**：限制单 IP 在 15 分钟内最多发起 1000 次请求，有效防止恶意刷量和服务雪崩。
+  - **开发环境**：放宽至 15 分钟 10000 次，方便高频调试。
+  - 当通过 Nginx 部署时，应用会自动信任代理层传递的真实 IP（`trust proxy`）。
 - **容器化部署（Docker）**：
-  - 编写 `Dockerfile` 与 `docker-compose.yml`，将运行环境、依赖、PM2 进程管理统一打包。
-  - 映射外部 Volume 持久化 SQLite 数据目录与日志目录，实现服务的无状态化与一键部署。
+  - 项目根目录已提供生产就绪的 `Dockerfile` 与 `docker-compose.yml`。
+  - 内部基于 `node:18-alpine`，自动安装依赖及 PM2。
+  - 默认使用外部挂载卷映射 `data/prod` 和 `logs`，实现容器状态无状态化、数据持久化及快速一键部署（`docker-compose up -d`）。
 
 ---
 
