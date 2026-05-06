@@ -120,6 +120,35 @@ class DriveOrchestrator {
     return { reply, parsed };
   }
 
+  _createAutoHealingTask(agentId, parentId, fixSteps) {
+    if (!fixSteps || fixSteps.length === 0) return;
+    
+    const stepsText = fixSteps.map((step, i) => `${i + 1}. ${step}`).join('\n');
+    const description = `[Auto-Healing] 此任务由系统自动创建，用于解决父任务的阻塞问题。\n\n需要执行的修复步骤:\n${stepsText}\n\n请按顺序执行这些步骤。完成后请结束任务。`;
+    
+    const childTask = Todo.create(agentId, {
+      title: `[修复] 自动修复任务 for ${parentId.split('-')[0]}`,
+      description: description,
+      status: 'pending',
+      priority: 'critical',
+      parentId: parentId,
+      assignedAgentId: agentId
+    });
+
+    console.log(`[DriveOrchestrator] 自动创建修复子任务: ${childTask.id}`);
+    
+    FocusState.createOrUpdate(agentId, { currentTaskId: childTask.id, focusMode: 'auto' });
+
+    Context.create(agentId, {
+      sessionId: 'auto-healing',
+      role: 'system',
+      content: `[Auto-Healing] 已根据诊断报告自动创建修复任务: ${childTask.id}`,
+      metadata: { type: 'auto_healing_created', parent_id: parentId, child_id: childTask.id }
+    });
+    
+    Notification.create(agentId, parentId, 'info', `🛠️ 已自动创建修复任务并切换焦点`);
+  }
+
   detectGreetingLoop(reply, task) {
     const greetingPatterns = [
       '你好', '您好', '已就绪', '待命', '就绪', '已启动',
@@ -349,8 +378,13 @@ class DriveOrchestrator {
         );
         try {
           const blockedTask = Todo.findById(agentId, task_.id);
-          await this.consultTask(agentId, task_.id, blockedTask, 'Preflight 检测到环境缺失导致阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
-        } catch (e) {}
+          const consultRes = await this.consultTask(agentId, task_.id, blockedTask, 'Preflight 检测到环境缺失导致阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
+          if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
+            this._createAutoHealingTask(agentId, task_.id, consultRes.parsed.fix_steps);
+          }
+        } catch (e) {
+          console.error('[DriveOrchestrator] Preflight Auto-Healing 失败:', e.message);
+        }
         return { success: false, attempts: attempt + 1, blocked: true, blockers: preflight.blockers, preflight: true };
       }
 
@@ -442,8 +476,13 @@ class DriveOrchestrator {
 
           try {
             const blockedTask = Todo.findById(agentId, task_.id);
-            await this.consultTask(agentId, task_.id, blockedTask, '任务已被环境缺失阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
-          } catch (e) {}
+            const consultRes = await this.consultTask(agentId, task_.id, blockedTask, '任务已被环境缺失阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
+            if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
+              this._createAutoHealingTask(agentId, task_.id, consultRes.parsed.fix_steps);
+            }
+          } catch (e) {
+            console.error('[DriveOrchestrator] Execution Auto-Healing 失败:', e.message);
+          }
 
           return { success: false, attempts: attempt + 1, reply, commands: execResults, blocked: true, blockers: attemptSummary.blockers };
         }
@@ -548,8 +587,13 @@ class DriveOrchestrator {
 
     try {
       const stalledTask = Todo.findById(agentId, task_.id);
-      await this.consultTask(agentId, task_.id, stalledTask, '任务多轮驱动无进展。请基于执行记录推断卡点并给出下一步排障与修复路径（优先给最小变更方案）。');
-    } catch (e) {}
+      const consultRes = await this.consultTask(agentId, task_.id, stalledTask, '任务多轮驱动无进展。请基于执行记录推断卡点并给出下一步排障与修复路径（优先给最小变更方案）。');
+      if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
+        this._createAutoHealingTask(agentId, task_.id, consultRes.parsed.fix_steps);
+      }
+    } catch (e) {
+      console.error('[DriveOrchestrator] Stalled Auto-Healing 失败:', e.message);
+    }
 
     return { success: false, attempts: this.maxRetries, reply: lastReply, commands: lastResults, stalled: true };
   }
@@ -566,6 +610,39 @@ class DriveOrchestrator {
 
   async _tickInner() {
     const db = getDb();
+
+    // 检查是否有完成的自动修复子任务，恢复其父任务
+    try {
+      const completedHealingTasks = db.prepare(`
+        SELECT id, parent_id, agent_id, title FROM todos
+        WHERE status = 'completed'
+          AND parent_id IS NOT NULL AND parent_id != ''
+          AND title LIKE '[修复]%'
+      `).all();
+
+      for (const child of completedHealingTasks) {
+        const parent = Todo.findById(child.agent_id, child.parent_id);
+        if (parent && parent.status === 'blocked') {
+          Todo.update(parent.agent_id, parent.id, {
+            status: 'pending',
+            heartbeatStep: `🔄 子任务「${child.title}」已完成，恢复父任务执行`,
+            attemptCount: 0
+          });
+          Context.create(parent.agent_id, {
+            sessionId: 'auto-healing',
+            role: 'system',
+            content: `[Auto-Healing] 子任务 ${child.id} 已完成，父任务恢复为 pending 状态。`,
+            metadata: { type: 'auto_healing_resume', child_id: child.id, parent_id: parent.id }
+          });
+          Notification.create(parent.agent_id, parent.id, 'info', `🔄 自动修复完成，已恢复任务执行`);
+        }
+        // 将子任务标记为已归档，避免重复处理
+        Todo.update(child.agent_id, child.id, { archived: 1 });
+      }
+    } catch (e) {
+      console.error('[DriveOrchestrator] 恢复父任务失败:', e.message);
+    }
+
     const agents = Agent.findAll();
     let totalDriven = 0;
     let totalStalled = 0;
@@ -575,10 +652,20 @@ class DriveOrchestrator {
       if (concurrent >= this.maxConcurrentDrives) break;
 
       const focus = FocusState.findByAgent(agent.id);
-      if (!focus || !focus.current_task_id) continue;
+      let task = focus && focus.current_task_id ? Todo.findById(agent.id, focus.current_task_id) : null;
 
-      const task = Todo.findById(agent.id, focus.current_task_id);
-      if (!this.shouldDrive(task)) continue;
+      if (!task || !this.shouldDrive(task)) {
+        try {
+          const newFocus = await FocusState.autoFocus(agent.id, this.framework?.modules?.llmManager);
+          if (newFocus) {
+            task = Todo.findById(agent.id, newFocus.id);
+          }
+        } catch (e) {
+          console.error(`[DriveOrchestrator] 自动聚焦失败:`, e.message);
+        }
+      }
+
+      if (!task || !this.shouldDrive(task)) continue;
 
       if (task.status === 'pending') {
         const concurrency = Agent.canAcceptNewTask(agent.id);

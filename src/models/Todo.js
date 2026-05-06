@@ -200,7 +200,8 @@ class Todo {
       validationReport,
       validatedBy,
       validationCount,
-      validationDeadline
+      validationDeadline,
+      archived
     } = data;
 
     const updates = [];
@@ -341,6 +342,11 @@ class Todo {
     if (validationDeadline !== undefined) {
       updates.push('validation_deadline = ?');
       values.push(validationDeadline);
+    }
+
+    if (archived !== undefined) {
+      updates.push('archived = ?');
+      values.push(archived ? 1 : 0);
     }
 
     if (schedule !== undefined) {

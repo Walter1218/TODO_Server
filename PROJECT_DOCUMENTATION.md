@@ -22,6 +22,7 @@
 - **多智能体协作**：任务指派、转交、跨 agent 通知
 - **验收标准**：LLM 生成检查清单，用户确认后执行
 - **自动运维监控**：`StuckMonitor`、`DriveOrchestrator` 与 `ValidatorService` 协同工作，实现无人值守的任务修复与验收
+- **自愈机制 (Auto-Healing)**：任务阻塞 (Preflight失败/超时停滞) 时自动触发 LLM 诊断，自动派生 `[修复]` 子任务执行环境准备，修复完成后父任务自动恢复
 - **Agent-to-Agent 自驱校验**：Worker 执行，Validator 验收，Orchestrator 编排，彻底跳出 Human-in-the-loop（支持第三方 Agent 独立验证）
 - **LLM Agent Loop**：`ValidationAgent` 采用多轮工具调用（ReAct 模式）独立验证任务，最多 10 轮迭代，支持 RESULT-FIRST 验证策略、事实快速路径、系统日志过滤、收敛规则和强制判定兜底
 - **结构化驱动工具**：`StructuredDriveTools` 提供 `updateProgress`、`proposeCompletion`、`confirmCompletion`、`askForHelp` 等结构化工具，替代脆弱的文本解析
@@ -286,7 +287,7 @@ POST /api/agents/:id/focus/auto
 |---------|------|------|
 | StuckTaskMonitor | 3min | 基于动态阈值检测无心跳任务，自动恢复/标记 blocked（通知按类型冷却去重：recovered/blocked/zombie 60min，stalled 30min）。blocked 恢复前检查同模板是否已有活跃实例 |
 | ZombieDetector | 10min | 检测无心跳 >2h 的 in_progress 任务标记为 blocked，防止弹跳循环 |
-| DriveOrchestrator | 60s | 扫描所有有 focus 的任务，自动 drive + 验证，maxConcurrent=5 |
+| DriveOrchestrator | 60s | 扫描所有有 focus 的任务，自动 drive + 验证，maxConcurrent=5。<br> **新增 Auto-Healing (自愈) 机制**：当任务遇到 Preflight 阻塞或长时间 stalled，Orchestrator 会自动调用 Consult 获取修复步骤（`fix_steps`），自动生成并派发高优子任务（`[修复] 自动修复任务`）。子任务完成后，父任务将自动被恢复为 `pending` 重新执行。 |
 | ValidatorService | 随 Drive | 检测到 `pending_validation` 任务时自动调用 ValidationAgent 执行异步校验 |
 | LLMInferencer | 5min | LLM 推断 idle 5-15 分钟的任务真实状态，高置信度自动标记 |
 | WorkSnapshotMonitor | 2min | 采集所有 Agent 工作快照到 contexts（保留上限 30 条/会话） |
