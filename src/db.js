@@ -139,6 +139,7 @@ function initializeSchema() {
     { col: 'heartbeat_progress', type: 'REAL DEFAULT 0' },
     { col: 'heartbeat_step', type: 'TEXT DEFAULT \'\'' },
     { col: 'heartbeat_blockers', type: 'TEXT DEFAULT \'[]\'' },
+    { col: 'task_category', type: 'TEXT DEFAULT \'general\'' }
   ];
 
   for (const mig of todoMigrations) {
@@ -364,6 +365,7 @@ function initializeSchema() {
           validation_report TEXT,
           validated_by TEXT,
           validation_count INTEGER DEFAULT 0,
+          task_category TEXT DEFAULT 'general',
           FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
           FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
           FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
@@ -377,7 +379,7 @@ function initializeSchema() {
           schedule, is_template, origin_agent_id, assigned_agent_id,
           assignment_note, assigned_at, transferred_from, archived,
           next_due_at, last_spawned_at, last_driven_at,
-          validation_report, validated_by, validation_count
+          validation_report, validated_by, validation_count, task_category
         )
         SELECT 
           id, agent_id, project_id, parent_id, title, description, status, priority,
@@ -388,7 +390,7 @@ function initializeSchema() {
           schedule, is_template, origin_agent_id, assigned_agent_id,
           assignment_note, assigned_at, transferred_from, archived,
           next_due_at, last_spawned_at, last_driven_at,
-          validation_report, validated_by, validation_count
+          validation_report, validated_by, validation_count, 'general' as task_category
         FROM todos;
         DROP TABLE todos;
         ALTER TABLE todos_new RENAME TO todos;

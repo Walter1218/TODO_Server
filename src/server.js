@@ -3,6 +3,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const logger = require('./utils/logger');
 const agentsRouter = require('./routes/agents');
 const todosRouter = require('./routes/todos');
 const projectsRouter = require('./routes/projects');
@@ -37,7 +38,7 @@ app.use(cors(corsOptions));
 app.use(express.json());
 
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
+  logger.info(`${new Date().toISOString()} ${req.method} ${req.url}`);
   next();
 });
 
@@ -118,7 +119,7 @@ app.use((req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
+  logger.error('Unhandled error:', err);
   res.status(500).json({
     error: 'Internal server error',
     message: process.env.NODE_ENV === 'production' ? 'An unexpected error occurred' : err.message
@@ -126,15 +127,15 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Agent TODO Server is running on port ${PORT}`);
-  console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log(`API base URL: http://localhost:${PORT}/api`);
+  logger.info(`Agent TODO Server is running on port ${PORT}`);
+  logger.info(`Health check: http://localhost:${PORT}/health`);
+  logger.info(`API base URL: http://localhost:${PORT}/api`);
 
   try {
     getDb();
-    console.log('Database initialized successfully');
+    logger.info('Database initialized successfully');
   } catch (error) {
-    console.error('Failed to initialize database:', error);
+    logger.error('Failed to initialize database:', error);
     process.exit(1);
   }
 
@@ -144,9 +145,9 @@ app.listen(PORT, () => {
     const { AgentTaskFramework } = require('../framework');
     driveFramework = AgentTaskFramework.fromConfig();
     driveFramework.initialize().then(() => {
-      console.log('[Framework] 已初始化，支持手动驱动');
+      logger.info('[Framework] 已初始化，支持手动驱动');
     }).catch(err => {
-      console.error('[Framework] 初始化失败:', err.message);
+      logger.error('[Framework] 初始化失败:', err.message);
     });
     // 挂载到 app 供路由使用
     app.set('driveFramework', driveFramework);
@@ -164,7 +165,7 @@ app.listen(PORT, () => {
     driveOrchestrator.start(driveFramework);
     app.set('driveOrchestrator', driveOrchestrator);
   } catch (err) {
-    console.error('[Framework] 加载失败:', err.message);
+    logger.error('[Framework] 加载失败:', err.message);
   }
 
   // 通知去重冷却缓存（taskId+type -> 上次通知时间戳），防止相同类型通知反复刷屏
@@ -215,12 +216,12 @@ app.listen(PORT, () => {
         const lastUpdate = recentHermesTasks.last_update ? new Date(recentHermesTasks.last_update.replace(' ', 'T') + 'Z').getTime() : 0;
         if (lastUpdate > 0 && Date.now() - lastUpdate > HERMES_STALE_THRESHOLD_MS) {
           const staleMinutes = Math.round((Date.now() - lastUpdate) / 60000);
-          console.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 健康警告：超过 ${staleMinutes} 分钟没有更新验证任务`);
+          logger.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 健康警告：超过 ${staleMinutes} 分钟没有更新验证任务`);
           const validatingCount = db.prepare(`
             SELECT COUNT(*) as count FROM todos WHERE agent_id = ? AND status = 'validating'
           `).get(HERMES_TESTER_ID).count;
           if (validatingCount > 0) {
-            console.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 有 ${validatingCount} 个验证任务卡住中，可能未正常运行`);
+            logger.warn(`[StuckTaskMonitor] ⚠️ hermes-tester 有 ${validatingCount} 个验证任务卡住中，可能未正常运行`);
           }
         }
       }
@@ -283,7 +284,7 @@ app.listen(PORT, () => {
                 heartbeatStep: `🔒 验证次数已耗尽(${vc1a})且无心跳，保持 blocked`,
                 lastHeartbeat: new Date().toISOString()
               });
-              console.log(`[StuckTaskMonitor] 任务 ${task.id} 验证已耗尽(${vc1a})且无心跳，标记 blocked`);
+              logger.info(`[StuckTaskMonitor] 任务 ${task.id} 验证已耗尽(${vc1a})且无心跳，标记 blocked`);
               totalStuck++;
               continue;
             }
@@ -314,7 +315,7 @@ app.listen(PORT, () => {
             Notification.create(agent.id, task.id, 'recovered',
               `任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），StuckTaskMonitor 已自动恢复（attempt_count: ${currentAttempts}/${maxAttempts}）`
             );
-            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 自动恢复，${thresholdReason}=${thresholdMinutes}min, 实际idle=${idleMinutes}min, attempt_count 不变 ${currentAttempts}/${maxAttempts}`);
+            logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 自动恢复，${thresholdReason}=${thresholdMinutes}min, 实际idle=${idleMinutes}min, attempt_count 不变 ${currentAttempts}/${maxAttempts}`);
           } else {
             // 真正的工作尝试次数已耗尽，保持 blocked
             Todo.updateStatus(agent.id, task.id, 'blocked');
@@ -323,7 +324,7 @@ app.listen(PORT, () => {
                 `任务「${task.title}」无心跳 ${idleMinutes} 分钟（超过${thresholdReason} ${thresholdMinutes} 分钟），且工作尝试次数已耗尽（${currentAttempts}/${maxAttempts}），需要人工介入`
               );
             }
-            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 尝试次数耗尽，保持 blocked`);
+            logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 尝试次数耗尽，保持 blocked`);
           }
           totalStuck++;
         }
@@ -340,13 +341,13 @@ app.listen(PORT, () => {
         const agentConcurrency = Agent.canAcceptNewTask(agent.id);
         for (const task of blockedStuck) {
           if (!agentConcurrency.canAccept) {
-            console.log(`[StuckTaskMonitor] Agent ${agent.id} 已达并发上限(${agentConcurrency.active}/${agentConcurrency.max})，跳过恢复「${task.title}」`);
+            logger.info(`[StuckTaskMonitor] Agent ${agent.id} 已达并发上限(${agentConcurrency.active}/${agentConcurrency.max})，跳过恢复「${task.title}」`);
             break;
           }
           // 冷却期检查：2 分钟内已更新过的任务跳过（防止和 Worker 竞态恢复）
           const lastUpdate = task.updated_at ? new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime() : 0;
           if (Date.now() - lastUpdate < 2 * 60 * 1000) {
-            console.log(`[StuckTaskMonitor] 任务 ${task.id} 2 分钟内已更新，跳过恢复`);
+            logger.info(`[StuckTaskMonitor] 任务 ${task.id} 2 分钟内已更新，跳过恢复`);
             continue;
           }
 
@@ -360,7 +361,7 @@ app.listen(PORT, () => {
               LIMIT 1
             `).get(agent.id, task.parent_id, task.id);
             if (siblingActive) {
-              console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 同模板已有活跃实例 ${siblingActive.id}，跳过恢复`);
+              logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 同模板已有活跃实例 ${siblingActive.id}，跳过恢复`);
               continue;
             }
           }
@@ -369,7 +370,7 @@ app.listen(PORT, () => {
           const maxAttempts = task.max_attempts || 3;
           const vc = task.validation_count || 0;
           if (vc >= 3) {
-            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 验证次数已耗尽(${vc})，保持 blocked`);
+            logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 验证次数已耗尽(${vc})，保持 blocked`);
             continue;
           }
 
@@ -392,7 +393,7 @@ app.listen(PORT, () => {
           Notification.create(agent.id, task.id, 'recovered',
             `任务「${task.title}」从 blocked 自动恢复（无心跳超过 ${STUCK_MAX_IDLE_MINUTES} 分钟，attempt_count: ${currentAttempts}/${maxAttempts}）`
           );
-          console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 从 blocked 自动恢复，attempt_count 不变 ${currentAttempts}/${maxAttempts}`);
+          logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 从 blocked 自动恢复，attempt_count 不变 ${currentAttempts}/${maxAttempts}`);
           totalStuck++;
         }
 
@@ -404,7 +405,7 @@ app.listen(PORT, () => {
             Notification.create(agent.id, task.id, 'stalled',
               `任务「${task.title}」进度停滞：已 ${PROGRESS_STALL_MINUTES} 分钟无进展，当前步骤：${lastStep}`
             );
-            console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 进度停滞 ${PROGRESS_STALL_MINUTES} 分钟`);
+            logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 进度停滞 ${PROGRESS_STALL_MINUTES} 分钟`);
           }
         }
 
@@ -429,7 +430,7 @@ app.listen(PORT, () => {
                 content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」连续命令失败。请检查：\n1. 确认命令是否正确（如 duckdb CLI 不存在，应使用 python3 -c "import duckdb..."）\n2. 如遇到无法解决的问题，请调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助\n3. 避免重复执行相同的失败命令，尝试替代方案`,
                 metadata: { type: 'corrective_guidance', task_id: task.id, failure_count: parseInt(match[1]) }
               });
-              console.log(`[StuckTaskMonitor] 已向${getTaskTypeLabel(task)} ${task.id} 发送纠正指导`);
+              logger.info(`[StuckTaskMonitor] 已向${getTaskTypeLabel(task)} ${task.id} 发送纠正指导`);
             }
           }
         }
@@ -460,7 +461,7 @@ app.listen(PORT, () => {
               content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」LLM 调用卡住（已 ${idleMinutes} 分钟无响应）。建议：\n1. 检查 LLM 服务是否正常\n2. 如果 LLM 无响应超过 5 分钟，可以手动重启 agent 进程\n3. 或调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
               metadata: { type: 'validation_timeout', task_id: task.id, idle_minutes: idleMinutes, last_step: lastStep }
             });
-            console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} LLM 调用卡住 ${idleMinutes} 分钟`);
+            logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} LLM 调用卡住 ${idleMinutes} 分钟`);
             totalStuck++;
           }
 
@@ -475,7 +476,7 @@ app.listen(PORT, () => {
               content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」执行卡住（已运行 ${ageMinutes} 分钟，当前步骤: ${lastStep}）。建议：\n1. 检查任务是否在执行死循环\n2. 检查命令执行是否有阻塞\n3. 如无法解决，调用 POST /api/agents/${agent.id}/todos/${task.id}/request-help 请求帮助`,
               metadata: { type: 'validation_stuck', task_id: task.id, age_minutes: ageMinutes, last_step: lastStep }
             });
-            console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 执行卡住 ${ageMinutes} 分钟`);
+            logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 执行卡住 ${ageMinutes} 分钟`);
             totalStuck++;
           }
         }
@@ -503,7 +504,7 @@ app.listen(PORT, () => {
               Notification.create(agent.id, task.id, 'validation_exhausted',
                 `任务「${task.title}」验证超时且已达次数上限(${vc}次)，已标记为阻塞`
               );
-              console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时且达上限，标记阻塞`);
+              logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时且达上限，标记阻塞`);
             } else {
               Todo.update(agent.id, task.id, {
                 status: 'pending_validation',
@@ -518,7 +519,7 @@ app.listen(PORT, () => {
               Notification.create(agent.id, task.id, 'validation_timeout',
                 `任务「${task.title}」第三方验证超时，已重新进入验证队列`
               );
-              console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时 ${idleMinutes} 分钟，已重新入队`);
+              logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证超时 ${idleMinutes} 分钟，已重新入队`);
             }
           } else {
             Context.create(agent.id, {
@@ -527,7 +528,7 @@ app.listen(PORT, () => {
               content: `[StuckTaskMonitor] 检测到${getTaskTypeLabel(task)}「${task.title}」验证阶段等待中（已 ${idleMinutes} 分钟无更新）。hermes-tester 正在处理中...`,
               metadata: { type: 'validation_validating_pending', task_id: task.id, idle_minutes: idleMinutes }
             });
-            console.log(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证等待中 ${idleMinutes} 分钟`);
+            logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 验证等待中 ${idleMinutes} 分钟`);
           }
           totalStuck++;
         }
@@ -578,20 +579,20 @@ app.listen(PORT, () => {
           Notification.create(agent.id, task.id, 'recovered',
             `任务「${task.title}」已 blocked 超过 ${BLOCKED_RESET_HOURS} 小时，尝试次数自动重置为 0/3`
           );
-          console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) blocked 超过 ${BLOCKED_RESET_HOURS}h，重置尝试次数`);
+          logger.info(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) blocked 超过 ${BLOCKED_RESET_HOURS}h，重置尝试次数`);
           totalStuck++;
         }
       }
 
       if (totalStuck > 0) {
-        console.log(`[StuckTaskMonitor] 本次处理 ${totalStuck} 个卡住任务`);
+        logger.info(`[StuckTaskMonitor] 本次处理 ${totalStuck} 个卡住任务`);
       }
     } catch (err) {
-      console.error('[StuckTaskMonitor] 检查卡住任务时出错:', err.message);
+      logger.error('[StuckTaskMonitor] 检查卡住任务时出错:', err.message);
     }
   }, STUCK_CHECK_INTERVAL_MS);
 
-  console.log(`[StuckTaskMonitor] 已启动，每 ${STUCK_CHECK_INTERVAL_MS / 1000}s 检查一次，无心跳阈值 ${STUCK_MAX_IDLE_MINUTES} 分钟，进度停滞阈值 ${PROGRESS_STALL_MINUTES} 分钟`);
+  logger.info(`[StuckTaskMonitor] 已启动，每 ${STUCK_CHECK_INTERVAL_MS / 1000}s 检查一次，无心跳阈值 ${STUCK_MAX_IDLE_MINUTES} 分钟，进度停滞阈值 ${PROGRESS_STALL_MINUTES} 分钟`);
 
   // 自动归档旧任务：每天归档一次超过 30 天的 completed/cancelled 任务 + 清理超时 pending
   const ARCHIVE_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -608,32 +609,32 @@ app.listen(PORT, () => {
       for (const agent of agents) {
         const archived = Todo.archiveOldCompleted(agent.id, ARCHIVE_DAYS_OLD);
         if (archived > 0) {
-          console.log(`[CleanupMonitor] Agent ${agent.id}: 归档了 ${archived} 个超过 ${ARCHIVE_DAYS_OLD} 天的旧任务`);
+          logger.info(`[CleanupMonitor] Agent ${agent.id}: 归档了 ${archived} 个超过 ${ARCHIVE_DAYS_OLD} 天的旧任务`);
           totalArchived += archived;
         }
 
         const cancelled = Todo.cancelStalePending(agent.id, STALE_PENDING_HOURS);
         if (cancelled > 0) {
-          console.log(`[CleanupMonitor] Agent ${agent.id}: 取消了 ${cancelled} 个超过 ${STALE_PENDING_HOURS}h 的 pending 任务`);
+          logger.info(`[CleanupMonitor] Agent ${agent.id}: 取消了 ${cancelled} 个超过 ${STALE_PENDING_HOURS}h 的 pending 任务`);
           totalCancelled += cancelled;
         }
 
         const orphans = Todo.cancelOrphanChildren(agent.id);
         if (orphans > 0) {
-          console.log(`[CleanupMonitor] Agent ${agent.id}: 清理了 ${orphans} 个孤儿子任务（父任务已完成）`);
+          logger.info(`[CleanupMonitor] Agent ${agent.id}: 清理了 ${orphans} 个孤儿子任务（父任务已完成）`);
           totalOrphans += orphans;
         }
       }
 
       if (totalArchived > 0 || totalCancelled > 0 || totalOrphans > 0) {
-        console.log(`[CleanupMonitor] 本次: 归档 ${totalArchived}, 取消过期 ${totalCancelled}, 清理孤儿 ${totalOrphans}`);
+        logger.info(`[CleanupMonitor] 本次: 归档 ${totalArchived}, 取消过期 ${totalCancelled}, 清理孤儿 ${totalOrphans}`);
       }
     } catch (err) {
-      console.error('[CleanupMonitor] 归档旧任务时出错:', err.message);
+      logger.error('[CleanupMonitor] 归档旧任务时出错:', err.message);
     }
   }, ARCHIVE_INTERVAL_MS);
 
-  console.log(`[CleanupMonitor] 已启动，每 ${ARCHIVE_INTERVAL_MS / 1000 / 60 / 60}h 清理一次，归档阈值 ${ARCHIVE_DAYS_OLD} 天，pending 过期 ${STALE_PENDING_HOURS}h`);
+  logger.info(`[CleanupMonitor] 已启动，每 ${ARCHIVE_INTERVAL_MS / 1000 / 60 / 60}h 清理一次，归档阈值 ${ARCHIVE_DAYS_OLD} 天，pending 过期 ${STALE_PENDING_HOURS}h`);
 
   // 定时调度任务引擎：每分钟检查到期的模板任务并生成实例
   const SCHEDULER_INTERVAL_MS = 60 * 1000;
@@ -651,7 +652,7 @@ app.listen(PORT, () => {
             const nextDue = Todo.computeNextDueAt(template.schedule, new Date());
             if (nextDue) {
               Todo.update(agent.id, template.id, { nextDueAt: nextDue });
-              console.log(`[DailyScheduler] 修复旧模板 ${template.id} 的 next_due_at: ${nextDue}`);
+              logger.info(`[DailyScheduler] 修复旧模板 ${template.id} 的 next_due_at: ${nextDue}`);
             }
           }
         }
@@ -673,22 +674,22 @@ app.listen(PORT, () => {
               `定时模板「${template.title}」已生成执行实例，等待 cron job 认领执行`
             );
 
-            console.log(`[DailyScheduler] Agent ${agent.id}: 从模板 ${template.id} 生成任务 ${spawned.id}「${spawned.title}」`);
+            logger.info(`[DailyScheduler] Agent ${agent.id}: 从模板 ${template.id} 生成任务 ${spawned.id}「${spawned.title}」`);
           } catch (spawnErr) {
-            console.error(`[DailyScheduler] 模板 ${template.id} spawn 失败:`, spawnErr.message);
+            logger.error(`[DailyScheduler] 模板 ${template.id} spawn 失败:`, spawnErr.message);
           }
         }
       }
 
       if (totalSpawned > 0) {
-        console.log(`[DailyScheduler] 本次共生成 ${totalSpawned} 个定时任务实例`);
+        logger.info(`[DailyScheduler] 本次共生成 ${totalSpawned} 个定时任务实例`);
       }
     } catch (err) {
-      console.error('[DailyScheduler] 调度检查时出错:', err.message);
+      logger.error('[DailyScheduler] 调度检查时出错:', err.message);
     }
   }, SCHEDULER_INTERVAL_MS);
 
-  console.log(`[DailyScheduler] 已启动，每 ${SCHEDULER_INTERVAL_MS / 1000}s 检查一次到期模板任务`);
+  logger.info(`[DailyScheduler] 已启动，每 ${SCHEDULER_INTERVAL_MS / 1000}s 检查一次到期模板任务`);
 
   const CRON_START_GRACE_MINUTES = parseInt(process.env.CRON_START_GRACE_MINUTES || '10', 10);
   const CRON_NAG_COOLDOWN_MINUTES = parseInt(process.env.CRON_NAG_COOLDOWN_MINUTES || '60', 10);
@@ -718,7 +719,7 @@ app.listen(PORT, () => {
           LIMIT 50
         `).all(overdueCutoff);
       } catch (sqlErr) {
-        console.error('[CronExecutionMonitor] SQL 查询出错:', sqlErr.message);
+        logger.error('[CronExecutionMonitor] SQL 查询出错:', sqlErr.message);
         return;
       }
 
@@ -766,19 +767,19 @@ app.listen(PORT, () => {
 
           totalNagged++;
         } catch (taskErr) {
-          console.error(`[CronExecutionMonitor] 任务 ${task.id} 处理失败: ${taskErr.message}`);
+          logger.error(`[CronExecutionMonitor] 任务 ${task.id} 处理失败: ${taskErr.message}`);
         }
       }
 
       if (totalNagged > 0) {
-        console.log(`[CronExecutionMonitor] 本次标记/提醒 ${totalNagged} 个未按时启动的定时实例（阈值 ${CRON_START_GRACE_MINUTES}min）`);
+        logger.info(`[CronExecutionMonitor] 本次标记/提醒 ${totalNagged} 个未按时启动的定时实例（阈值 ${CRON_START_GRACE_MINUTES}min）`);
       }
     } catch (err) {
-      console.error('[CronExecutionMonitor] 扫描出错:', err.message, err.stack?.split('\n').slice(0, 3).join(' '));
+      logger.error('[CronExecutionMonitor] 扫描出错:', err.message, err.stack?.split('\n').slice(0, 3).join(' '));
     }
   }, CRON_MONITOR_INTERVAL_MS);
 
-  console.log(`[CronExecutionMonitor] 已启动，每 ${CRON_MONITOR_INTERVAL_MS / 1000}s 扫描 pending 定时实例；启动阈值 ${CRON_START_GRACE_MINUTES}min，提醒冷却 ${CRON_NAG_COOLDOWN_MINUTES}min`);
+  logger.info(`[CronExecutionMonitor] 已启动，每 ${CRON_MONITOR_INTERVAL_MS / 1000}s 扫描 pending 定时实例；启动阈值 ${CRON_START_GRACE_MINUTES}min，提醒冷却 ${CRON_NAG_COOLDOWN_MINUTES}min`);
 
   // AssignmentDriver：每 60 秒扫描已指派但长时间未执行的任务，自动 focus + 通知
   const ASSIGN_DRIVER_INTERVAL_MS = 60 * 1000;
@@ -824,23 +825,23 @@ app.listen(PORT, () => {
             });
             Context.pruneBySession(agent.id, 'assignment-driver', 50);
 
-            console.log(`[AssignmentDriver] Agent ${agent.id}: 任务 ${rawTask.id}「${rawTask.title}」被指派后超时，已自动聚焦`);
+            logger.info(`[AssignmentDriver] Agent ${agent.id}: 任务 ${rawTask.id}「${rawTask.title}」被指派后超时，已自动聚焦`);
             totalDriven++;
           } catch (taskErr) {
-            console.error(`[AssignmentDriver] 处理任务 ${rawTask.id} 失败:`, taskErr.message);
+            logger.error(`[AssignmentDriver] 处理任务 ${rawTask.id} 失败:`, taskErr.message);
           }
         }
       }
 
       if (totalDriven > 0) {
-        console.log(`[AssignmentDriver] 本次共驱动 ${totalDriven} 个超时未执行的已指派任务`);
+        logger.info(`[AssignmentDriver] 本次共驱动 ${totalDriven} 个超时未执行的已指派任务`);
       }
     } catch (err) {
-      console.error('[AssignmentDriver] 巡检时出错:', err.message);
+      logger.error('[AssignmentDriver] 巡检时出错:', err.message);
     }
   }, ASSIGN_DRIVER_INTERVAL_MS);
 
-  console.log(`[AssignmentDriver] 已启动，每 ${ASSIGN_DRIVER_INTERVAL_MS / 1000}s 扫描已指派但未执行的任务（超时阈值 ${ASSIGN_STALE_MINUTES} 分钟）`);
+  logger.info(`[AssignmentDriver] 已启动，每 ${ASSIGN_DRIVER_INTERVAL_MS / 1000}s 扫描已指派但未执行的任务（超时阈值 ${ASSIGN_STALE_MINUTES} 分钟）`);
 
   // 工作快照轮询：每 2 分钟采集所有 Agent 工作状态（原 30s 产生过量 context 记录）
   const SNAPSHOT_INTERVAL_MS = 2 * 60 * 1000;
@@ -893,11 +894,11 @@ app.listen(PORT, () => {
         Context.pruneBySession(agent.id, 'work-snapshot', SNAPSHOT_MAX_RETAIN);
       }
     } catch (err) {
-      console.error('[WorkSnapshotMonitor] 采集失败:', err.message);
+      logger.error('[WorkSnapshotMonitor] 采集失败:', err.message);
     }
   }, SNAPSHOT_INTERVAL_MS);
 
-  console.log(`[WorkSnapshotMonitor] 已启动，每 ${SNAPSHOT_INTERVAL_MS / 1000}s 采集一次工作状态`);
+  logger.info(`[WorkSnapshotMonitor] 已启动，每 ${SNAPSHOT_INTERVAL_MS / 1000}s 采集一次工作状态`);
 
   // ==================== LLM 辅助状态推断引擎 ====================
   // 当智能体超过 5 分钟没有主动报告心跳时，利用 LLM 分析最近活动记录，
@@ -957,7 +958,7 @@ app.listen(PORT, () => {
               heartbeat_blockers: parseJson(rawTask.heartbeat_blockers, [])
             };
           } catch (e) {
-            console.warn(`[StuckTaskMonitor] 任务 ${rawTask.id} JSON 解析错误，跳过: ${e.message}`);
+            logger.warn(`[StuckTaskMonitor] 任务 ${rawTask.id} JSON 解析错误，跳过: ${e.message}`);
             continue;
           }
 
@@ -1031,12 +1032,12 @@ ${attemptLines}
               try {
                 inference = JSON.parse(jsonMatch[0]);
               } catch (parseErr) {
-                console.log(`[LLMInferencer] JSON 解析失败: ${parseErr.message}`);
+                logger.info(`[LLMInferencer] JSON 解析失败: ${parseErr.message}`);
               }
             }
 
             if (!inference || typeof inference.confidence !== 'number') {
-              console.log(`[LLMInferencer] 任务 ${task.id} LLM 返回格式异常，跳过处理`);
+              logger.info(`[LLMInferencer] 任务 ${task.id} LLM 返回格式异常，跳过处理`);
               continue;
             }
 
@@ -1044,7 +1045,7 @@ ${attemptLines}
             const suggestedStatus = inference.suggested_status;
             const isWorking = inference.is_working;
 
-            console.log(`[LLMInferencer] 任务 ${task.id} (${task.title.substring(0, 30)}...) | ` +
+            logger.info(`[LLMInferencer] 任务 ${task.id} (${task.title.substring(0, 30)}...) | ` +
               `is_working=${isWorking} | suggested=${suggestedStatus} | confidence=${confidence}`);
 
             // 记录推断结果到 contexts
@@ -1073,7 +1074,7 @@ ${attemptLines}
                 Notification.create(agent.id, task.id, 'completed',
                   `任务「${task.title}」被 LLM 推断为已完成（置信度 ${Math.round(confidence * 100)}%），原因：${inference.reason || ''}`
                 );
-                console.log(`[LLMInferencer] 任务 ${task.id} 自动标记为 completed`);
+                logger.info(`[LLMInferencer] 任务 ${task.id} 自动标记为 completed`);
 
               } else if (suggestedStatus === 'blocked' && isWorking === false) {
                 const taskDesc = (task.description || '').toLowerCase();
@@ -1092,7 +1093,7 @@ ${attemptLines}
                   Notification.create(agent.id, task.id, 'completed',
                     `任务「${task.title}」被标记为已完成（description 包含巡检结果/执行报告）`
                   );
-                  console.log(`[LLMInferencer] 任务 ${task.id} description 包含结果证据，标记为 completed 而非 blocked`);
+                  logger.info(`[LLMInferencer] 任务 ${task.id} description 包含结果证据，标记为 completed 而非 blocked`);
                 } else {
                 // LLM 判断任务已卡住，提前标记 blocked
                 const newLog = [...task.attempt_log, {
@@ -1110,7 +1111,7 @@ ${attemptLines}
                 Notification.create(agent.id, task.id, 'blocked',
                   `任务「${task.title}」被 LLM 推断为已卡住（置信度 ${Math.round(confidence * 100)}%），原因：${inference.reason || ''}`
                 );
-                console.log(`[LLMInferencer] 任务 ${task.id} 提前标记为 blocked`);
+                logger.info(`[LLMInferencer] 任务 ${task.id} 提前标记为 blocked`);
                 }
 
               } else if (isWorking === true && inference.current_action) {
@@ -1118,20 +1119,20 @@ ${attemptLines}
                 Todo.updateHeartbeat(agent.id, task.id, {
                   step: `LLM 推断: ${inference.current_action}`
                 });
-                console.log(`[LLMInferencer] 任务 ${task.id} 更新心跳步骤: ${inference.current_action}`);
+                logger.info(`[LLMInferencer] 任务 ${task.id} 更新心跳步骤: ${inference.current_action}`);
               }
             }
           } catch (llmErr) {
-            console.error(`[LLMInferencer] LLM 调用失败: ${llmErr.message}`);
+            logger.error(`[LLMInferencer] LLM 调用失败: ${llmErr.message}`);
           }
         }
       }
     } catch (err) {
-      console.error('[LLMInferencer] 状态推断出错:', err.message);
+      logger.error('[LLMInferencer] 状态推断出错:', err.message);
     }
   }, INFERENCE_INTERVAL_MS);
 
-  console.log(`[LLMInferencer] 已启动，每 ${INFERENCE_INTERVAL_MS / 60000}min 运行一次，` +
+  logger.info(`[LLMInferencer] 已启动，每 ${INFERENCE_INTERVAL_MS / 60000}min 运行一次，` +
     `触发阈值 ${INFERENCE_MIN_IDLE_MS / 60000}-${INFERENCE_MAX_IDLE_MS / 60000}min，` +
     `置信度阈值 ${INFERENCE_CONFIDENCE_THRESHOLD}`);
 
@@ -1169,14 +1170,14 @@ ${attemptLines}
       totalCleaned += delNotif.changes;
 
       if (totalCleaned > 0) {
-        console.log(`[GlobalCleanup] 已清理 ${totalCleaned} 条过期数据`);
+        logger.info(`[GlobalCleanup] 已清理 ${totalCleaned} 条过期数据`);
       }
     } catch (err) {
-      console.error('[GlobalCleanup] 清理出错:', err.message);
+      logger.error('[GlobalCleanup] 清理出错:', err.message);
     }
   }, GLOBAL_CLEANUP_INTERVAL_MS);
 
-  console.log(`[GlobalCleanup] 已启动，每 ${GLOBAL_CLEANUP_INTERVAL_MS / 3600000}h 清理一次（contexts 保留 ${CONTEXT_MAX_AGE_DAYS} 天，notifications 保留 ${NOTIFICATION_MAX_AGE_DAYS} 天已读）`);
+  logger.info(`[GlobalCleanup] 已启动，每 ${GLOBAL_CLEANUP_INTERVAL_MS / 3600000}h 清理一次（contexts 保留 ${CONTEXT_MAX_AGE_DAYS} 天，notifications 保留 ${NOTIFICATION_MAX_AGE_DAYS} 天已读）`);
 
   // ==================== 僵尸任务检测 ====================
   // 每 10 分钟检测 in_progress 但超过 2 小时无心跳的任务，自动标记 blocked
@@ -1223,14 +1224,14 @@ ${attemptLines}
       }
 
       if (totalZombies > 0) {
-        console.log(`[ZombieDetector] 本次标记 ${totalZombies} 个僵尸任务为 blocked`);
+        logger.info(`[ZombieDetector] 本次标记 ${totalZombies} 个僵尸任务为 blocked`);
       }
     } catch (err) {
-      console.error('[ZombieDetector] 检测出错:', err.message);
+      logger.error('[ZombieDetector] 检测出错:', err.message);
     }
   }, ZOMBIE_INTERVAL_MS);
 
-  console.log(`[ZombieDetector] 已启动，每 ${ZOMBIE_INTERVAL_MS / 60000}min 检测无心跳超 ${ZOMBIE_THRESHOLD_MINUTES}min 的僵尸任务`);
+  logger.info(`[ZombieDetector] 已启动，每 ${ZOMBIE_INTERVAL_MS / 60000}min 检测无心跳超 ${ZOMBIE_THRESHOLD_MINUTES}min 的僵尸任务`);
 });
 
 module.exports = app;

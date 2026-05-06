@@ -76,6 +76,8 @@ function initTestSchema(db) {
       validated_by TEXT,
       validation_count INTEGER DEFAULT 0,
       validation_deadline DATETIME,
+      task_category TEXT DEFAULT 'general',
+      completion_report TEXT,
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
       FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
