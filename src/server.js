@@ -2,6 +2,7 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const path = require('path');
 const logger = require('./utils/logger');
 const agentsRouter = require('./routes/agents');
@@ -36,6 +37,23 @@ const corsOptions = {
 };
 app.use(cors(corsOptions));
 app.use(express.json());
+
+// Trust proxy for rate limiting behind Nginx
+if (process.env.NODE_ENV === 'production') {
+  app.set('trust proxy', 1);
+}
+
+// API Rate Limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: process.env.NODE_ENV === 'production' ? 1000 : 10000, // Limit each IP to 1000 requests per `window` in prod
+  message: { error: 'Too many requests from this IP, please try again after 15 minutes' },
+  standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
+  legacyHeaders: false, // Disable the `X-RateLimit-*` headers
+});
+
+// Apply rate limiter to all API routes
+app.use('/api', apiLimiter);
 
 app.use((req, res, next) => {
   logger.info(`${new Date().toISOString()} ${req.method} ${req.url}`);

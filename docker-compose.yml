@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  todo-server:
+    build: .
+    container_name: agent-todo-server
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - LOG_LEVEL=info
+      # DB_PATH will use the default set in Dockerfile: ./data/prod/todo.db
+      # CORS_ORIGIN=https://your-production-domain.com
+    volumes:
+      - ./data/prod:/app/data/prod
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
