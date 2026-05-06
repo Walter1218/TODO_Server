@@ -163,10 +163,22 @@ app.listen(PORT, () => {
 
   // 通知去重冷却缓存（taskId+type -> 上次通知时间戳），防止相同类型通知反复刷屏
   const _notifCooldown = new Map();
-  function _shouldNotify(taskId, type, cooldownMs = 30 * 60 * 1000) {
+  const _COOLDOWN_BY_TYPE = {
+    recovered: 60 * 60 * 1000,
+    blocked: 60 * 60 * 1000,
+    zombie_blocked: 60 * 60 * 1000,
+    stalled: 30 * 60 * 1000,
+    assigned: 0,
+    completion: 0,
+    validation_timeout: 15 * 60 * 1000,
+    validation_exhausted: 0,
+  };
+  function _shouldNotify(taskId, type, cooldownMs) {
+    const effectiveCooldown = cooldownMs ?? _COOLDOWN_BY_TYPE[type] ?? (30 * 60 * 1000);
+    if (effectiveCooldown === 0) return true;
     const key = `${taskId}:${type}`;
     const last = _notifCooldown.get(key) || 0;
-    if (Date.now() - last < cooldownMs) return false;
+    if (Date.now() - last < effectiveCooldown) return false;
     _notifCooldown.set(key, Date.now());
     if (_notifCooldown.size > 5000) {
       const oldest = [..._notifCooldown.entries()].sort((a, b) => a[1] - b[1]).slice(0, 2500);
@@ -330,6 +342,21 @@ app.listen(PORT, () => {
           if (Date.now() - lastUpdate < 2 * 60 * 1000) {
             console.log(`[StuckTaskMonitor] 任务 ${task.id} 2 分钟内已更新，跳过恢复`);
             continue;
+          }
+
+          // 同模板活跃实例去重：如果同一个模板已经有一个 pending/in_progress 的实例，不恢复此 blocked 任务
+          if (task.parent_id) {
+            const siblingActive = db.prepare(`
+              SELECT id FROM todos
+              WHERE agent_id = ? AND parent_id = ? AND id != ?
+                AND status IN ('pending', 'in_progress')
+                AND (archived = 0 OR archived IS NULL)
+              LIMIT 1
+            `).get(agent.id, task.parent_id, task.id);
+            if (siblingActive) {
+              console.log(`[StuckTaskMonitor] 任务 ${task.id} (${task.title}) 同模板已有活跃实例 ${siblingActive.id}，跳过恢复`);
+              continue;
+            }
           }
 
           const currentAttempts = task.attempt_count || 0;

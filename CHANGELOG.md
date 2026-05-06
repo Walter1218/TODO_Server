@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ---
 
+## [1.1.0-pre.2] - 2026-05-06
+
+> Fixes task instance over-spawning and notification storm. Based on daily throughput analysis.
+
+### Fixed
+
+- **Task over-spawning (P0)**: Each template spawned 2-6x duplicate instances per day instead of 1.
+  - `todo_bridge.py` `spawn_instance()` now checks for existing active (pending/in_progress/blocked) child of the same template before creating new instance; reuses active one if found. Added process-level `fcntl` file lock per script name to prevent concurrent launches of the same script.
+  - Spawn API route `POST /{template_id}/spawn` now defaults `replaceExisting=true` (was `false`). Active duplicate instances are automatically cancelled and archived when a new one spawns from the same template.
+  - StuckTaskMonitor blocked-task recovery now skips tasks whose parent template already has another active sibling instance, preventing blocked→recovery→new spawn ping-pong loop.
+
+- **Notification storm**: 50 unread notifications (40 recovery + 10 blocked) caused by repeated blocked↔recovered bounce.
+  - Cooldown tightened: `recovered`, `blocked`, `zombie_blocked` → 60min (was 30min); `stalled` → 30min; assigned/completion → no cooldown.
+  - `_shouldNotify()` now uses a type-specific default cooldown map (`_COOLDOWN_BY_TYPE`), with per-call override still supported.
+
+### Added
+
+- **`TodoTask` dedup and lock support**: `todo_bridge.TodoTask` now accepts `dedup=True` and `lock_name=None` parameters. When `lock_name` is set, a process-level file lock (`/tmp/todo_bridge_{name}.lock`) prevents concurrent script runs; when dedup is active (default), existing active template children are reused instead of spawning new ones.
+
+### Changed
+
+- **`todo_bridge._request()` auth**: Now uses `X-Agent-Secret` header for authentication (matching server route expectations).
+- **`find_template()` enhanced**: Substring matching now also checks `find_template()` via `/scheduled/pending` and `?isTemplate=false&limit=200` for active instance lookup.
+
+---
+
 ## [1.1.0-pre.1] - 2026-05-05
 
 > Pre-release version. Fixes critical task completion signal delivery failure and adds robust observability infrastructure.

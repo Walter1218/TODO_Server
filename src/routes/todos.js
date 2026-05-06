@@ -791,14 +791,17 @@ router.post('/:id/spawn', async (req, res) => {
       return res.status(400).json({ error: 'Validation error', message: 'Task is not a template' });
     }
 
-    const spawned = Todo.spawnFromTemplate(agentId, id);
+    const skipDedupe = req.body?.skipDedupe === true;
+    const replaceExisting = req.body?.replaceExisting !== false;
+
+    const spawned = Todo.spawnFromTemplate(agentId, id, { skipDedupe, replaceExisting });
 
     // Auto-focus after spawning
     const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
 
     res.json({
       success: true,
-      data: { template: todo, spawned },
+      data: { template: todo, spawned, replaced: !!spawned._replacedFrom },
       focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
     });
   } catch (error) {

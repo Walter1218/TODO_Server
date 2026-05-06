@@ -268,7 +268,7 @@ GET  /api/agents/:id/contexts/summary  # 会话摘要
 ```
 
 ### 11. 自动运维监控
-- **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked（通知带 30 分钟冷却去重）
+- **StuckTaskMonitor**：每 3 分钟自动扫描，基于动态阈值（预估耗时 × 进度 × 0.5）检测无心跳任务，自动恢复或标记 blocked（通知带类型级冷却去重：recovered/blocked/zombie 60min，stalled 30min）。blocked 恢复前检查同模板是否已有活跃实例，防止乒乓弹跳
 - **ZombieDetector**：每 10 分钟检测无心跳 >2h 的 `in_progress` 任务，标记为 `blocked`，防止 StuckTaskMonitor 弹跳循环
 - **AssignmentDriver**：指派/转交后立即 auto-focus 到目标 agent；每 60 秒兜底扫描已指派但超过 5 分钟仍为 `pending` 的任务，自动强制 focus + 通知
 - **DriveOrchestrator**：每 60 秒扫描所有有 focus 的任务，自动 drive（LLM 推理 + bash 执行） + ProgressValidator 验证
