@@ -214,18 +214,24 @@ class AgentTaskFramework {
         options.systemPrompt || '',
         options.tools
       );
-      if (response.toolCalls && response.toolCalls.length > 0) {
-        const { StructuredDriveTools } = require('../../../src/utils/StructuredDriveTools');
+      if (options.autoExecuteTools !== false && response.toolCalls && response.toolCalls.length > 0) {
+        const StructuredDriveTools = require('../../src/utils/StructuredDriveTools');
         const taskId = options.taskId || this.currentHeartbeatTaskId;
         const sessionId = options.sessionId || 'structured-drive';
         const agentId = options.agentId || this.config.base?.agentId;
-        const toolResults = await StructuredDriveTools.executeToolCalls(
-          response.toolCalls,
-          agentId,
-          taskId,
-          sessionId
-        );
-        response.toolResults = toolResults;
+
+        if (agentId && taskId) {
+          const toolResults = await StructuredDriveTools.executeToolCalls(
+            response.toolCalls,
+            agentId,
+            taskId,
+            sessionId
+          );
+          response.toolResults = toolResults;
+        } else {
+          response.toolResults = [];
+          response.toolExecutionSkipped = true;
+        }
       }
     } else {
       const context = await this.prepareContext();
@@ -363,7 +369,7 @@ ${context.features.memory.map(m => `- ${m.content} (${m.timestamp})`).join('\n')
       }));
 
       const requestParams = {
-        messages,
+        messages: [...messages],
         system: systemPrompt,
         userContent: userMessage
       };

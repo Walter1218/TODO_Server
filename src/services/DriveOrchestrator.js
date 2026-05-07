@@ -10,6 +10,11 @@ const ValidatorService = require('./ValidatorService');
 const ValidationDispatchService = require('./ValidationDispatchService');
 const TaskReportService = require('./TaskReportService');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
+const {
+  TOOL_DEFINITIONS,
+  buildStructuredDrivePrompt,
+  executeToolCalls
+} = require('../utils/StructuredDriveTools');
 const { isValidationTask, shouldTriggerValidation, getTaskTypeLabel } = require('../utils/TaskType');
 
 const DEFAULTS = {
@@ -23,6 +28,9 @@ const DEFAULTS = {
   validationTimeoutMs: 30 * 60 * 1000,
   maxValidationAttempts: 3,
   validationCooldownMs: 2 * 60 * 1000,
+  toolLoopMaxIterations: 6,
+  toolLoopTokenBudget: 50000,
+  maxNoProgressRounds: 2,
 };
 
 class DriveOrchestrator {
@@ -37,7 +45,14 @@ class DriveOrchestrator {
     this.validationTimeoutMs = options.validationTimeoutMs || DEFAULTS.validationTimeoutMs;
     this.maxValidationAttempts = options.maxValidationAttempts || DEFAULTS.maxValidationAttempts;
     this.validationCooldownMs = options.validationCooldownMs || DEFAULTS.validationCooldownMs;
+    this.toolLoopMaxIterations = options.toolLoopMaxIterations || DEFAULTS.toolLoopMaxIterations;
+    this.toolLoopTokenBudget = options.toolLoopTokenBudget || DEFAULTS.toolLoopTokenBudget;
+    this.maxNoProgressRounds = options.maxNoProgressRounds || DEFAULTS.maxNoProgressRounds;
     this.drivingTasks = new Set();
+    this.toolLoopStats = {
+      fallbackReasons: {},
+      exitReasons: {}
+    };
     this.framework = null;
     this.validator = null;
     this.validationDispatcher = null;
@@ -193,7 +208,7 @@ class DriveOrchestrator {
 
     const duckdbMatches = desc.match(/\/[\w\/]+\.duckdb/g);
     if (duckdbMatches) {
-      duckdbMatches.slice(0, 2).forEach((path, idx) => {
+      duckdbMatches.slice(0, 2).forEach((path) => {
         commands.push({
           index: commands.length,
           command: `python3 -c "import duckdb; conn = duckdb.connect('${path}'); print(conn.execute('SELECT table_name FROM information_schema.tables').fetchall())"`,
@@ -331,11 +346,306 @@ class DriveOrchestrator {
     return task;
   }
 
-  buildRetryContext(reply, results, attempt, validationFeedback) {
+  buildRetryContext(results, attempt, validationFeedback) {
     const baseMsg = `任务执行遇到问题，正在进行第 ${attempt + 1} 次重试...`;
     const progressMsg = results?.length > 0 ? `\n\n📊 上次执行结果:\n${CommandExecutor.buildExecutionSummary(results)}` : '';
     const validationMsg = validationFeedback ? `\n\n📋 上次验证失败反馈（请务必解决）:\n${validationFeedback}` : '';
     return `${baseMsg}${progressMsg}${validationMsg}`;
+  }
+
+  _extractUsageTokens(usage) {
+    if (!usage) return 0;
+    return usage.totalTokens || usage.total_tokens || usage.promptTokens || usage.prompt_tokens || 0;
+  }
+
+  _recordToolLoopStat(bucket, key) {
+    if (!key) return;
+    if (!this.toolLoopStats[bucket]) {
+      this.toolLoopStats[bucket] = {};
+    }
+    this.toolLoopStats[bucket][key] = (this.toolLoopStats[bucket][key] || 0) + 1;
+  }
+
+  getToolLoopStats() {
+    return JSON.parse(JSON.stringify(this.toolLoopStats));
+  }
+
+  resetToolLoopStats() {
+    this.toolLoopStats = {
+      fallbackReasons: {},
+      exitReasons: {}
+    };
+  }
+
+  _buildToolLoopMessages(task, retryContext) {
+    const prompt = buildStructuredDrivePrompt(task, { isManual: false });
+    const userContent = retryContext
+      ? `${prompt}\n\n## 上次执行上下文\n${retryContext}`
+      : prompt;
+
+    return [
+      {
+        role: 'system',
+        content: '你是 TODO Server 的自动执行引擎。你的目标不是汇报计划，而是通过工具真正推进任务。每轮优先调用工具；有进展就更新进度；满足验收条件就调用 proposeCompletion；无法继续时调用 askForHelp。'
+      },
+      {
+        role: 'user',
+        content: userContent
+      }
+    ];
+  }
+
+  _summarizeStructuredToolResults(toolResults) {
+    if (!toolResults || toolResults.length === 0) return '(无结构化工具调用)';
+    return toolResults.map(({ toolCall, result }) => {
+      const toolName = toolCall?.function?.name || 'unknown';
+      const status = result?.success ? '✅' : '❌';
+      const action = result?.action || 'unknown';
+      const dataText = result?.data ? JSON.stringify(result.data).slice(0, 240) : (result?.error || '');
+      return `${status} ${toolName} -> ${action}\n${dataText}`;
+    }).join('\n---\n');
+  }
+
+  async _recordToolLoopFallback(agentId, task, reason, details = {}) {
+    this._recordToolLoopStat('fallbackReasons', reason || 'unknown');
+    await Context.create(agentId, {
+      sessionId: 'drive-orchestrator',
+      role: 'system',
+      content: `[DriveOrchestrator] 结构化工具链回退到 legacy 流程，原因：${reason || 'unknown'}`,
+      metadata: { type: 'tool_loop_fallback', task_id: task.id, reason: reason || 'unknown', ...details }
+    });
+  }
+
+  async _recordToolLoopExit(agentId, task, reason, details = {}) {
+    this._recordToolLoopStat('exitReasons', reason || 'unknown');
+    await Context.create(agentId, {
+      sessionId: 'drive-orchestrator',
+      role: 'system',
+      content: `[DriveOrchestrator][tool-loop] 退出原因：${reason || 'unknown'}`,
+      metadata: { type: 'tool_loop_exit', task_id: task.id, reason: reason || 'unknown', ...details }
+    });
+  }
+
+  async _markTaskBlocked(agentId, task, blockers, reasonPrefix, contextType = 'env_blocked') {
+    const latest = Todo.findById(agentId, task.id) || task;
+    const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...(blockers || [])])];
+    const blockerText = mergedBlockers.join('；');
+
+    Todo.update(agentId, task.id, {
+      status: 'blocked',
+      heartbeatStep: `⛔ ${reasonPrefix}：${blockerText}`,
+      heartbeatBlockers: mergedBlockers
+    });
+
+    Context.create(agentId, {
+      sessionId: task.id,
+      role: 'system',
+      content: `[${reasonPrefix}] 任务已阻塞：${blockerText}`,
+      metadata: { type: contextType, task_id: task.id, blockers: mergedBlockers }
+    });
+
+    Notification.create(agentId, task.id, 'blocked',
+      `任务「${task.title}」${reasonPrefix}：${blockerText}`
+    );
+
+    try {
+      const blockedTask = Todo.findById(agentId, task.id);
+      const consultRes = await this.consultTask(agentId, task.id, blockedTask, `任务因「${reasonPrefix}」被阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。`);
+      if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
+        this._createAutoHealingTask(agentId, task.id, consultRes.parsed.fix_steps);
+      }
+    } catch (e) {
+      console.error('[DriveOrchestrator] 自动排障失败:', e.message);
+    }
+  }
+
+  async _handleStructuredToolResults(agentId, task, toolResults) {
+    for (const { toolCall, result } of (toolResults || [])) {
+      const toolName = toolCall?.function?.name || 'unknown';
+      const data = result?.data || {};
+
+      if (toolName === 'executeCommand') {
+        Todo.recordAttempt(agentId, task.id, {
+          success: !!result?.success,
+          reason: result?.success
+            ? `结构化执行成功: ${data.command || ''}`.trim()
+            : `结构化执行失败: ${data.command || ''}`.trim(),
+          output: String(data.output || result?.error || '').slice(0, 1200)
+        });
+
+        const blockers = Array.isArray(data.blockers) ? data.blockers : [];
+        if (!result?.success && blockers.length > 0) {
+          await this._markTaskBlocked(agentId, task, blockers, '结构化执行阻塞');
+          return { handled: true, blocked: true, blockers };
+        }
+      }
+
+      if (result?.action === 'task_pending_validation') {
+        return { handled: true, success: true, validationTriggered: true };
+      }
+
+      if (result?.action === 'task_force_completed') {
+        return { handled: true, success: true, forceCompleted: true };
+      }
+
+      if (result?.action === 'help_requested') {
+        return { handled: true, blocked: true, helpRequested: true };
+      }
+    }
+
+    return { handled: false };
+  }
+
+  async runToolDrivenLoop(agentId, task, retryContext = null) {
+    const llmManager = this.framework?.modules?.llmManager;
+    if (!llmManager || !llmManager.hasProvider || !llmManager.hasProvider()) {
+      return { fallback: true, reason: 'llm_unavailable', totalTokens: 0, iterations: 0 };
+    }
+
+    const messages = this._buildToolLoopMessages(task, retryContext);
+    let totalTokens = 0;
+    let noProgressRounds = 0;
+
+    for (let iteration = 0; iteration < this.toolLoopMaxIterations; iteration++) {
+      const currentTask = Todo.findById(agentId, task.id) || task;
+      const before = ProgressValidator.snapshot(currentTask);
+      const remainingBudget = Math.max(1000, this.toolLoopTokenBudget - totalTokens);
+
+      const response = await llmManager.chat({
+        messages: [...messages],
+        tools: TOOL_DEFINITIONS,
+        maxTokens: Math.min(16000, remainingBudget)
+      });
+      totalTokens += this._extractUsageTokens(response.usage);
+
+      if (!response.toolCalls || response.toolCalls.length === 0) {
+        await Context.create(agentId, {
+          sessionId: 'drive-orchestrator',
+          role: 'assistant',
+          content: `[DriveOrchestrator][tool-loop] 未返回工具调用，第 ${iteration + 1} 轮：\n${String(response.content || '').slice(0, 500)}`,
+          metadata: { type: 'tool_loop_no_tool_calls', task_id: task.id, iteration: iteration + 1 }
+        });
+        return {
+          fallback: true,
+          reason: 'no_tool_calls',
+          attempts: iteration + 1,
+          reply: response.content || '',
+          totalTokens,
+          iterations: iteration + 1
+        };
+      }
+
+      messages.push({
+        role: 'assistant',
+        content: response.content || '',
+        tool_calls: response.toolCalls
+      });
+
+      const toolResults = await executeToolCalls(response.toolCalls, agentId, task.id, 'drive-orchestrator');
+      for (const { toolCall, result } of toolResults) {
+        messages.push({
+          role: 'tool',
+          tool_call_id: toolCall.id,
+          content: JSON.stringify(result)
+        });
+      }
+
+      await Context.create(agentId, {
+        sessionId: 'drive-orchestrator',
+        role: 'system',
+        content: `[DriveOrchestrator][tool-loop] 第 ${iteration + 1} 轮工具结果\n${this._summarizeStructuredToolResults(toolResults)}`,
+        metadata: { type: 'tool_loop_results', task_id: task.id, iteration: iteration + 1, tool_count: toolResults.length }
+      });
+
+      const handled = await this._handleStructuredToolResults(agentId, task, toolResults);
+      const refreshed = Todo.findById(agentId, task.id) || currentTask;
+      const after = ProgressValidator.snapshot(refreshed);
+      const changed = ProgressValidator.compare(before, after).changed;
+
+      if (!changed) {
+        noProgressRounds++;
+      } else {
+        noProgressRounds = 0;
+      }
+
+      if (handled.handled) {
+        await this._recordToolLoopExit(agentId, task, handled.validationTriggered
+          ? 'pending_validation'
+          : handled.forceCompleted
+            ? 'force_completed'
+            : handled.helpRequested
+              ? 'help_requested'
+              : handled.blocked
+                ? 'blocked'
+                : 'handled', {
+          iteration: iteration + 1,
+          total_tokens: totalTokens
+        });
+        return {
+          ...handled,
+          attempts: iteration + 1,
+          toolLoop: true,
+          totalTokens
+        };
+      }
+
+      if (refreshed.status === 'pending_validation') {
+        await this._recordToolLoopExit(agentId, task, 'pending_validation', {
+          iteration: iteration + 1,
+          total_tokens: totalTokens
+        });
+        return { success: true, validationTriggered: true, attempts: iteration + 1, toolLoop: true, totalTokens };
+      }
+
+      if (refreshed.status === 'completed') {
+        await this._recordToolLoopExit(agentId, task, 'completed', {
+          iteration: iteration + 1,
+          total_tokens: totalTokens
+        });
+        return { success: true, attempts: iteration + 1, toolLoop: true, totalTokens };
+      }
+
+      if (refreshed.status === 'blocked') {
+        await this._recordToolLoopExit(agentId, task, 'blocked', {
+          iteration: iteration + 1,
+          total_tokens: totalTokens
+        });
+        return { blocked: true, attempts: iteration + 1, toolLoop: true, totalTokens };
+      }
+
+      if (noProgressRounds >= this.maxNoProgressRounds || totalTokens >= this.toolLoopTokenBudget) {
+        const fallbackReason = noProgressRounds >= this.maxNoProgressRounds ? 'no_progress' : 'token_budget_exceeded';
+        await this._recordToolLoopExit(agentId, task, fallbackReason, {
+          iteration: iteration + 1,
+          total_tokens: totalTokens,
+          no_progress_rounds: noProgressRounds,
+          token_budget: this.toolLoopTokenBudget
+        });
+        return {
+          fallback: true,
+          reason: fallbackReason,
+          attempts: iteration + 1,
+          toolLoop: true,
+          totalTokens,
+          iterations: iteration + 1,
+          noProgressRounds
+        };
+      }
+    }
+
+    await this._recordToolLoopExit(agentId, task, 'tool_loop_iteration_limit', {
+      iteration: this.toolLoopMaxIterations,
+      total_tokens: totalTokens,
+      token_budget: this.toolLoopTokenBudget
+    });
+    return {
+      fallback: true,
+      reason: 'tool_loop_iteration_limit',
+      attempts: this.toolLoopMaxIterations,
+      toolLoop: true,
+      totalTokens,
+      iterations: this.toolLoopMaxIterations
+    };
   }
 
   async driveTask(agentId, task) {
@@ -346,6 +656,27 @@ class DriveOrchestrator {
     let retryContext = task_._validationFeedback ? `📋 验证失败反馈（请务必解决）:\n${task_._validationFeedback}` : null;
     let lastResults = null;
     let lastReply = null;
+
+    try {
+      const toolLoopResult = await this.runToolDrivenLoop(agentId, task_, retryContext);
+      if (toolLoopResult && !toolLoopResult.fallback) {
+        return toolLoopResult;
+      }
+
+      await this._recordToolLoopFallback(agentId, task_, toolLoopResult?.reason || 'unknown', {
+        total_tokens: toolLoopResult?.totalTokens || 0,
+        iterations: toolLoopResult?.iterations || toolLoopResult?.attempts || 0,
+        no_progress_rounds: toolLoopResult?.noProgressRounds || 0
+      });
+    } catch (toolErr) {
+      this._recordToolLoopStat('fallbackReasons', 'tool_loop_error');
+      await Context.create(agentId, {
+        sessionId: 'drive-orchestrator',
+        role: 'system',
+        content: `[DriveOrchestrator] 结构化工具链异常，回退到 legacy 流程：${toolErr.message}`,
+        metadata: { type: 'tool_loop_error', task_id: task_.id, reason: 'tool_loop_error', error: toolErr.message }
+      });
+    }
 
     while (attempt < this.maxRetries) {
       if (attempt > 0) {
@@ -422,9 +753,6 @@ class DriveOrchestrator {
       });
 
       const isGreetingLoop = this.detectGreetingLoop(reply, task_);
-      const isDataSyncTask = (task_.description || '').includes('fetch_') ||
-                              (task_.description || '').includes('duckdb') ||
-                              (task_.description || '').includes('同步');
 
       let execResults = [];
       let { commands, results } = await CommandExecutor.extractAndRun(reply, { task: task_ });
@@ -572,7 +900,7 @@ class DriveOrchestrator {
       lastResults = execResults;
 
       if (attempt + 1 < this.maxRetries) {
-        retryContext = this.buildRetryContext(lastReply, lastResults, attempt, task_._validationFeedback || null);
+        retryContext = this.buildRetryContext(lastResults, attempt, task_._validationFeedback || null);
       }
       attempt++;
     }

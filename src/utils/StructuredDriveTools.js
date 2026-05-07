@@ -13,11 +13,128 @@
  *   askForHelp({ blocker, neededResource, alternativesTried })
  */
 
+const fs = require('fs');
+const path = require('path');
 const Todo = require('../models/Todo');
 const Context = require('../models/Context');
+const Notification = require('../models/Notification');
 const CompletionReportBuilder = require('../services/CompletionReportBuilder');
+const CommandExecutor = require('../services/CommandExecutor');
+
+const PROJECT_ROOT = path.resolve(__dirname, '../..');
+const HOME_DIR = process.env.HOME || PROJECT_ROOT;
+const SAFE_READ_ROOTS = [PROJECT_ROOT, HOME_DIR, '/tmp'];
+const DANGEROUS_COMMAND_PATTERNS = [
+  /\brm\s+-rf\s+\//,
+  /\bshutdown\b/i,
+  /\breboot\b/i,
+  /\bmkfs\b/i,
+  /\bdd\s+if=/i,
+  /\bmount\b/i,
+  /\bumount\b/i
+];
+
+function buildToolResult(success, action, data = {}, error = null) {
+  return {
+    success,
+    action,
+    ...(success ? { data } : {}),
+    ...(error ? { error } : {})
+  };
+}
+
+function isPathAllowed(resolvedPath) {
+  return SAFE_READ_ROOTS.some(root => resolvedPath === root || resolvedPath.startsWith(root + path.sep));
+}
+
+function resolveAllowedPath(filePath) {
+  if (!filePath) {
+    throw new Error('path is required');
+  }
+
+  const normalized = String(filePath).startsWith('~/')
+    ? path.join(HOME_DIR, String(filePath).slice(2))
+    : String(filePath);
+  const resolved = path.resolve(normalized);
+  if (!isPathAllowed(resolved)) {
+    throw new Error(`Path outside allowed roots: ${resolved}`);
+  }
+  return resolved;
+}
 
 const TOOL_DEFINITIONS = [
+  {
+    type: "function",
+    function: {
+      name: "executeCommand",
+      description: "执行一条 shell 命令并返回结果。用于推进任务、跑脚本、验证产出。",
+      parameters: {
+        type: "object",
+        properties: {
+          command: {
+            type: "string",
+            description: "要执行的命令"
+          },
+          cwd: {
+            type: "string",
+            description: "工作目录（可选）"
+          },
+          timeoutMs: {
+            type: "integer",
+            description: "超时时间，毫秒（可选）",
+            minimum: 1000,
+            maximum: 600000
+          }
+        },
+        required: ["command"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "readFile",
+      description: "读取文件内容，用于查看配置、脚本、日志或输出文件。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "文件路径"
+          },
+          offset: {
+            type: "integer",
+            description: "起始行号（从 1 开始）",
+            minimum: 1
+          },
+          limit: {
+            type: "integer",
+            description: "读取行数限制",
+            minimum: 1,
+            maximum: 200
+          }
+        },
+        required: ["path"]
+      }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "checkPath",
+      description: "检查文件或目录是否存在、大小、修改时间等元信息。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "文件或目录路径"
+          }
+        },
+        required: ["path"]
+      }
+    }
+  },
   {
     type: "function",
     function: {
@@ -159,7 +276,7 @@ const TOOL_DEFINITIONS = [
   }
 ];
 
-const TOOL_NAMES = ['updateProgress', 'proposeCompletion', 'confirmCompletion', 'askForHelp'];
+const TOOL_NAMES = ['executeCommand', 'readFile', 'checkPath', 'updateProgress', 'proposeCompletion', 'confirmCompletion', 'askForHelp'];
 
 function buildStructuredDrivePrompt(task, opts = {}) {
   const blockers = Array.isArray(task.heartbeat_blockers)
@@ -192,17 +309,23 @@ function buildStructuredDrivePrompt(task, opts = {}) {
   }
 
   lines.push(`\n## 你的工作流程（严格遵守）`);
-  lines.push(`1. 分析当前状态，决定是否继续执行还是求助`);
-  lines.push(`2. 【必须】调用 updateProgress 报告当前进度（progress: 0-100, step: 一句话）`);
-  lines.push(`3. 如果阻塞无法自行解决，调用 askForHelp`);
-  lines.push(`4. 任务全部完成后，【必须】调用 proposeCompletion 并列出 criteriaMet`);
+  lines.push(`1. 分析当前状态，优先使用工具推进任务`);
+  lines.push(`2. 需要执行命令时调用 executeCommand`);
+  lines.push(`3. 需要查看文件或路径时调用 readFile / checkPath`);
+  lines.push(`4. 每轮有实质进展后都要调用 updateProgress`);
+  lines.push(`5. 如果阻塞无法自行解决，调用 askForHelp`);
+  lines.push(`6. 任务全部完成后，调用 proposeCompletion 并列出 criteriaMet`);
 
   lines.push(`\n## 工具调用说明`);
+  lines.push(`- executeCommand：执行命令，结果会立刻返回给你用于下一轮判断`);
+  lines.push(`- readFile：读取文件内容，用于查看脚本、配置、输出文件`);
+  lines.push(`- checkPath：检查文件/目录状态，用于确认产出是否存在`);
   lines.push(`- updateProgress：每次工作循环至少调用一次`);
   lines.push(`- proposeCompletion：任务完成后提交验收申请，任务进入 pending_validation 并自动触发验收`);
   lines.push(`- confirmCompletion：强制完成（不推荐），仅在必须跳过自动验收时使用`);
   lines.push(`- askForHelp：阻塞超过 2 分钟无法自行解决时调用`);
   lines.push(`- 所有工具调用都会被执行，结果直接写入任务记录`);
+  lines.push(`- 不要只输出自然语言计划；要通过工具真正推进任务`);
   lines.push(`- 不要在回复文字中描述进度，统一通过工具调用更新`);
 
   lines.push(`\n现在请开始工作。`);
@@ -252,6 +375,100 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
 
   let note = '';
 
+  if (name === 'executeCommand') {
+    const { command, cwd, timeoutMs } = args;
+    if (!command || !String(command).trim()) {
+      return buildToolResult(false, 'command_rejected', {}, 'command is required');
+    }
+
+    if (DANGEROUS_COMMAND_PATTERNS.some(pattern => pattern.test(command))) {
+      return buildToolResult(false, 'command_rejected', {}, 'command contains dangerous patterns');
+    }
+
+    const resolvedCwd = cwd ? resolveAllowedPath(cwd) : HOME_DIR;
+    const results = await CommandExecutor.executeCommands(
+      [{ index: 0, command: String(command).trim(), source: 'structured_tool' }],
+      { cwd: resolvedCwd, timeoutMs: timeoutMs || 60000, maxCommands: 1 }
+    );
+    const result = results[0] || { success: false, output: 'No command result returned' };
+
+    Context.create(agentId, {
+      sessionId: sessionId || 'structured-drive',
+      role: 'system',
+      content: `[executeCommand] ${result.success ? '成功' : '失败'}: ${command}\n${String(result.output || '').slice(0, 500)}`,
+      metadata: { type: 'structured_execute_command', task_id: taskId, command: String(command).slice(0, 200), success: !!result.success }
+    });
+
+    return buildToolResult(result.success, 'command_executed', {
+      command,
+      cwd: resolvedCwd,
+      output: result.output || '',
+      stdout: result.stdout || '',
+      stderr: result.stderr || '',
+      exitCode: result.exitCode,
+      duration: result.duration,
+      blockers: CommandExecutor.detectEnvironmentBlockers(result.output || '')
+    }, result.success ? null : (result.output || 'command execution failed'));
+  }
+
+  if (name === 'readFile') {
+    const { path: filePath, offset = 1, limit = 80 } = args;
+    const resolved = resolveAllowedPath(filePath);
+    if (!fs.existsSync(resolved)) {
+      return buildToolResult(false, 'file_missing', { path: resolved }, 'file does not exist');
+    }
+
+    const content = fs.readFileSync(resolved, 'utf8');
+    const lines = content.split('\n');
+    const start = Math.max(1, Number(offset) || 1);
+    const take = Math.min(200, Math.max(1, Number(limit) || 80));
+    const selected = lines.slice(start - 1, start - 1 + take);
+    const rendered = selected.map((line, idx) => `${start + idx}→${line}`).join('\n');
+
+    Context.create(agentId, {
+      sessionId: sessionId || 'structured-drive',
+      role: 'system',
+      content: `[readFile] ${resolved} (${start}-${start + selected.length - 1})`,
+      metadata: { type: 'structured_read_file', task_id: taskId, path: resolved }
+    });
+
+    return buildToolResult(true, 'file_read', {
+      path: resolved,
+      offset: start,
+      limit: take,
+      content: rendered
+    });
+  }
+
+  if (name === 'checkPath') {
+    const { path: filePath } = args;
+    const resolved = resolveAllowedPath(filePath);
+    const exists = fs.existsSync(resolved);
+    if (!exists) {
+      return buildToolResult(true, 'path_checked', {
+        path: resolved,
+        exists: false
+      });
+    }
+
+    const stats = fs.statSync(resolved);
+    Context.create(agentId, {
+      sessionId: sessionId || 'structured-drive',
+      role: 'system',
+      content: `[checkPath] ${resolved} exists=${exists}`,
+      metadata: { type: 'structured_check_path', task_id: taskId, path: resolved }
+    });
+
+    return buildToolResult(true, 'path_checked', {
+      path: resolved,
+      exists: true,
+      isDirectory: stats.isDirectory(),
+      size: stats.size,
+      modifiedAt: stats.mtime.toISOString(),
+      createdAt: stats.birthtime.toISOString()
+    });
+  }
+
   if (name === 'updateProgress') {
     const { progress, step, blockers, resolvedBlockers: explicitResolved } = args;
 
@@ -296,13 +513,11 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       blockers: currentBlockers
     });
 
-    return {
-      success: true,
-      action: 'progress_updated',
+    return buildToolResult(true, 'progress_updated', {
       progress,
       step,
       note
-    };
+    });
   }
 
   if (name === 'proposeCompletion') {
@@ -338,13 +553,11 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       metadata: { type: 'task_completion_proposal', task_id: taskId, criteria_met: criteriaMet || [], completion_report: finalReport }
     });
 
-    return {
-      success: true,
-      action: 'task_pending_validation',
+    return buildToolResult(true, 'task_pending_validation', {
       summary,
       completionReport: finalReport,
       criteriaMet: criteriaMet || []
-    };
+    });
   }
 
   if (name === 'confirmCompletion') {
@@ -380,14 +593,12 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
       metadata: { type: 'task_force_completion', task_id: taskId, reason: reason || '', criteria_met: criteriaMet || [], completion_report: finalReport }
     });
 
-    return {
-      success: true,
-      action: 'task_force_completed',
+    return buildToolResult(true, 'task_force_completed', {
       summary,
       completionReport: finalReport,
       reason: reason || '',
       criteriaMet: criteriaMet || []
-    };
+    });
   }
 
   if (name === 'askForHelp') {
@@ -409,20 +620,17 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
 
     Todo.update(agentId, taskId, { status: 'blocked' });
 
-    const { Notification } = require('../models/Notification');
     Notification.create(agentId, taskId, 'blocked',
       `🔴 任务「${task.title}」请求支援：${blocker}，需要：${neededResource}，已试过：${(alternativesTried || []).join(', ')}`
     );
 
-    return {
-      success: true,
-      action: 'help_requested',
+    return buildToolResult(true, 'help_requested', {
       blocker,
       neededResource
-    };
+    });
   }
 
-  return { success: false, error: 'Tool not implemented' };
+  return buildToolResult(false, 'tool_not_implemented', {}, 'Tool not implemented');
 }
 
 async function extractAndExecuteToolCalls(reply, agentId, taskId, sessionId) {
@@ -465,10 +673,25 @@ async function extractAndExecuteToolCalls(reply, agentId, taskId, sessionId) {
   return results;
 }
 
-module.exports = {
+async function executeToolCalls(toolCalls, agentId, taskId, sessionId) {
+  const results = [];
+  for (const toolCall of (toolCalls || [])) {
+    const result = await executeToolCall(toolCall, agentId, taskId, sessionId);
+    results.push({ toolCall, result });
+  }
+  return results;
+}
+
+const StructuredDriveTools = {
   TOOL_DEFINITIONS,
   TOOL_NAMES,
   buildStructuredDrivePrompt,
   executeToolCall,
+  executeToolCalls,
   extractAndExecuteToolCalls
+};
+
+module.exports = {
+  ...StructuredDriveTools,
+  StructuredDriveTools
 };

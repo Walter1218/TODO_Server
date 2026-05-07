@@ -25,7 +25,7 @@
 - **自愈机制 (Auto-Healing)**：任务阻塞 (Preflight失败/超时停滞) 时自动触发 LLM 诊断，自动派生 `[修复]` 子任务执行环境准备，修复完成后父任务自动恢复
 - **Agent-to-Agent 自驱校验**：Worker 执行，Validator 验收，Orchestrator 编排，彻底跳出 Human-in-the-loop（支持第三方 Agent 独立验证）
 - **LLM Agent Loop**：`ValidationAgent` 采用多轮工具调用（ReAct 模式）独立验证任务，最多 10 轮迭代，支持 RESULT-FIRST 验证策略、事实快速路径、系统日志过滤、收敛规则和强制判定兜底
-- **结构化驱动工具**：`StructuredDriveTools` 提供 `updateProgress`、`proposeCompletion`、`confirmCompletion`、`askForHelp` 等结构化工具，替代脆弱的文本解析
+- **结构化驱动工具**：`StructuredDriveTools` 提供 `executeCommand`、`readFile`、`checkPath`、`updateProgress`、`proposeCompletion`、`confirmCompletion`、`askForHelp` 等结构化工具，已接入 `DriveOrchestrator` 的工具优先主循环，并保留 legacy fallback
 - **任务分类与完成报告**：`task_category` 自动分类（inspection/script/code_change/general），`CompletionReportBuilder` 自动生成详细完成报告（数据位置、时间覆盖、完成度、产出物列表等）
 - **孤儿子任务自动清理**：CleanupMonitor 自动检测父任务已完成但子任务仍在 pending/in_progress/blocked 的孤儿子任务并取消
 - **Per-Agent 并发控制**：每个 Agent 可配置最大并发任务数（`max_concurrent_tasks`），Dispatch 全流程检查并发槽位
@@ -1056,7 +1056,7 @@ if (isValidationTask(task)) {
 | LLM Provider tools | ✅ | - | ✅ | - | MiniMax/OpenAI/Ollama/Anthropic 全部支持 |
 | LLM Provider 热插拔 | ✅ | - | - | - | 运行时切换 Provider，无需重启 |
 | Agent Loop（验证） | ✅ | - | - | - | ValidationAgent 10 轮工具调用 + RESULT-FIRST + 系统日志过滤 + 强制判定兜底 |
-| StructuredDriveTools | ✅ | - | - | - | updateProgress/proposeCompletion/confirmCompletion/askForHelp |
+| StructuredDriveTools | ✅ | - | - | - | executeCommand/readFile/checkPath/updateProgress/proposeCompletion/confirmCompletion/askForHelp；已接入 DriveOrchestrator 工具优先主循环，保留 legacy fallback |
 | 角色模板系统 | - | - | ✅ | - | 通用/编码/分析/DevOps |
 | 记忆管理 | - | - | ✅ | - | 提取 + 自动摘要 |
 | WebSocket 实时推送 | - | - | - | - | ❌ 待实现 |
@@ -1104,8 +1104,8 @@ if (isValidationTask(task)) {
 - [x] **LLMManager 参数透传修复** — maxTokens/temperature 正确传递到 Provider
 - [x] **maxTokens 统一升级 100000** — 所有 Provider 和 ValidationAgent 统一
 - [x] **收敛规则 + 快速路径 + 系统提醒** — 防止 ValidationAgent 无限循环
-- [x] **StructuredDriveTools** — updateProgress/proposeCompletion/confirmCompletion/askForHelp
-- [x] **DriveOrchestrator 优化** — validation_count < 3 规则、validation_failed 自动重试
+- [x] **StructuredDriveTools** — executeCommand/readFile/checkPath/updateProgress/proposeCompletion/confirmCompletion/askForHelp
+- [x] **DriveOrchestrator 工具优先执行闭环（阶段一）** — 已实现工具优先 Agent Loop、即时结果回灌、fallback 原因统计、token 预算退出留痕与关键降级路径测试
 - [x] **LLM Provider 热插拔** — 运行时切换 Provider（API + Framework），无需重启
 
 ### 11.2 待实现
@@ -1115,11 +1115,11 @@ if (isValidationTask(task)) {
 | ~~P0~~ | ~~**内嵌验证智能体（ValidationAgent）**~~ | ~~2-3 天~~ | ~~高~~ |
 | ~~P0~~ | ~~LLM Provider tools 支持（MiniMax/OpenAI）~~ | ~~0.5 天~~ | ~~高~~ |
 | P0 | 后端禁止修改 Agent 任务状态 | 0.5 天 | 高（安全性） |
-| P0 | Agent Loop Agent Loop ReAct 升级（DriveOrchestrator 多步推理） | 2-3 天 | 高（任务完成率） |
+| ~~P0~~ | ~~DriveOrchestrator ReAct Agent Loop 收尾（覆盖率提升 + token 预算 + 缩减 legacy fallback）~~ | ~~1-2 天~~ | ~~高（任务完成率）~~ |
 | P1 | WebSocket 实时推送 | 1-2 天 | 中（体验提升） |
 | P1 | 可视化管理界面完善 | 2-3 天 | 高（运维友好） |
 | P1 | 任务优先级管理机制 | 1-2 天 | 高（防止验证任务被抢占） |
-| P1 | Token 预算控制与用量追踪 | 1-2 天 | 中（成本控制+防无限循环） |
+| P1 | Tool Loop 覆盖率提升与全局 token 用量聚合 | 1-2 天 | 中（成本控制+持续优化） |
 | P1 | 统一调度器（替代 server.js 9 个 setInterval） | 1-2 天 | 中（可维护性） |
 | P2 | askForHelp 人类响应机制 | 1 天 | 中（协作增强） |
 | P2 | Agent 监控面板 | 1-2 天 | 中（可观测性） |
@@ -1227,14 +1227,14 @@ if (isValidationTask(task)) {
 1. **认证中间件 timing-safe 比较**：当前 `===` 比较 secret_key 存在 timing attack 风险
 2. **MemoryManager 内存存储脆弱性**：依赖 `localStorage`（Node.js 不存在），重启即丢失
 3. **输入验证缺失**：路由层缺乏系统性输入校验
-4. **DriveOrchestrator 缺乏实时多步推理**：当前 `driveTask()` 中 LLM 生成命令后执行，但执行结果不反馈到同一轮 LLM 推理中——只有失败重试时才通过 `retryContext` 传递。这意味着 Agent Loop 无法在单次驱动中根据命令执行结果调整策略。
+4. **DriveOrchestrator 实时多步推理已完成阶段一落地**：当前已具备工具优先 Agent Loop、命令结果即时回灌、fallback 原因统计、token 预算退出留痕，以及成功/求助/降级路径测试。后续重点转为提升工具覆盖率并逐步缩减 legacy fallback 占比。
 
 ### 15.2 P1 高优先级（影响性能/可维护性）
 
 5. **Framework.js 单体职责过重**：~800行承担多个职责
 6. **ConfigLoader 脆弱的配置搜索**：依赖 `require.main.filename`
 7. **缺少速率限制**：所有 API 无速率限制
-8. **缺少 Token 预算控制**：LLM 调用无 token 累计和预算限制，可能导致成本失控
+8. **缺少全局 Token 用量聚合**：DriveOrchestrator 的 tool loop 已具备局部 token 预算与超预算退出留痕，但系统级 usage 聚合、跨模块预算视图仍未建立
 9. **9 个定时器硬编码在 server.js**：全部 `setInterval`，无统一调度器，单进程重复执行风险
 10. **命令提取依赖正则**：`CommandExecutor` 用 `BLOCK_REGEX`/`LINE_CMD_REGEX` 提取命令，脆弱且需要维护 80+ 个 `INVALID_PREFIXES` 黑名单
 
@@ -1246,15 +1246,15 @@ if (isValidationTask(task)) {
 14. **测试覆盖率待提升**：Express 路由层、SDK 等未覆盖
 15. **Agent 间无消息传递通道**：只有任务指派和通知，缺乏双向对话能力
 16. **所有 Agent 共享 LLM 配置**：无法为不同 Agent 配置不同模型或参数
-17. **StructuredDriveTools 未被 DriveOrchestrator 主循环使用**：只在 `Framework.processMessage()` 中可选使用
+17. **StructuredDriveTools 已接入 DriveOrchestrator 主循环并完成阶段一闭环**：目前默认优先走结构化 tool loop，执行失败或无 tool call 时回退 legacy 命令提取链；后续工作以提升 executeCommand 覆盖率、收缩 legacy fallback、建设全局统计视图为主。
 
 ### 15.4 V1.2 架构演进路线（Agent Loop 核心能力提升）
 
 #### 15.4.1 A 组：Agent Loop 核心能力增强
 
-**A1. DriveOrchestrator ReAct Agent Loop 升级**（投入产出比最高）
+**A1. DriveOrchestrator ReAct Agent Loop 升级**（已完成阶段一）
 
-当前问题：
+legacy 路径当前问题：
 ```
 LLM → 提取命令 → 执行 → 存结果 → 下一轮 retry 才能看到
 ```
@@ -1268,11 +1268,11 @@ while (not done and iterations < MAX):
     4. 判断是否完成/阻塞/需要验证
 ```
 
-具体改动：
-- `DriveOrchestrator.driveTask()` 引入 Agent Loop，每轮执行完命令后将结果 push 到 messages 中
-- 定义完整工具集：`execute_command`、`read_file`、`update_progress`、`propose_completion`、`ask_for_help`
-- 用 StructuredDriveTools 替代正则命令提取
-- 每轮 LLM 能看到之前所有命令的执行结果，实现真正的 ReAct 模式
+阶段一已完成改动：
+- `DriveOrchestrator.driveTask()` 已引入工具优先 Agent Loop，每轮工具结果会回灌到后续推理
+- `StructuredDriveTools` 已扩展执行型工具：`executeCommand`、`readFile`、`checkPath`、`updateProgress`、`proposeCompletion`、`askForHelp`
+- 已保留 legacy 命令提取链作为 fallback，并记录 fallback 原因与退出留痕
+- 已补成功路径、`askForHelp` 路径、token 超预算回退路径测试
 
 **A2. ValidationAgent 增强自我反思**
 
@@ -1281,9 +1281,9 @@ while (not done and iterations < MAX):
 
 **A3. Token 预算控制**
 
-- LLMManager 添加 `usageTracker`，累计每次调用的 token 消耗
-- 为每个 Agent Loop 设置 token 预算上限（如 driveTask: 50k, validation: 80k）
-- 超预算时优雅降级（返回当前最佳判断）
+- `DriveOrchestrator` 的 tool loop 已设置局部 token 预算上限并在超预算时留下结构化退出记录
+- 后续可在 `LLMManager` 增加全局 `usageTracker`，聚合各 Agent Loop 的 token 消耗
+- 长期目标是建立跨 drive/validation 的统一预算与成本面板
 
 #### 15.4.2 B 组：架构改进
 
@@ -1335,7 +1335,7 @@ while (not done and iterations < MAX):
 
 1. 项目核心卖点在“任务能被稳定做完并自动验收”，而不是“任务能被创建和展示”
 2. `ValidationAgent` 已经具备工具化闭环雏形，但 `DriveOrchestrator` 仍主要依赖文本约定和命令提取，执行端成熟度低于验收端
-3. `StructuredDriveTools` 已具备 `updateProgress` / `proposeCompletion` / `askForHelp` 等结构化接口，但尚未成为自动驱动主循环默认路径
+3. `StructuredDriveTools` 已扩展为 `executeCommand` / `readFile` / `checkPath` / `updateProgress` / `proposeCompletion` / `askForHelp` 等结构化接口，并已成为 `DriveOrchestrator` 的默认优先路径；当前剩余工作是提高工具覆盖率并逐步缩减 legacy fallback
 4. 若先投入 Web UI、WebSocket、监控面板等外围功能，只会放大底层执行链不稳定带来的问题
 
 ### 15.7 三阶段实施方案（建议执行版本）
