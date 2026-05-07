@@ -7,9 +7,12 @@ const Context = require('../models/Context');
 
 const execAsync = util.promisify(exec);
 
-const MAX_ITERATIONS = 10;
+const MAX_ITERATIONS = 4;
+const MAX_TOOL_CALLS_PER_ROUND = 2;
+const MAX_TOTAL_EVIDENCE_ITEMS = 4;
 const TOOL_TIMEOUT_MS = 30000;
 const MAX_OUTPUT_LENGTH = 1000;
+const VALIDATION_MAX_TOKENS = 3000;
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 
@@ -141,11 +144,11 @@ const SYSTEM_PROMPT = `You are a rigorous QA validation agent. Your job is to ve
 - Only mark as FAIL if there are actual data integrity issues or missing tables
 
 ## Convergence Rules (Important)
-- Rounds 1–2: Check task requirements + verify most critical data artifact.
-- Rounds 3–4: Cross-check secondary artifacts (files, DBs).
-- Round 5+: STOP tool hunting. Form the final judgment NOW.
-- You MUST output the final JSON judgment once you have 2–3 evidence items.
-- If you reach round 8+, you must stop calling tools and output the judgment even if evidence is partial.
+- Round 1: Check task requirements + verify the single most critical artifact.
+- Round 2: Cross-check at most one additional artifact only if still necessary.
+- Round 3: STOP tool hunting and output the final judgment.
+- Round 4: Final forced response round. No more tools.
+- You MUST output the final JSON judgment once you have 2-3 evidence items.
 
 ## Response Format
 When you have gathered enough evidence, respond with ONLY a JSON object (no markdown, no code fences):
@@ -247,45 +250,50 @@ class ValidationAgent {
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: `Please validate the following task:\n\nTitle: ${task.title}\nDescription: ${task.description || 'N/A'}\nAcceptance Criteria: ${task.acceptance_criteria || 'N/A'}\nTask ID: ${task.id}\nAgent ID: ${agentId}\n\nUse the tools provided to verify whether this task has been truly completed.` }
+      { role: 'user', content: this._buildValidationRequest(agentId, task) }
     ];
 
     const evidence = [];
 
     for (let i = 0; i < this.maxIterations; i++) {
-      if (i === Math.floor(this.maxIterations * 0.4) - 1) {
+      if (i === 1) {
         messages.push({
           role: 'system',
-          content: `[System Reminder] You are at iteration ${i + 1} of ${this.maxIterations}. You have gathered ${evidence.length} evidence items. You MUST output your final JSON judgment NOW — do NOT call any more tools. Reply with a JSON object: {"pass": true/false, "reason": "...", "score": 0-100, "feedback": "...", "evidence_summary": [...]}`
-        });
-      }
-      if (i === this.maxIterations - 3) {
-        messages.push({
-          role: 'system',
-          content: `[System Reminder] WARNING: You are at iteration ${i + 1} of ${this.maxIterations}. This is the LAST round you may use tools. After the tool results come back, you MUST immediately output your JSON judgment. No more tools after this.`
+          content: `[System Reminder] You are at iteration ${i + 1} of ${this.maxIterations}. Keep the validation concise. If you already have 2 evidence items, output the final JSON judgment now and do not call more tools.`
         });
       }
       if (i === this.maxIterations - 2) {
         messages.push({
           role: 'system',
-          content: `[System Reminder] FINAL ROUND. You are at the second-to-last iteration. Output your JSON judgment IMMEDIATELY. Do NOT call any more tools. Respond with a valid JSON object containing pass, reason, score, feedback, and evidence_summary fields.`
+          content: `[System Reminder] FINAL TOOL ROUND. After this round, you must output your JSON judgment immediately. No more than one additional tool call is justified.`
+        });
+      }
+      if (i === this.maxIterations - 1 || evidence.length >= MAX_TOTAL_EVIDENCE_ITEMS) {
+        messages.push({
+          role: 'system',
+          content: `[System Reminder] FINAL RESPONSE ONLY. Output your JSON judgment immediately. Do NOT call any more tools. Respond with a valid JSON object containing pass, reason, score, feedback, and evidence_summary fields.`
         });
       }
 
       const response = await this.llmManager.chat({
         messages: [...messages],
         tools: VALIDATOR_TOOLS,
-        maxTokens: 100000
+        maxTokens: VALIDATION_MAX_TOKENS
       });
 
       if (response.toolCalls && response.toolCalls.length > 0) {
+        if (i >= this.maxIterations - 1 || evidence.length >= MAX_TOTAL_EVIDENCE_ITEMS) {
+          break;
+        }
+
+        const limitedToolCalls = response.toolCalls.slice(0, MAX_TOOL_CALLS_PER_ROUND);
         messages.push({
           role: 'assistant',
           content: response.content || '',
-          tool_calls: response.toolCalls
+          tool_calls: limitedToolCalls
         });
 
-        for (const toolCall of response.toolCalls) {
+        for (const toolCall of limitedToolCalls) {
           const result = await this._executeTool(toolCall, agentId, task);
           const resultStr = JSON.stringify(result);
 
@@ -320,6 +328,24 @@ class ValidationAgent {
 
     console.warn(`[ValidationAgent] 达到最大迭代次数 (${this.maxIterations})，基于已有证据生成强制判定`);
     return this._forceJudgment(evidence, this.maxIterations);
+  }
+
+  _buildValidationRequest(agentId, task) {
+    const description = String(task.description || 'N/A').slice(0, 1200);
+    const acceptanceCriteria = String(task.acceptance_criteria || 'N/A').slice(0, 600);
+    const heartbeat = String(task.heartbeat_step || '').slice(0, 200);
+
+    return `Please validate the following task:
+
+Title: ${task.title}
+Description: ${description}
+Acceptance Criteria: ${acceptanceCriteria}
+Task ID: ${task.id}
+Agent ID: ${agentId}
+Current Status: ${task.status}
+Heartbeat Step: ${heartbeat || 'N/A'}
+
+Use the tools provided to verify whether this task has been truly completed. Prefer direct artifact checks over logs.`;
   }
 
   _forceJudgment(evidence, iterations) {
@@ -433,7 +459,7 @@ class ValidationAgent {
     const safeSql = sql.replace(/["`]/g, '\\"');
     const command = `python3 -c "import duckdb; conn = duckdb.connect('${db_path}'); print(conn.execute(\\"${safeSql}\\").fetchall())"`;
 
-    const { stdout, stderr } = await execAsync(command, {
+    const { stdout } = await execAsync(command, {
       timeout: TOOL_TIMEOUT_MS,
       cwd: PROJECT_ROOT
     });

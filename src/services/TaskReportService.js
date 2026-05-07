@@ -1,8 +1,91 @@
 const Todo = require('../models/Todo');
-const Context = require('../models/Context');
 const { getDb } = require('../db');
 
 class TaskReportService {
+  static truncateText(value, maxLength = 240) {
+    if (value === null || value === undefined) return '';
+    const text = String(value);
+    if (text.length <= maxLength) return text;
+    return `${text.slice(0, maxLength)}...`;
+  }
+
+  static buildConsultPayload(task, report, options = {}) {
+    const maxAttempts = Math.max(1, options.maxAttempts || 3);
+    const maxTimeline = Math.max(1, options.maxTimeline || 5);
+    const maxCommands = Math.max(1, options.maxCommands || 3);
+    const blockers = Array.isArray(task.heartbeat_blockers) ? task.heartbeat_blockers.slice(0, 5) : [];
+    const attempts = Array.isArray(task.attempt_log) ? task.attempt_log.slice(-maxAttempts) : [];
+    const commandHistory = Array.isArray(report?.execution?.commandHistory)
+      ? report.execution.commandHistory.slice(-maxCommands)
+      : [];
+    const timeline = Array.isArray(report?.timeline) ? report.timeline.slice(-maxTimeline) : [];
+
+    return {
+      task: {
+        id: task.id,
+        title: this.truncateText(task.title, 120),
+        status: task.status,
+        priority: task.priority,
+        progress: task.heartbeat_progress || 0,
+        last_step: this.truncateText(task.heartbeat_step || '', 160),
+        blockers,
+        attempt_count: task.attempt_count || 0,
+        max_attempts: task.max_attempts || 3,
+        task_category: task.task_category || 'general'
+      },
+      recent_attempts: attempts.map(item => ({
+        timestamp: item.timestamp,
+        success: !!item.success,
+        reason: this.truncateText(item.reason || '', 120),
+        output: this.truncateText(item.output || '', 160)
+      })),
+      execution_summary: {
+        total_drives: report?.execution?.totalDrives || 0,
+        total_command_executions: report?.execution?.totalCommandExecutions || 0,
+        total_progress_reports: report?.execution?.totalProgressReports || 0,
+        total_llm_replies: report?.execution?.totalLLMReplies || 0,
+        recent_commands: commandHistory.map(entry => ({
+          timestamp: entry.timestamp,
+          commands: (entry.commands || []).slice(0, 2).map(cmd => ({
+            success: !!cmd.success,
+            command: this.truncateText(cmd.command || '', 120)
+          }))
+        }))
+      },
+      validation_summary: {
+        validation_count: report?.validation?.validationCount || 0,
+        validated_by: report?.validation?.validatedBy || null,
+        final_result: report?.validation?.finalResult
+          ? {
+              pass: !!report.validation.finalResult.pass,
+              score: report.validation.finalResult.score,
+              reason: this.truncateText(report.validation.finalResult.reason || '', 160),
+              feedback: this.truncateText(report.validation.finalResult.feedback || '', 160)
+            }
+          : null
+      },
+      recent_timeline: timeline.map(event => ({
+        timestamp: event.timestamp,
+        type: event.type,
+        description: this.truncateText(event.description || '', 120)
+      }))
+    };
+  }
+
+  static buildConsultPrompt(task, report, question, options = {}) {
+    const payload = this.buildConsultPayload(task, report, options);
+    return `你是一个资深运维/数据工程排障助手。请基于压缩后的任务摘要，给出最小可落地的修复建议。
+
+# 任务摘要
+${JSON.stringify(payload, null, 2)}
+
+# 用户问题
+${question || '请诊断核心卡点，并给出最小可落地的修复步骤（按优先级排序），以及需要补齐的环境/配置清单。'}
+
+请只返回 JSON：
+{"summary":"...","root_causes":["..."],"fix_steps":["..."],"preflight_checklist":["..."],"template_improvements":["..."]}`;
+  }
+
   static async generateReport(agentId, taskId) {
     const task = Todo.findById(agentId, taskId);
     if (!task) {
@@ -146,7 +229,6 @@ class TaskReportService {
 
     for (const vr of validationReports) {
       try {
-        const passMatch = vr.content.match(/✅|❌/);
         const scoreMatch = vr.content.match(/评分\s*(\d+)/);
         const reasonMatch = vr.content.match(/原因[：:]\s*(.+?)(?=\n|$)/);
         const feedbackMatch = vr.content.match(/反馈[：:]\s*(.+?)(?=\n|$)/);

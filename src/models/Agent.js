@@ -106,8 +106,15 @@ class Agent {
 
   static getMaxConcurrent(agentId) {
     const db = getDb();
-    const row = db.prepare('SELECT max_concurrent_tasks FROM agents WHERE id = ?').get(agentId);
-    return row ? (row.max_concurrent_tasks || 5) : 5;
+    try {
+      const row = db.prepare('SELECT max_concurrent_tasks FROM agents WHERE id = ?').get(agentId);
+      return row ? (row.max_concurrent_tasks || 5) : 5;
+    } catch (error) {
+      if (String(error.message || '').includes('no such column')) {
+        return 5;
+      }
+      throw error;
+    }
   }
 
   static getActiveTaskCount(agentId) {

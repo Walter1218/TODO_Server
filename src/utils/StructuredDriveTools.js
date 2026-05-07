@@ -20,6 +20,7 @@ const Context = require('../models/Context');
 const Notification = require('../models/Notification');
 const CompletionReportBuilder = require('../services/CompletionReportBuilder');
 const CommandExecutor = require('../services/CommandExecutor');
+const JobRunService = require('../services/JobRunService');
 
 const PROJECT_ROOT = path.resolve(__dirname, '../..');
 const HOME_DIR = process.env.HOME || PROJECT_ROOT;
@@ -333,7 +334,7 @@ function buildStructuredDrivePrompt(task, opts = {}) {
   return lines.join('\n');
 }
 
-function mergeCompletionReport(autoReport, userDetails, userSummary) {
+function mergeCompletionReport(autoReport, userDetails, userSummary, criteriaMet) {
   const report = { ...autoReport };
   if (userDetails) {
     if (!report.sections) report.sections = [];
@@ -356,6 +357,17 @@ function mergeCompletionReport(autoReport, userDetails, userSummary) {
   if (userSummary) {
     report.userSummary = userSummary;
   }
+  const detailEvidenceLines = [];
+  if (userDetails?.dataLocation) detailEvidenceLines.push(`产出位置: ${userDetails.dataLocation}`);
+  if (userDetails?.timeCoverage) detailEvidenceLines.push(`时间覆盖: ${userDetails.timeCoverage}`);
+  if (userDetails?.completionRate) detailEvidenceLines.push(`完成度: ${userDetails.completionRate}`);
+  if (userDetails?.missingData) detailEvidenceLines.push(`数据缺失: ${userDetails.missingData}`);
+  report.validationEvidence = {
+    criteriaMet: Array.isArray(criteriaMet) ? criteriaMet : [],
+    artifacts: Array.isArray(userDetails?.artifacts) ? userDetails.artifacts : [],
+    evidenceLines: detailEvidenceLines,
+    summary: userSummary || report.summary || ''
+  };
   report.generatedAt = new Date().toISOString();
   return report;
 }
@@ -524,7 +536,7 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
     const { summary, criteriaMet, evidence, completionDetails } = args;
 
     const autoReport = CompletionReportBuilder.build(task, agentId);
-    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary);
+    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary, criteriaMet);
 
     const criteriaText = Array.isArray(criteriaMet) && criteriaMet.length > 0
       ? `验收标准满足情况：\n${criteriaMet.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
@@ -541,6 +553,9 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
     });
 
     CompletionReportBuilder.storeReport(taskId, agentId, finalReport);
+    JobRunService.markPendingValidation(agentId, Todo.findById(agentId, taskId), {
+      source: 'structured_drive_propose_completion'
+    });
 
     if (criteriaText) {
       Todo.update(agentId, taskId, { context: criteriaText });
@@ -564,7 +579,7 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
     const { summary, reason, criteriaMet, evidence, completionDetails } = args;
 
     const autoReport = CompletionReportBuilder.build(task, agentId);
-    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary);
+    const finalReport = mergeCompletionReport(autoReport, completionDetails, summary, criteriaMet);
 
     const criteriaText = Array.isArray(criteriaMet) && criteriaMet.length > 0
       ? `验收标准满足情况：\n${criteriaMet.map((c, i) => `${i + 1}. ${c}`).join('\n')}`
@@ -581,6 +596,9 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
     });
 
     CompletionReportBuilder.storeReport(taskId, agentId, finalReport);
+    JobRunService.markCompleted(agentId, Todo.findById(agentId, taskId), {
+      source: 'structured_drive_confirm_completion'
+    });
 
     if (criteriaText) {
       Todo.update(agentId, taskId, { context: criteriaText });
@@ -619,6 +637,11 @@ async function executeToolCall(toolCall, agentId, taskId, sessionId) {
     });
 
     Todo.update(agentId, taskId, { status: 'blocked' });
+    JobRunService.markFailure(agentId, Todo.findById(agentId, taskId), 'human_blocked', {
+      source: 'structured_drive_ask_for_help',
+      blocker,
+      neededResource
+    });
 
     Notification.create(agentId, taskId, 'blocked',
       `🔴 任务「${task.title}」请求支援：${blocker}，需要：${neededResource}，已试过：${(alternativesTried || []).join(', ')}`

@@ -1,8 +1,8 @@
 const Todo = require('../models/Todo');
 const Context = require('../models/Context');
-const Agent = require('../models/Agent');
 const CommandExecutor = require('./CommandExecutor');
 const ValidationAgent = require('./ValidationAgent');
+const ValidationPolicyService = require('./ValidationPolicyService');
 
 const MAX_VALIDATION_COUNT = 3;
 
@@ -28,10 +28,15 @@ class ValidatorService {
       return { pass: false, reason: `验证次数已达上限(${currentVC}/${MAX_VALIDATION_COUNT})`, score: 0, exhausted: true };
     }
 
+    const policyResult = ValidationPolicyService.validate(task);
+    if (policyResult.applied) {
+      return this._applyValidationResult(agentId, task, policyResult, policyResult.validator || 'validation-policy');
+    }
+
     if (this.framework.modules.llmManager?.hasProvider()) {
       return this._validateWithAgent(agentId, task);
     }
-    return this._validateWithRules(task);
+    return this._validateWithRules(agentId, task);
   }
 
   async _validateWithAgent(agentId, task) {
@@ -42,130 +47,123 @@ class ValidatorService {
       if (validationResult.exhausted) {
         return validationResult;
       }
-
-      const newCount = (task.validation_count || 0) + 1;
-      const isExhausted = newCount >= MAX_VALIDATION_COUNT;
-      const updateData = {
-        validationCount: newCount,
-        validationReport: JSON.stringify(validationResult),
-        validatedBy: 'validation-agent'
-      };
-
-      if (validationResult.pass) {
-        updateData.status = 'completed';
-        updateData.heartbeatStep = '✅ ValidationAgent 校验通过';
-      } else if (isExhausted) {
-        updateData.status = 'blocked';
-        updateData.heartbeatStep = `🔒 校验失败已达 ${MAX_VALIDATION_COUNT} 次上限，需要人工介入`;
-      } else {
-        updateData.status = 'validation_failed';
-        updateData.heartbeatStep = `❌ 校验未通过: ${validationResult.reason}`;
-
-        await Context.create(agentId, {
-          sessionId: 'drive-orchestrator',
-          role: 'system',
-          content: `[ValidationAgent] 校验未通过反馈：\n${validationResult.feedback}`,
-          metadata: { type: 'validation_feedback', task_id: task.id }
-        });
-      }
-
-      await Todo.update(agentId, task.id, updateData);
-      if (validationResult.pass) {
-        Todo.checkAndCompleteParent(agentId, task.id);
-      }
+      await this._applyValidationResult(agentId, task, validationResult, 'validation-agent');
 
       console.log(`[ValidatorService] 任务校验完成(${validationResult.pass ? '通过' : '不通过'}, 得分: ${validationResult.score}, 迭代: ${validationResult.iterations || 1}轮, 工具调用: ${(validationResult.evidence || []).length}次)`);
       return validationResult;
     } catch (err) {
       console.error(`[ValidatorService] ValidationAgent 校验出错: ${err.message}, 回退到规则验证`);
-      return this._validateWithRules(task);
+      return this._validateWithRules(agentId, task);
     }
   }
 
-  async _validateWithRules(task) {
+  async _validateWithRules(agentId, task) {
     const executionLogs = await this._collectLogs(task);
     const actualValidationResults = await this._runValidationCommands(task);
-    const validationResultsSummary = actualValidationResults.length > 0
-      ? `\n=== 实际验证结果 ===\n${CommandExecutor.buildExecutionSummary(actualValidationResults)}`
-      : '';
+    const successfulResults = actualValidationResults.filter(item => item.success);
+    const failedResults = actualValidationResults.filter(item => !item.success);
+    const evidenceSummary = [];
 
-    const validatorPrompt = `你是一名严谨的软件质量保障工程师（QA Engineer）。
-你的任务是审核一个 AI Agent 执行任务的质量，并决定是否通过验收。
-
-=== 任务信息 ===
-标题: ${task.title}
-描述: ${task.description}
-验收标准:
-${task.acceptance_criteria || '未设置明确验收标准'}
-
-=== 执行过程日志 ===
-${executionLogs}
-
-${validationResultsSummary}
-
-=== 评分指南 ===
-- 0-20分: Agent 完全未执行任务（如陷入循环问候）
-- 21-40分: Agent 尝试执行但未完成核心任务
-- 41-60分: Agent 完成部分核心任务
-- 61-80分: Agent 完成核心任务但有一些小问题
-- 81-100分: Agent 完美完成任务
-
-=== 回复格式 ===
-{
-  "pass": true/false,
-  "reason": "简要说明通过或失败的原因",
-  "feedback": "如果不通过，请给出具体的修正建议；如果通过，请给予肯定",
-  "score": 0-100
-}
-
-请确保回复仅包含 JSON。`;
-
-    try {
-      const result = await this.framework.generateResponseRaw(validatorPrompt, [], "你是一个专业的任务校验智能体。");
-      const reply = result.message || '';
-      const jsonMatch = reply.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        throw new Error('LLM 回复格式错误，未找到 JSON');
-      }
-
-      const validationResult = JSON.parse(jsonMatch[0]);
-      const agentId = task.agent_id || 'hermes-ops';
-      const newCount = (task.validation_count || 0) + 1;
-      const isExhausted = newCount >= MAX_VALIDATION_COUNT;
-      const updateData = {
-        validationCount: newCount,
-        validationReport: JSON.stringify(validationResult),
-        validatedBy: 'todo-server-validator-legacy'
-      };
-
-      if (validationResult.pass) {
-        updateData.status = 'completed';
-        updateData.heartbeatStep = '✅ 校验通过(legacy)';
-      } else if (isExhausted) {
-        updateData.status = 'blocked';
-        updateData.heartbeatStep = `🔒 校验失败已达 ${MAX_VALIDATION_COUNT} 次上限，需要人工介入`;
-      } else {
-        updateData.status = 'validation_failed';
-        updateData.heartbeatStep = `❌ 校验未通过: ${validationResult.reason}`;
-
-        await Context.create(agentId, {
-          sessionId: 'drive-orchestrator',
-          role: 'system',
-          content: `[Validator] 校验未通过反馈：\n${validationResult.feedback}`,
-          metadata: { type: 'validation_feedback', task_id: task.id }
-        });
-      }
-
-      await Todo.update(agentId, task.id, updateData);
-      if (validationResult.pass) {
-        Todo.checkAndCompleteParent(agentId, task.id);
-      }
-      console.log(`[ValidatorService] 任务校验完成(legacy): ${validationResult.pass ? '通过' : '不通过'} (得分: ${validationResult.score})`);
-      return validationResult;
-    } catch (err) {
-      console.error(`[ValidatorService] legacy 校验出错: ${err.message}`);
-      return { pass: false, error: err.message };
+    if (successfulResults.length > 0) {
+      evidenceSummary.push(`验证命令成功 ${successfulResults.length} 条`);
+      evidenceSummary.push(...successfulResults.slice(0, 2).map(item => String(item.output || item.stdout || '').substring(0, 120)));
     }
+    if (failedResults.length > 0) {
+      evidenceSummary.push(...failedResults.slice(0, 2).map(item => `失败: ${String(item.output || item.stderr || '').substring(0, 120)}`));
+    }
+
+    let validationResult;
+    if (successfulResults.length > 0 && failedResults.length === 0) {
+      validationResult = {
+        pass: true,
+        reason: '验证命令执行成功，规则校验通过',
+        feedback: '已通过规则校验，存在可执行的实际验证结果。',
+        score: 82,
+        evidence_summary: evidenceSummary,
+        validator: 'rule:command-verifier'
+      };
+    } else if (actualValidationResults.length > 0 && successfulResults.length === 0) {
+      validationResult = {
+        pass: false,
+        reason: '验证命令全部失败，缺少可接受的结果证据',
+        feedback: '请修复验证命令或补齐结构化产出物后重新提交验收。',
+        score: 30,
+        evidence_summary: evidenceSummary,
+        validator: 'rule:command-verifier'
+      };
+    } else {
+      const hasExecutionTrace = executionLogs && executionLogs.trim().length > 0;
+      validationResult = {
+        pass: false,
+        reason: hasExecutionTrace ? '缺少结构化完成证据和可执行验证命令，暂不自动通过' : '未发现执行证据，暂不自动通过',
+        feedback: '请通过 proposeCompletion 补齐结构化 evidence/criteriaMet/artifacts 后再进入自动验收。',
+        score: hasExecutionTrace ? 45 : 20,
+        evidence_summary: hasExecutionTrace ? ['存在执行日志，但不足以形成结果级验收证据'] : [],
+        validator: 'rule:evidence-gate'
+      };
+    }
+
+    await this._applyValidationResult(agentId, task, validationResult, validationResult.validator || 'rule-validator');
+    console.log(`[ValidatorService] 任务校验完成(rule): ${validationResult.pass ? '通过' : '不通过'} (得分: ${validationResult.score})`);
+    return validationResult;
+  }
+
+  async _applyValidationResult(agentId, task, validationResult, validatedBy) {
+    if (validationResult.deferred) {
+      const updateData = {
+        validationReport: JSON.stringify(validationResult),
+        validatedBy,
+        status: 'pending',
+        failureBucket: null,
+        heartbeatProgress: Math.min(task.heartbeat_progress || 95, 95),
+        heartbeatStep: `⏸ 自动延期验收: ${validationResult.reason}`
+      };
+      if (validationResult.deferred_until) {
+        updateData.validationDeadline = validationResult.deferred_until;
+      }
+      await Todo.update(agentId, task.id, updateData);
+      await Context.create(agentId, {
+        sessionId: 'drive-orchestrator',
+        role: 'system',
+        content: `[Validator] 数据任务延期验收：\n${validationResult.feedback || validationResult.reason || '源头当日无数据'}`,
+        metadata: { type: 'validation_deferred', task_id: task.id, validator: validatedBy }
+      });
+      return validationResult;
+    }
+
+    const newCount = (task.validation_count || 0) + 1;
+    const isExhausted = newCount >= MAX_VALIDATION_COUNT;
+    const updateData = {
+      validationCount: newCount,
+      validationReport: JSON.stringify(validationResult),
+      validatedBy
+    };
+
+    if (validationResult.pass) {
+      updateData.status = 'completed';
+      updateData.heartbeatStep = '✅ 自动验收通过';
+    } else if (isExhausted || validationResult.exhausted) {
+      updateData.status = 'blocked';
+      updateData.failureBucket = 'validation_failed';
+      updateData.heartbeatStep = `🔒 校验失败已达 ${MAX_VALIDATION_COUNT} 次上限，需要人工介入`;
+    } else {
+      updateData.status = 'validation_failed';
+      updateData.failureBucket = 'validation_failed';
+      updateData.heartbeatStep = `❌ 校验未通过: ${validationResult.reason}`;
+
+      await Context.create(agentId, {
+        sessionId: 'drive-orchestrator',
+        role: 'system',
+        content: `[Validator] 校验未通过反馈：\n${validationResult.feedback || validationResult.reason || '无反馈'}`,
+        metadata: { type: 'validation_feedback', task_id: task.id, validator: validatedBy }
+      });
+    }
+
+    await Todo.update(agentId, task.id, updateData);
+    if (validationResult.pass) {
+      Todo.checkAndCompleteParent(agentId, task.id);
+    }
+    return validationResult;
   }
 
   async _collectLogs(task) {

@@ -61,6 +61,7 @@ function initTestSchema(db) {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       completed_at DATETIME,
       expected_duration_minutes INTEGER,
+      task_spec TEXT,
       schedule TEXT,
       is_template BOOLEAN DEFAULT 0,
       origin_agent_id TEXT,
@@ -77,7 +78,19 @@ function initTestSchema(db) {
       validation_count INTEGER DEFAULT 0,
       validation_deadline DATETIME,
       task_category TEXT DEFAULT 'general',
+      failure_bucket TEXT,
+      circuit_open_until DATETIME,
+      last_preflight_at DATETIME,
+      last_preflight_status TEXT,
+      last_preflight_report TEXT DEFAULT '',
       completion_report TEXT,
+      requires_plan BOOLEAN DEFAULT 0,
+      plan_status TEXT DEFAULT 'not_required',
+      current_plan_id TEXT,
+      current_step_id TEXT,
+      execution_state TEXT DEFAULT 'idle',
+      lease_expires_at DATETIME,
+      last_action_at DATETIME,
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
       FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
@@ -117,6 +130,79 @@ function initTestSchema(db) {
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
     );
+
+    CREATE TABLE IF NOT EXISTS job_runs (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL UNIQUE,
+      template_id TEXT,
+      planned_at DATETIME,
+      spawned_at DATETIME,
+      started_at DATETIME,
+      first_heartbeat_at DATETIME,
+      pending_validation_at DATETIME,
+      completed_at DATETIME,
+      validated_at DATETIME,
+      final_status TEXT DEFAULT 'pending',
+      failure_bucket TEXT,
+      metadata TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS scheduler_events (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      template_id TEXT,
+      task_id TEXT,
+      event_type TEXT NOT NULL,
+      event_status TEXT DEFAULT 'info',
+      details TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS task_plans (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      revision INTEGER DEFAULT 1,
+      status TEXT DEFAULT 'draft',
+      source TEXT DEFAULT 'system_rule',
+      summary TEXT DEFAULT '',
+      review_notes TEXT DEFAULT '',
+      metadata TEXT DEFAULT '{}',
+      approved_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS task_plan_steps (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      step_key TEXT NOT NULL,
+      step_order INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      instruction TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending',
+      completion_notes TEXT DEFAULT '',
+      metadata TEXT DEFAULT '{}',
+      completed_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      plan_id TEXT,
+      step_id TEXT,
+      event_type TEXT NOT NULL,
+      event_status TEXT DEFAULT 'info',
+      details TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );
   `);
 }
 
@@ -140,6 +226,11 @@ function setupTestDb() {
 
 function clearAllTables(db) {
   db.exec(`
+    DELETE FROM scheduler_events;
+    DELETE FROM task_events;
+    DELETE FROM task_plan_steps;
+    DELETE FROM task_plans;
+    DELETE FROM job_runs;
     DELETE FROM task_notifications;
     DELETE FROM contexts;
     DELETE FROM focus_states;

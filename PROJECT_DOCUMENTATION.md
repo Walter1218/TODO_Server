@@ -1,6 +1,6 @@
 # Agent TODO Server 项目文档
 
-> 最后更新：2026-05-07
+> 最后更新：2026-05-08
 > 本文档为项目唯一主文档，其他独立文档已废弃，内容已合并至此。
 
 ---
@@ -24,8 +24,11 @@
 - **自动运维监控**：`StuckMonitor`、`DriveOrchestrator` 与 `ValidatorService` 协同工作，实现无人值守的任务修复与验收
 - **自愈机制 (Auto-Healing)**：任务阻塞 (Preflight失败/超时停滞) 时自动触发 LLM 诊断，自动派生 `[修复]` 子任务执行环境准备，修复完成后父任务自动恢复
 - **Agent-to-Agent 自驱校验**：Worker 执行，Validator 验收，Orchestrator 编排，彻底跳出 Human-in-the-loop（支持第三方 Agent 独立验证）
-- **LLM Agent Loop**：`ValidationAgent` 采用多轮工具调用（ReAct 模式）独立验证任务，最多 10 轮迭代，支持 RESULT-FIRST 验证策略、事实快速路径、系统日志过滤、收敛规则和强制判定兜底
+- **LLM Agent Loop**：`ValidationAgent` 采用受限工具调用的轻量验证回路，默认最多 4 轮、单次预算 3000 token，优先走事实快速路径与规则校验，仅在证据不足时才使用 LLM 兜底
 - **结构化驱动工具**：`StructuredDriveTools` 提供 `executeCommand`、`readFile`、`checkPath`、`updateProgress`、`proposeCompletion`、`confirmCompletion`、`askForHelp` 等结构化工具，已接入 `DriveOrchestrator` 的工具优先主循环，并保留 legacy fallback
+- **复杂任务强制规划**：`TaskPlanService` 为复杂任务自动生成 `inspect -> execute -> verify` 三步计划，先过规则审查，再允许进入真实执行
+- **按步骤强制推进**：`DriveOrchestrator` 已接入计划门禁；首次 drive 只完成 `inspect`，后续只允许在 `execute` 步骤推进，进入 `pending_validation/validating/completed` 后自动切到 `verify`
+- **低 token 监督策略**：复杂任务计划生成、审查、步骤推进默认全部走规则和状态机，不把 LLM 放进高频监督链
 - **任务分类与完成报告**：`task_category` 自动分类（inspection/script/code_change/general），`CompletionReportBuilder` 自动生成详细完成报告（数据位置、时间覆盖、完成度、产出物列表等）
 - **孤儿子任务自动清理**：CleanupMonitor 自动检测父任务已完成但子任务仍在 pending/in_progress/blocked 的孤儿子任务并取消
 - **Per-Agent 并发控制**：每个 Agent 可配置最大并发任务数（`max_concurrent_tasks`），Dispatch 全流程检查并发槽位
@@ -71,6 +74,7 @@ TODO_Server/
 │       ├── ValidationAgent.js    # 内嵌验证智能体（LLM + 工具调用）
 │       ├── ValidationDispatchService.js # 第三方验证任务派发服务
 │       ├── CompletionReportBuilder.js   # 任务完成报告生成器（按类型自动构建）
+│       ├── TaskPlanService.js    # 复杂任务计划生成/审查/步骤状态机
 │       └── TaskReportService.js  # 任务流程报告生成服务
 ├── sdk/
 │   └── agent-todo-sdk.js         # JavaScript SDK（完整 CRUD + 协作 + 调度）
@@ -219,42 +223,53 @@ npm run setup:hermes
 POST /api/agents/:id/focus/auto
 ```
 
-**LLM 增强自动选优**：
-- 多个候选任务时，LLM 综合紧急程度、完成难度、依赖关系、风险评估选择最优任务
-- 单候选或无 LLM 时，回退到评分算法：`score = priority_weight(critical=100) + age_bonus(max 20) + ready_bonus(max 30) - retry_penalty`
+**规则优先自动选优**：
+- 多候选任务默认使用规则评分算法：`score = priority_weight(critical=100) + age_bonus(max 20) + ready_bonus(max 30) - retry_penalty`
 - 每次任务创建/完成/状态变更后自动重新评估聚焦
+- 不再为聚焦排序额外消耗 LLM 配额
 
-**LLM 任务状态推断**：
-- 优先复用 `LLMInferencer` 后台推断结果（5 分钟缓存）
-- 无缓存时实时发起 LLM 分析：判断智能体是否在工作、当前动作、建议状态
-- LLM 不可用时自动回退到阈值规则引擎
-- `LLMInferencer` 后台每 5 分钟扫描 idle 5-15 分钟的任务，高置信度（≥0.75）时自动标记 completed/blocked
+**任务状态分析**：
+- 默认使用规则引擎判断任务是否活跃、空闲、阻塞或可能卡住
+- `focus` 路由默认关闭实时 LLM 状态分析，避免低价值高频推断持续消耗 token
+- 仅在显式开启 `ENABLE_FOCUS_LLM_ANALYSIS=1` 时才允许该分析链路恢复
 
 ### 4.4 心跳与重试追踪
 
 - 每 5 分钟上报进度、当前步骤、阻塞项
 - 超过 30 分钟无心跳 → 自动标记为 stuck
 - 超过最大重试次数（默认 3）→ 自动标记为 `blocked`
+- 复杂任务额外记录 `requires_plan / plan_status / current_plan_id / current_step_id / execution_state / last_action_at`
+- 当前计划底座表：`task_plans`、`task_plan_steps`、`task_events`
 
-### 4.5 验收标准与自驱校验
+### 4.5 复杂任务强制规划与驱动
+
+- **触发条件**：默认对 `hermes-default` 下的复杂任务，以及带 `task_spec` / 较长验收标准 / `script`、`code_change`、`inspection` 等高复杂度任务启用强制规划
+- **计划生成**：系统自动生成 `inspect -> execute -> verify` 三步计划，写入 `task_plans` 与 `task_plan_steps`
+- **规则审查**：在进入执行前检查高危删除命令、疑似生产数据库触达等安全红线；未通过时任务直接进入 `needs_revision/blocked`
+- **步骤推进**：首次 drive 只完成 `inspect`；只有 `execute` 步骤会进入原有工具驱动链；进入 `pending_validation/validating/completed` 后自动切到 `verify`
+- **修订闭环**：执行阻塞或验证失败时，系统会把任务标记为 `needs_revision`，同时写入 `task_events`，为后续受控修订保留入口
+- **成本约束**：这套监督链默认不新增高频 LLM 请求，仍坚持规则优先、LLM 只用于真正需要的执行/排障/验证兜底
+
+### 4.6 验收标准与自驱校验
 
 - **验收清单**：LLM 自动生成结构化验收清单，用户确认后开始执行
 - **自驱验收**：Worker 完成任务后调用 `proposeCompletion()`，状态转为 `pending_validation`
 - **自动质检**：`ValidatorService` 自动读取执行上下文并进行 LLM 审计，通过则标记 `completed`，失败则打回并附带改进建议
 - **ValidationAgent（内置 LLM Agent Loop）**：
   - **RESULT-FIRST 验证策略**：以任务实际产出（数据文件、数据库记录）为判定依据，禁止基于 Agent 运行状态（focus_task、idle）做判定
-  - LLM + 工具调用的 ReAct 模式，最多 10 轮迭代
+  - LLM + 工具调用的轻量 ReAct 模式，默认最多 4 轮迭代
   - 5 个工具：`exec_shell`、`read_duckdb`、`check_file`、`get_execution_logs`、`get_task_info`
   - **事实快速路径**：attempt_count=0 时先用工具检查 DuckDB 数据库、数据目录等实际产出物，有事实证据即通过，无证据才拒绝
   - **系统日志过滤**：`_getExecutionLogs` 过滤 14 种系统前缀（DriveOrchestrator、StuckTaskMonitor 等）和 14 种系统 metadata 类型，只返回 Agent 真正的执行日志
   - **强制判定兜底**：LLM 达到迭代上限未给出结论时，基于已有证据正/负面比例自动生成判定，避免迭代耗尽直接失败
-  - **收敛规则**：第 4 轮提醒产出结论，第 7 轮警告为最后一轮工具调用，第 9 轮强制输出 JSON 判定
+  - **收敛规则**：第 2 轮开始强提醒收敛，第 3 轮为最后工具轮，第 4 轮只允许返回 JSON 判定
   - 工具安全约束：只读权限、危险命令过滤、沙箱路径限制、30s 超时、1000 字符截断
-  - 显式传递 maxTokens: 100000 确保完整输出
+  - 单次调用预算默认 `maxTokens=3000`，并限制每轮最多 2 个工具调用，避免验证链空转打爆额度
 - **第三方验证（可选，默认关闭）**：通过 `ValidationDispatchService` 派发独立验证任务给另一个 Agent（如 hermes-ops），由第三方 Agent 独立调查并通过 `/validation-report` API 提交验证报告
 - **任务流程报告**：验证完成后自动生成任务报告，包含基本信息、执行记录、验证记录和时间线，支持 JSON 和 Markdown 格式
+- **疑难咨询 / 自动排障建议**：`/consult` 与 `DriveOrchestrator.consultTask()` 已改为压缩摘要 prompt，只携带最近尝试、关键执行统计和短时间线，并限制单次 `maxTokens=1200`
 
-### 4.6 多智能体协作
+### 4.7 多智能体协作
 
 | 能力 | API |
 |------|-----|
@@ -546,16 +561,16 @@ NODE_ENV=development   # 运行环境
       "baseUrl": "http://localhost:3456",
       "model": "MiniMax-M2.7",
       "temperature": 0.7,
-      "maxTokens": 100000
+      "maxTokens": 2000
     },
-    "openai": { "apiKey": "", "model": "gpt-3.5-turbo", "temperature": 0.7, "maxTokens": 100000 },
-    "anthropic": { "apiKey": "", "model": "claude-3-5-haiku-20241022", "temperature": 0.7, "maxTokens": 100000 },
+    "openai": { "apiKey": "", "model": "gpt-3.5-turbo", "temperature": 0.7, "maxTokens": 2000 },
+    "anthropic": { "apiKey": "", "model": "claude-3-5-haiku-20241022", "temperature": 0.7, "maxTokens": 2000 },
     "fallback": {
       "provider": "ollama",
       "baseUrl": "http://localhost:11434/v1",
       "model": "Qwen3.5_9b_f16:latest",
       "temperature": 0.7,
-      "maxTokens": 100000
+      "maxTokens": 2000
     }
   },
   "agent": { "id": "", "name": "" },
@@ -573,7 +588,7 @@ NODE_ENV=development   # 运行环境
 **LLM 配置说明**：
 - `provider`：默认使用哪个 Provider（`minimax` / `openai` / `anthropic`）
 - `fallback`：主 Provider 不可用时的备用 Provider（默认 Ollama 本地模型）
-- `maxTokens`：统一设置为 100000，确保 ValidationAgent 多轮工具调用和长文本输出不被截断
+- `maxTokens`：Provider 默认建议控制在 `1024-2000`，具体链路按场景做 per-call 覆盖；不要再全局放大 token 上限
 - `temperature`：所有 Provider 统一 0.7
 - `LLMManager` 在调用 Provider 时正确透传 `maxTokens` 和 `temperature` 参数（支持 per-call 覆盖）
 - **热插拔**：运行时可通过 `POST /api/llm/swap` 或 `framework.swapLLMProvider()` 切换 Provider，无需重启。切换流程：创建新实例 → 连接测试 → 原子替换 → 释放旧实例
@@ -665,7 +680,7 @@ agents:
 │                    │                         │
 │                    ▼                         │
 │  ┌──────────────────────────────────────┐    │
-│  │        Agent Loop（最多 10 轮）       │    │
+│  │        Agent Loop（最多 4 轮）        │    │
 │  │                                      │    │
 │  │   ┌──────────────┐                   │    │
 │  │   │ LLM + Tools  │◄── messages       │    │
@@ -802,9 +817,9 @@ async validate(agentId, task) {
 | **命令过滤** | 复用 `DANGEROUS_PATTERNS` 黑名单，禁止 `rm -rf`、`DROP`、`DELETE`、`TRUNCATE` 等危险命令 |
 | **沙箱路径限制** | `exec_shell` 仅允许在项目目录和 `/tmp` 下执行 |
 | **超时保护** | 每个工具调用最多 30 秒 |
-| **循环次数上限** | Agent Loop 最多 10 轮（`MAX_ITERATIONS=10`） |
+| **循环次数上限** | Agent Loop 最多 4 轮（`MAX_ITERATIONS=4`） |
 | **响应截断** | 工具返回结果超过 1000 字符时自动截断（`MAX_OUTPUT_LENGTH=1000`） |
-| **收敛强制** | 第 4 轮提醒产出结论，第 7 轮警告为最后一轮工具调用，第 9 轮强制输出 JSON 判定 |
+| **收敛强制** | 第 2 轮开始强提醒收敛，第 3 轮为最后工具轮，第 4 轮强制输出 JSON 判定 |
 | **事实快速路径** | attempt_count=0 时先用工具检查 DuckDB 数据库、数据目录等实际产出物，有证据即通过，无证据才拒绝 |
 | **强制判定兜底** | LLM 达到迭代上限未给出结论时，基于已有证据正/负面比例自动生成判定，避免迭代耗尽直接失败 |
 | **系统日志过滤** | `_getExecutionLogs` 过滤 14 种系统前缀和 14 种系统 metadata 类型，只返回 Agent 真正的执行日志 |
@@ -849,7 +864,7 @@ async validate(agentId, task) {
 | 3 | `src/services/ValidatorService.js` | 内部切换到 ValidationAgent，保持外部接口不变 | ✅ 已完成 |
 | 4 | `src/services/DriveOrchestrator.js` | 优化 validation_failed 处理逻辑 + maxConcurrentDrives=5 + shouldDrive parent_id 守卫 | ✅ 已完成 |
 | 5 | `framework/llm/LLMManager.js` | 修复 maxTokens/temperature 透传 bug | ✅ 已完成 |
-| 6 | 所有 config 文件 | maxTokens 统一升级到 100000 | ✅ 已完成 |
+| 6 | Validation / Consult / Focus / TemplateNormalization | 增加分链路 token 预算与降级护栏 | ✅ 已完成 |
 | 7 | `src/models/FocusState.js` | createOrUpdate 非法 focusMode 值自动修正守卫 | ✅ 已完成 |
 
 ---
@@ -1059,7 +1074,7 @@ if (isValidationTask(task)) {
 | LLM 集成 | ✅ | - | ✅ | - | Server 聚焦/推断 + Framework 全模块 |
 | LLM Provider tools | ✅ | - | ✅ | - | MiniMax/OpenAI/Ollama/Anthropic 全部支持 |
 | LLM Provider 热插拔 | ✅ | - | - | - | 运行时切换 Provider，无需重启 |
-| Agent Loop（验证） | ✅ | - | - | - | ValidationAgent 10 轮工具调用 + RESULT-FIRST + 系统日志过滤 + 强制判定兜底 |
+| Agent Loop（验证） | ✅ | - | - | - | ValidationAgent 4 轮轻量工具调用 + RESULT-FIRST + 系统日志过滤 + 强制判定兜底 |
 | StructuredDriveTools | ✅ | - | - | - | executeCommand/readFile/checkPath/updateProgress/proposeCompletion/confirmCompletion/askForHelp；已接入 DriveOrchestrator 工具优先主循环，保留 legacy fallback |
 | 角色模板系统 | - | - | ✅ | - | 通用/编码/分析/DevOps |
 | 记忆管理 | - | - | ✅ | - | 提取 + 自动摘要 |
@@ -1098,15 +1113,15 @@ if (isValidationTask(task)) {
 - [x] DriveOrchestrator 全自动任务驱动引擎（maxConcurrent=5）
 - [x] ValidatorService Agent-to-Agent 自动化质检（内置 ValidationAgent）
 - [x] StuckTaskMonitor 动态阈值卡住检测
-- [x] LLMInferencer 后台智能状态推断
+- [x] 规则优先任务状态分析（focus 默认关闭实时 LLM 推断）
 - [x] CleanupMonitor 自动归档超过 30 天的任务
 - [x] Python CLI Skill（`propose-completion`）
 - [x] Profile 感知自动匹配凭证
 - [x] Skill 同步到所有 Hermes profile
-- [x] **ValidationAgent（LLM Agent Loop + 5 个工具）** — 多轮工具调用独立验证
+- [x] **ValidationAgent（LLM Agent Loop + 5 个工具）** — 轻量多轮工具调用独立验证
 - [x] **所有 Provider tools 支持** — MiniMax/OpenAI/Ollama/Anthropic 全部支持 tools
 - [x] **LLMManager 参数透传修复** — maxTokens/temperature 正确传递到 Provider
-- [x] **maxTokens 统一升级 100000** — 所有 Provider 和 ValidationAgent 统一
+- [x] **链路级 token 预算治理** — Validation / Consult / Focus / TemplateNormalization 按场景单独限额，避免全局放大
 - [x] **收敛规则 + 快速路径 + 系统提醒** — 防止 ValidationAgent 无限循环
 - [x] **StructuredDriveTools** — executeCommand/readFile/checkPath/updateProgress/proposeCompletion/confirmCompletion/askForHelp
 - [x] **DriveOrchestrator 工具优先执行闭环（阶段一）** — 已实现工具优先 Agent Loop、即时结果回灌、fallback 原因统计、token 预算退出留痕与关键降级路径测试
@@ -1220,7 +1235,7 @@ if (isValidationTask(task)) {
 | `sdk/README.md` | SDK 使用 → 第六章 | ✅ 已清理 |
 | `skills/hermes-todo-skill/SKILL.md` | Skill 使用 → 第六章 | ✅ 已清理 |
 
-> 最后更新：2026-05-04 - 新增 ValidationAgent Agent Loop、Provider tools 支持、maxTokens 升级、Agent 架构演进路线、LLM Provider 热插拔
+> 最后更新：2026-05-07 - 新增四批稳定性治理，并完成第五批 token 降耗护栏（Validation/Consult/Focus/TemplateNormalization）
 
 ---
 
@@ -1696,6 +1711,285 @@ while (not done and iterations < MAX):
 - `校验通过率 >= 90%`
 - `pending_validation` 超时堆积数接近 `0`
 - 任一模板连续失败达到阈值时，系统能自动熔断并告警，而不是持续产出坏实例
+
+**当前已落地的第一批治理（2026-05-07）：**
+
+- 已默认关闭高频低价值的 `LLMInferencer`，不再用 LLM 猜测 `idle 5-15 分钟` 任务状态，避免持续消耗 MiniMax 配额
+- 已移除 `ContextManager` 和 `FocusState` 中的 LLM 排序/选任务分支，聚焦逻辑回退为规则优先
+- 已新增 `job_runs` / `scheduler_events` 事件层，开始记录作业实例的 `planned_at / spawned_at / started_at / first_heartbeat_at / pending_validation_at / completed_at / validated_at / final_status / failure_bucket`
+- 已新增标准化 `failure_bucket`：
+  - `not_started`
+  - `no_heartbeat`
+  - `tool_failure`
+  - `env_missing`
+  - `llm_unstable`
+  - `validation_failed`
+  - `human_blocked`
+- 已把 `DailyScheduler`、`CronExecutionMonitor`、`DriveOrchestrator`、`StructuredDriveTools`、`Todo` 状态更新链接入事件层，为后续完成率/验证通过率看板打底
+
+**当前已落地的第二批治理（2026-05-07）：**
+
+- 已新增 `TemplatePreflightService`，在 `DailyScheduler` 生成实例前先做模板级预检
+- 模板描述中若声明了显式 preflight 规范，例如：
+  - `CWD=...`
+  - `SCRIPT=...`
+  - `REQUIRES_BIN=...`
+  - `REQUIRES_ENV=...`
+  - `REQUIRES_PATH=...`
+  调度前会先检查目录、脚本、命令、环境变量、关键路径是否存在
+- 若模板预检失败，调度器不会继续 spawn 新实例，而是记录 `template_preflight_blocked` 事件并保留审计上下文
+- 已新增模板级连续失败熔断：
+  - 默认阈值：连续失败 `3` 次
+  - 默认冷却：`120` 分钟
+  - 连续失败达到阈值后，模板进入 `circuit_open_until`
+  - 冷却结束后允许再次尝试一次，而不是因为旧失败记录立即再次熔断
+- 这批改造的目的不是“让所有模板都继续跑”，而是把明显会失败的模板挡在实例生成之前，减少无效实例、空转驱动和配额浪费
+
+**当前已落地的第三批治理（2026-05-07）：**
+
+- 已新增 `ValidationPolicyService`，把验证链改成“固定策略优先，LLM/ValidationAgent 兜底”
+- 当前优先支持的固定策略包括：
+  - `inspection`
+  - `script`
+  - `backup`
+  - `code_change`
+  - `generic`
+- `proposeCompletion` 现在会把结构化证据写入 `completion_report.validationEvidence`，至少包括：
+  - `criteriaMet`
+  - `artifacts`
+  - `evidenceLines`
+  - `summary`
+- `ValidatorService` 会先读取 `completion_report` 和 `validationEvidence`，若证据足够则直接完成自动验收，不再优先消耗 LLM
+- 若结构化证据不足，系统不会轻易放过，而是进入规则拒绝或再回退到 `ValidationAgent`
+- 已新增 `pending_validation` 超时升级：
+  - 若待验收任务长时间未被处理，`StuckTaskMonitor` 会主动触发验证
+  - 若启用了第三方验证，则升级派发验证任务
+  - 否则立即触发内嵌自动验收，而不是让任务长期堆在 `pending_validation`
+- 这批改造的目标是把“做完了但验不过 / 没人验 / 等太久”这三类问题从系统层压下去，直接服务于 `90%+` 的验证通过率目标
+
+**当前已落地的第四批治理（2026-05-07）：**
+
+- 已新增 `ScheduleGovernanceService`，在 `DailyScheduler` 生成实例前补上调度治理闸门
+- 当前默认治理策略：
+  - 同模板只允许 `1` 个活跃实例
+  - 每个 agent 在短时间窗口内最多生成 `2` 个定时实例
+  - `inspection / backup` 类模板会进一步收紧 burst，避免占满调度窗口
+- 模板描述中支持显式覆盖治理参数：
+  - `MAX_ACTIVE_INSTANCES=<n>`
+  - `SCHEDULE_BURST_LIMIT=<n>`
+  - `SCHEDULE_BURST_WINDOW_MINUTES=<n>`
+- 已新增 `task_spawn_skipped` 事件，调度器跳过模板时会写清楚具体原因，例如：
+  - `template_active_limit`
+  - `agent_capacity_reached`
+  - `agent_spawn_burst_limit`
+- 已新增 `OpsMetricsService`，基于 `job_runs / scheduler_events` 输出运营指标
+- 当前可直接读取的关键指标包括：
+  - `spawned_jobs`
+  - `started_jobs`
+  - `first_heartbeat_jobs`
+  - `completed_jobs`
+  - `entered_validation_jobs`
+  - `validation_passed_jobs`
+  - `blocked_jobs`
+  - `startup_rate`
+  - `first_heartbeat_rate`
+  - `completion_rate`
+  - `validation_pass_rate`
+  - `blocked_rate`
+- 已新增接口：
+  - `GET /api/agents/:agentId/todos/stats/ops?hours=24`
+- 这批改造的目标是把“系统已经更稳”进一步变成“系统能持续量化观察、持续调参优化”，为后续把完成率和验证通过率稳定到 `90%+` 提供运营抓手
+
+**当前已落地的第五批治理（2026-05-07）：**
+
+- 已把 `ValidationAgent` 的默认验证预算从“高轮数 + 超大 token”收紧为：
+  - 最多 `4` 轮
+  - 每轮最多 `2` 个工具调用
+  - 单次 `maxTokens=3000`
+- 已把 `DriveOrchestrator` 结构化工具主循环收紧为：
+  - 最多 `4` 轮
+  - 总预算 `12000 token`
+  - 单轮最多 `3000 token`
+- 已把 `focus` 路由中的实时 LLM 工作状态分析默认关闭，改为规则引擎优先，只有显式开启 `ENABLE_FOCUS_LLM_ANALYSIS=1` 才会恢复
+- 已把 `/api/agents/:agentId/todos/:id/consult` 与 `DriveOrchestrator.consultTask()` 改为压缩摘要 prompt：
+  - 不再直接拼接完整 `report.execution` JSON
+  - 仅保留最近尝试、执行统计、验证摘要、短时间线
+  - 单次 `maxTokens=1200`
+- 已把 `env_missing / preflight_blocked` 类自动排障改成规则引擎优先：
+  - 目录不存在、环境变量缺失、脚本/命令缺失、权限不足等问题直接生成确定性修复步骤
+  - 不再为这类高频确定性阻塞默认触发模型请求
+- 已把 `TemplateNormalizationService` 的模板治理对话改为截断长字段并限制 `maxTokens=1200`
+- 已把模板规范化改成规则优先：
+  - `assigned_agent_id / task_category / max_attempts / 明确可推断的 schedule` 优先由规则补齐
+  - 只有涉及描述、验收标准等语义补全时才进入 agent2agent / LLM
+- 已新增 `tests/token-guards.test.js`，回归锁定：
+  - 验证链预算上限
+  - 排障咨询 prompt 压缩
+  - 模板治理 prompt 限额
+  - 确定性缺口跳过模型请求
+- 这批改造的目标不是“完全不用 LLM”，而是把 LLM 收敛到真正高价值、低频、可解释的环节，避免 TODO Server 再出现高频低价值调用把额度打爆
+
+**当前开发库 24h 基线（2026-05-07 实测）：**
+
+- 基线拉取方式：执行 `node scripts/query_ops_baseline.js`
+- 由于历史 `job_runs` 尚未持续沉淀，脚本会先对当前开发库活跃任务执行一次 `OpsBackfillService.backfillActiveRuns({ hours: 24 })`，把当天活跃实例回填进运行统计，再输出 `stats/ops` 口径结果
+- 本次回填结果：
+  - `scannedTasks=76`
+  - `runsCreated=13`（在前一次回填基础上继续补齐新归因实例）
+  - `bucketsAssigned=13`
+- 本次 24h 指标基线：
+  - `spawned_jobs=89`
+  - `startup_rate=86.52%`
+  - `first_heartbeat_rate=57.30%`
+  - `completion_rate=49.44%`
+  - `validation_pass_rate=0%`（当前开发库这批样本尚未形成有效 validated pass 事件）
+- 当前 24h 最大拖累项（按 `failure_buckets`）：
+  - `no_heartbeat=25`
+  - `not_started=6`
+- 对应定点治理已落地：
+  - `no_heartbeat`：`StuckTaskMonitor` / `ZombieDetector` 在自动恢复、阻塞标记时会同步写入 `failure_bucket=no_heartbeat`
+  - `not_started`：`AssignmentDriver` 对超时未启动的已指派任务同步写入 `failure_bucket=not_started`，并尝试自动驱动
+  - `stats/ops` 可观测性：新增 `OpsBackfillService`，定期把当前活跃任务补录到 `job_runs`，避免看板长期只显示空白或 `none`
+
+**今日状态收口与页面口径修正（2026-05-07）：**
+
+- 已确认后台页面“default 几千个任务”属于统计口径问题，不是今天真的新增了几千个活跃任务
+- 根因：
+  - `/api/agents/:agentId/todos/stats` 旧逻辑把 `archived=1` 的历史任务也算进了 `total / active_tasks`
+  - `public/index.html` 概览页优先展示了 `active_tasks`，导致页面把沉积历史一起显示为“总任务”
+- 已修复代码：
+  - `Todo.getStats()` 只统计未归档任务
+  - `active_tasks` 改为真正的非终态活跃任务
+  - 前端“总任务”改为优先展示 `total`
+- 已完成服务重启与页面口径切换：
+  - 本地 `todo-server` 已重启到最新代码
+  - 网页端现在展示的是最新统计口径，不再把 `archived` 历史任务混进“总任务/活跃任务”
+- 今日已统一收口的脏状态：
+  - 自动取消了 `6` 个“父任务已 completed/cancelled，但修复子任务仍挂着”的自动修复子任务
+  - 人工确认完成并收口了 `3` 个实际上已完成但仍卡在 `in_progress` 的巡检类任务：
+    - `schedule_test_daily`
+    - `【巡检】每日深度巡检`
+    - `🟡 数据仓库巡检报告 (2026-05-07 17:01)`
+- 收口后当前未归档状态已降到：
+  - `hermes-default`: `in_progress=14`, `pending=3`
+  - `hermes-ops`: `in_progress=0`, `pending=0`
+- 明日重点观察口径：
+  - `startup_rate`
+  - `first_heartbeat_rate`
+  - `completion_rate`
+  - `validation_pass_rate`
+  - `failure_buckets.no_heartbeat`
+- 统一观测命令：
+  - `node scripts/query_ops_baseline.js`
+
+**default 进行中任务的库侧核验（2026-05-07）：**
+
+- 已新增库核验脚本：
+  - `python3 scripts/query_default_db_evidence.py`
+  - `node scripts/audit_default_in_progress.js`
+- 当前 `hermes-default` 的 `14` 个 `in_progress` 里，不是全部都没做；从目标库最终状态看，至少有一部分业务结果已经满足：
+  - `daily_quote` 最新 `trade_date = 2026-05-07`，最新日期行数 `5493`
+  - `fact_adj_factor` 最新 `trade_date = 2026-05-07`，最新日期行数 `5519`
+  - `index_daily` 最新 `trade_date = 2026-05-06`，最新日期行数 `7`
+- 但以下链路从库结果看仍明显未完成或未落到目标表：
+  - `fact_margin` 只到 `2026-04-30`
+  - `fact_stk_limit` 只到 `2026-04-30`
+  - `fact_hk_hold / fact_hsgt_top10` 当前为空表
+  - `tushare_moneyflow.duckdb` 当前无业务表
+  - `tushare_block_trade_v2.duckdb` 当前无业务表
+- 因此后续处理口径应区分：
+  - 可以按库证据收口的任务
+  - 库里也未完成、需要继续驱动或转阻塞的任务
+
+**数据任务统一结果验收（2026-05-07 已落地）：**
+
+- 已新增 `todos.task_spec` 结构化字段，模板和实例共用，用于固定：
+  - 目标库路径
+  - 数据引擎类型（`duckdb / sqlite`）
+  - 目标表 / 日期字段
+  - 验收 SQL 列表
+- 已新增纯规则 `DataTaskValidationService`：
+  - 数据任务进入 `pending_validation` 后，优先直接执行目标库校验
+  - 所有 SQL 检查通过才允许进入 `completed`
+  - 不再让 LLM 判断“数据任务是不是完成了”
+- 已把 `TemplateNormalizationService` 扩展为数据模板规则补齐：
+  - 已知数据模板会自动补 `task_spec`
+  - 数据模板默认验收标准改为“目标库 + 最新日期 + 最新日期行数 + 库校验 SQL”
+  - 在规则足够时直接跳过 LLM，不再为了模板补全再发一次模型请求
+- 已执行模板升级脚本：
+  - `node scripts/upgrade_default_data_task_specs.js`
+  - 当前开发库 `hermes-default` 下 `14` 个数据模板已全部补齐 `task_spec`
+  - 同步补齐了 `18` 个仍未归档的实例任务字段，避免新老口径并存
+- 新增回归测试：
+  - `tests/data-task-validation.test.js`
+  - `tests/template-normalization.test.js`
+  - `tests/todo.test.js`
+- 这批改造解决的核心问题：
+  - 已落库但任务未收口
+  - 未落库却长期挂在 `in_progress`
+  - 数据任务完成判断依赖心跳/描述而非结果
+  - 模板升级后再次丢失目标库口径
+
+**数据任务强制驱动闭环增强（2026-05-08 已落地）：**
+
+- 已把 `DataTaskSpecService` 升级为数据任务规范源：
+  - 已知数据任务模板会固定输出正式目标库、正式校验 SQL、正式执行脚本
+  - 实例上残留的旧 `path / table / checks` 不再优先于规范规格，避免历史脏规格反复误判
+- 已为默认数据任务补“正式脚本绑定”，驱动时优先执行正式采集/同步脚本，而不是让智能体临时生成替代脚本：
+  - `fetch_daily_tushare.py`
+  - `daily_update_wrapper.py`
+  - `fetch_adj_factor_v2.py`
+  - `fetch_dividend_v2.py`
+  - `fetch_block_trade_v2.py`
+  - `fetch_index_daily_v2.py`
+  - `fetch_hsgt_hk_hold.py`
+  - `fetch_stk_limit.py`
+  - `fetch_margin.py`
+  - `fetch_margin_detail.py`
+  - `fetch_moneyflow_v2.py`
+  - `fetch_top_list.py`
+- 已把 `DriveOrchestrator` 接成“正式脚本优先”：
+  - 命中数据任务时先走正式脚本
+  - 脚本执行成功后直接进入规则验收
+  - 只有没有正式脚本绑定的任务才继续走原有 LLM/工具驱动链
+- 已把手动 `POST /api/agents/:agentId/todos/:id/drive` 优先切到 `DriveOrchestrator.triggerTaskDrive()`，避免手动驱动回退到旧的 `framework.processMessage()` 文本链路
+- 已给 `DataTaskValidationService` 增加 SQL 方言自适应：
+  - DuckDB/SQLite 共用一套验收规格时，会自动改写 `strftime(CURRENT_DATE - INTERVAL ...)` 等日期表达式
+  - 避免 DuckDB 风格 SQL 去验证 SQLite 目标库时直接报错
+- 已给源头空数据场景补“延期验收”规则：
+  - 当前已对 `hsgt`、`margin`、`margin_detail` 接入 Tushare 源头探测
+  - 若源头在目标日期返回 `0` 行，则本轮不记为 `validation_failed`
+  - 任务会自动回到等待下次调度的状态，并写入延期原因
+- 这批改造的目标不是让 LLM 继续高频盯执行细节，而是把执行、验收、延期判定都尽量收回到规则和正式脚本上，让 LLM 只保留在真正需要的兜底环节
+- 新增/更新回归测试：
+  - `tests/data-task-validation.test.js`
+  - `tests/drive-orchestrator.test.js`
+  - `tests/template-normalization.test.js`
+  - `tests/todo.test.js`
+
+**页面任务口径修正（2026-05-08 已落地）：**
+
+- Agent 面板继续保留“定时任务”独立区域，专门展示模板任务
+- 常规任务列表改为“今日日常任务”，只展示当天新生成的实例任务
+- 默认不再把昨天遗留实例和模板任务混在同一个常规列表里，避免凌晨看到 `0508` 任务时误以为已经提前调度
+- 列表后端新增 `todayOnly` 过滤口径，按当前机器本地时间判断 `created_at` 是否属于今天
+- 今日日常任务卡片额外显示“今日生成时间”和“来源模板”，方便快速区分这条实例是今天几点生成、由哪个模板派生
+
+**股市定时任务跨天补跑修正（2026-05-08 已落地）：**
+
+- 修复了 `findDueTemplates(..., { reconcile: true })` 在服务夜间恢复后会把“昨天下午 17:00-18:00 的股市日任务”在次日凌晨补生成的问题
+- 新规则：股市类收盘任务一旦跨过本地自然日，直接顺延到下一个调度时点，不再在凌晨执行补跑
+- 补充修正了时间根因：SQLite `CURRENT_TIMESTAMP` 写入的 UTC 裸时间现在统一按 UTC 解析，模板 `last_spawned_at` 也改为 ISO 时间，避免调度基准被本地时区误读
+- 本次已撤回凌晨误生成的 `每日 A股日线数据增量同步（Tushare）`、`每日分红数据增量同步（dividend）`、`每日资金流向数据增量同步（moneyflow）`、`每日龙虎榜数据增量同步（top_list）`、`每日复权因子数据增量同步（adj_factor）` 实例
+- 运行态复核已完成：`localhost:3000` 新进程加载修正后，当前 `hermes-default` 的“今日日常任务”只剩巡检任务，股市模板当前不再被判定为 due
+
+**本地 Dashboard 免登（2026-05-08 已落地）：**
+
+- 对 `localhost / 127.0.0.1` 访问放开本地 Dashboard 免登线：
+  - 本机访问 `/api/agents` 与 `/api/agents/:agentId/...` 时默认跳过 `X-Agent-Secret` 校验
+  - 本机访问 `/api/*` 时默认跳过开发期限流，避免 agent 列表被 `429` 打空
+- 前端在本机访问时会自动选择可用 Agent（优先 `hermes-default`）直接进入 Dashboard，不再弹出登录面板
+- 这条免登线仅用于本机开发访问；若设置 `DISABLE_LOCAL_DASHBOARD_BYPASS=1`，可恢复原始鉴权行为
 
 #### 阶段二：调度与执行中台收敛
 

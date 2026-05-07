@@ -6,6 +6,8 @@ const Context = require('../models/Context');
 const { getDb } = require('../db');
 
 const router = express.Router({ mergeParams: true });
+const ENABLE_FOCUS_LLM_ANALYSIS = process.env.ENABLE_FOCUS_LLM_ANALYSIS === '1'
+  || process.env.ENABLE_FOCUS_LLM_ANALYSIS === 'true';
 
 router.use((req, res, next) => {
   const { agentId } = req.params;
@@ -492,6 +494,10 @@ function _ruleBasedWorkAnalysis(agentId, task) {
 }
 
 async function buildWorkAnalysis(agentId, task, driveFramework) {
+  if (!ENABLE_FOCUS_LLM_ANALYSIS) {
+    return _ruleBasedWorkAnalysis(agentId, task);
+  }
+
   const now = Date.now();
   const lastHeartbeat = task.last_heartbeat ? parseDbTime(task.last_heartbeat) : 0;
   const idleMinutes = lastHeartbeat ? Math.floor((now - lastHeartbeat) / 60000) : 999;

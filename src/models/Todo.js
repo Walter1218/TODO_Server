@@ -16,6 +16,42 @@ const safeParseJson = (str, defaultValue = []) => {
   }
 };
 
+const safeParseObjectJson = (str, defaultValue = null) => {
+  if (!str) return defaultValue;
+  if (typeof str === 'object' && str !== null) return str;
+  try {
+    const parsed = JSON.parse(str);
+    return parsed && typeof parsed === 'object' ? parsed : defaultValue;
+  } catch {
+    return defaultValue;
+  }
+};
+
+function normalizeTaskSpecValue(value) {
+  if (value === undefined) return undefined;
+  if (value === null || value === '') return null;
+  if (typeof value === 'string') {
+    return safeParseObjectJson(value, null);
+  }
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value;
+  }
+  return null;
+}
+
+function hydrateTodoRecord(todo) {
+  if (!todo) return todo;
+  return {
+    ...todo,
+    requires_plan: coerceBoolean(todo.requires_plan),
+    tags: safeParseJson(todo.tags),
+    dependencies: safeParseJson(todo.dependencies),
+    attempt_log: safeParseJson(todo.attempt_log),
+    heartbeat_blockers: safeParseJson(todo.heartbeat_blockers),
+    task_spec: safeParseObjectJson(todo.task_spec, null)
+  };
+}
+
 const MONTH_NAME_MAP = {
   jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
   jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12
@@ -27,11 +63,58 @@ const DAY_NAME_MAP = {
 function coerceDate(value) {
   if (!value) return null;
   if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : new Date(value.getTime());
-  const normalized = typeof value === 'string' && value.includes(' ') && !value.includes('T')
-    ? value.replace(' ', 'T')
+  const normalized = typeof value === 'string'
+    ? (() => {
+        const trimmed = value.trim();
+        if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}(?:\.\d+)?$/.test(trimmed)) {
+          // SQLite CURRENT_TIMESTAMP uses UTC without an offset; preserve that here.
+          return `${trimmed.replace(' ', 'T')}Z`;
+        }
+        if (trimmed.includes(' ') && !trimmed.includes('T')) {
+          return trimmed.replace(' ', 'T');
+        }
+        return trimmed;
+      })()
     : value;
   const parsed = new Date(normalized);
   return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+const MARKET_CLOSE_CATCHUP_MAX_DELAY_MS = 4 * 60 * 60 * 1000;
+
+function isMarketCloseTemplate(template) {
+  if (!template) return false;
+  const text = [
+    template.title,
+    template.description,
+    template.task_category,
+    template.task_spec ? JSON.stringify(template.task_spec) : ''
+  ].filter(Boolean).join(' ').toLowerCase();
+
+  const cronExpr = String(template.schedule || '').startsWith('cron:')
+    ? String(template.schedule).slice(5).trim()
+    : String(template.schedule || '').trim();
+  const hourField = cronExpr.split(/\s+/)[1] || '';
+  const marketCloseHours = new Set(['16', '17', '18']);
+  const marketKeywords = [
+    'a股', 'tushare', 'daily_quote', 'daily_basic', 'stock.db',
+    'moneyflow', 'top_list', 'adj_factor', 'block_trade', 'hsgt',
+    'stk_limit', 'margin', 'margin_detail', 'index_daily',
+    '日线', '分红', '资金流向', '龙虎榜', '复权', '大宗交易',
+    '沪深港通', '涨跌停', '融资融券'
+  ];
+
+  return marketCloseHours.has(hourField)
+    && marketKeywords.some(keyword => text.includes(keyword));
+}
+
+function shouldSkipCrossDayCatchup(template, referenceTime) {
+  const nextDue = coerceDate(template?.next_due_at);
+  const reference = coerceDate(referenceTime);
+  if (!nextDue || !reference) return false;
+  if (nextDue.getTime() > reference.getTime()) return false;
+  if ((reference.getTime() - nextDue.getTime()) < MARKET_CLOSE_CATCHUP_MAX_DELAY_MS) return false;
+  return isMarketCloseTemplate(template);
 }
 
 function normalizeCronNumber(token, aliasMap = null) {
@@ -262,6 +345,11 @@ class Todo {
       if (trimmedTaskCategory !== rawData.taskCategory) normalizationNotes.push('task_category_trimmed');
     }
 
+    if (hasOwn(rawData, 'taskSpec')) {
+      normalizedData.taskSpec = normalizeTaskSpecValue(rawData.taskSpec);
+      if (rawData.taskSpec !== normalizedData.taskSpec) normalizationNotes.push('task_spec_normalized');
+    }
+
     if (hasOwn(rawData, 'priority')) {
       const allowedPriorities = ['low', 'medium', 'high', 'critical'];
       if (!allowedPriorities.includes(rawData.priority)) {
@@ -408,8 +496,17 @@ class Todo {
       taskCategory = 'general',
       validationReport = '',
       validatedBy = null,
-      validationCount = 0
+      validationCount = 0,
+      taskSpec = null,
+      requiresPlan = false,
+      planStatus = 'not_required',
+      currentPlanId = null,
+      currentStepId = null,
+      executionState = 'idle',
+      leaseExpiresAt = null,
+      lastActionAt = null
     } = normalizedData;
+    const failureBucket = data.failureBucket === undefined ? null : data.failureBucket;
 
     // Auto-set isTemplate=true if schedule is provided but isTemplate not explicitly set
     // This prevents LLM from forgetting to mark scheduled tasks as templates
@@ -427,9 +524,10 @@ class Todo {
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
         origin_agent_id, assigned_agent_id, schedule, is_template, next_due_at,
-        validation_report, validated_by, validation_count, task_category
+        validation_report, validated_by, validation_count, task_category, task_spec, failure_bucket,
+        requires_plan, plan_status, current_plan_id, current_step_id, execution_state, lease_expires_at, last_action_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -437,10 +535,17 @@ class Todo {
       context, JSON.stringify(tags), JSON.stringify(dependencies), position,
       acceptanceCriteria, criteriaConfirmed ? 1 : 0, maxAttempts,
       agentId, assignedAgentId, schedule, finalIsTemplate ? 1 : 0, nextDueAt,
-      validationReport, validatedBy, validationCount, taskCategory
+      validationReport, validatedBy, validationCount, taskCategory, taskSpec ? JSON.stringify(taskSpec) : null, failureBucket,
+      requiresPlan ? 1 : 0, planStatus, currentPlanId, currentStepId, executionState, leaseExpiresAt, lastActionAt
     );
-
-    return this.findById(agentId, id);
+    const created = this.findById(agentId, id);
+    try {
+      const JobRunService = require('../services/JobRunService');
+      JobRunService.syncTaskState(agentId, created, null, { source: 'todo_create' });
+    } catch (err) {
+      console.error('[Todo] syncTaskState(create) failed:', err.message);
+    }
+    return created;
   }
 
   static findById(agentId, id) {
@@ -448,14 +553,7 @@ class Todo {
     const stmt = db.prepare('SELECT * FROM todos WHERE id = ? AND agent_id = ?');
     const todo = stmt.get(id, agentId);
 
-    if (todo) {
-      todo.tags = safeParseJson(todo.tags);
-      todo.dependencies = safeParseJson(todo.dependencies);
-      todo.attempt_log = safeParseJson(todo.attempt_log);
-      todo.heartbeat_blockers = safeParseJson(todo.heartbeat_blockers);
-    }
-
-    return todo;
+    return hydrateTodoRecord(todo);
   }
 
   static findByTitle(agentId, title) {
@@ -463,19 +561,12 @@ class Todo {
     const stmt = db.prepare('SELECT * FROM todos WHERE agent_id = ? AND title = ? ORDER BY created_at DESC LIMIT 1');
     const todo = stmt.get(agentId, title);
 
-    if (todo) {
-      todo.tags = safeParseJson(todo.tags);
-      todo.dependencies = safeParseJson(todo.dependencies);
-      todo.attempt_log = safeParseJson(todo.attempt_log);
-      todo.heartbeat_blockers = safeParseJson(todo.heartbeat_blockers);
-    }
-
-    return todo;
+    return hydrateTodoRecord(todo);
   }
 
   static findAllByAgent(agentId, filters = {}) {
     const db = getDb();
-    const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0, source } = filters;
+    const { status, priority, tags, projectId, isTemplate, title, includeArchived, limit = 100, offset = 0, source, todayOnly } = filters;
 
     let query = 'SELECT * FROM todos WHERE agent_id = ?';
     const params = [agentId];
@@ -515,6 +606,10 @@ class Todo {
       query += ' AND (archived = 0 OR archived IS NULL)';
     }
 
+    if (todayOnly) {
+      query += " AND date(created_at, 'localtime') = date('now', 'localtime')";
+    }
+
     if (source === 'agent') {
       query += ' AND (origin_agent_id != ? OR assigned_agent_id = ?)';
       params.push(agentId, agentId);
@@ -530,13 +625,7 @@ class Todo {
     const stmt = db.prepare(query);
     const todos = stmt.all(...params);
 
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static update(agentId, id, data) {
@@ -553,6 +642,7 @@ class Todo {
         || hasOwn(data, 'description')
         || hasOwn(data, 'title')
         || hasOwn(data, 'taskCategory')
+        || hasOwn(data, 'taskSpec')
       )
     });
     const {
@@ -585,8 +675,34 @@ class Todo {
       validationCount,
       validationDeadline,
       archived,
-      taskCategory
+      taskCategory,
+      taskSpec,
+      requiresPlan,
+      planStatus,
+      currentPlanId,
+      currentStepId,
+      executionState,
+      leaseExpiresAt,
+      lastActionAt
     } = normalizedData;
+    const failureBucket = Object.prototype.hasOwnProperty.call(data, 'failureBucket')
+      ? data.failureBucket
+      : undefined;
+    const circuitOpenUntil = Object.prototype.hasOwnProperty.call(data, 'circuitOpenUntil')
+      ? data.circuitOpenUntil
+      : undefined;
+    const lastPreflightAt = Object.prototype.hasOwnProperty.call(data, 'lastPreflightAt')
+      ? data.lastPreflightAt
+      : undefined;
+    const lastPreflightStatus = Object.prototype.hasOwnProperty.call(data, 'lastPreflightStatus')
+      ? data.lastPreflightStatus
+      : undefined;
+    const lastPreflightReport = Object.prototype.hasOwnProperty.call(data, 'lastPreflightReport')
+      ? data.lastPreflightReport
+      : undefined;
+    const completionReport = Object.prototype.hasOwnProperty.call(data, 'completionReport')
+      ? data.completionReport
+      : undefined;
 
     const updates = [];
     const values = [];
@@ -733,6 +849,76 @@ class Todo {
       values.push(taskCategory);
     }
 
+    if (taskSpec !== undefined) {
+      updates.push('task_spec = ?');
+      values.push(taskSpec ? JSON.stringify(taskSpec) : null);
+    }
+
+    if (requiresPlan !== undefined) {
+      updates.push('requires_plan = ?');
+      values.push(requiresPlan ? 1 : 0);
+    }
+
+    if (planStatus !== undefined) {
+      updates.push('plan_status = ?');
+      values.push(planStatus);
+    }
+
+    if (currentPlanId !== undefined) {
+      updates.push('current_plan_id = ?');
+      values.push(currentPlanId);
+    }
+
+    if (currentStepId !== undefined) {
+      updates.push('current_step_id = ?');
+      values.push(currentStepId);
+    }
+
+    if (executionState !== undefined) {
+      updates.push('execution_state = ?');
+      values.push(executionState);
+    }
+
+    if (leaseExpiresAt !== undefined) {
+      updates.push('lease_expires_at = ?');
+      values.push(leaseExpiresAt);
+    }
+
+    if (lastActionAt !== undefined) {
+      updates.push('last_action_at = ?');
+      values.push(lastActionAt);
+    }
+
+    if (failureBucket !== undefined) {
+      updates.push('failure_bucket = ?');
+      values.push(failureBucket);
+    }
+
+    if (circuitOpenUntil !== undefined) {
+      updates.push('circuit_open_until = ?');
+      values.push(circuitOpenUntil);
+    }
+
+    if (lastPreflightAt !== undefined) {
+      updates.push('last_preflight_at = ?');
+      values.push(lastPreflightAt);
+    }
+
+    if (lastPreflightStatus !== undefined) {
+      updates.push('last_preflight_status = ?');
+      values.push(lastPreflightStatus);
+    }
+
+    if (lastPreflightReport !== undefined) {
+      updates.push('last_preflight_report = ?');
+      values.push(lastPreflightReport);
+    }
+
+    if (completionReport !== undefined) {
+      updates.push('completion_report = ?');
+      values.push(completionReport);
+    }
+
     if (archived !== undefined) {
       updates.push('archived = ?');
       values.push(archived ? 1 : 0);
@@ -780,7 +966,16 @@ class Todo {
     `);
 
     stmt.run(...values);
-
+    const refreshed = this.findById(agentId, id);
+    try {
+      const JobRunService = require('../services/JobRunService');
+      JobRunService.syncTaskState(agentId, refreshed, existingTask, {
+        source: 'todo_update',
+        failureBucket
+      });
+    } catch (err) {
+      console.error('[Todo] syncTaskState(update) failed:', err.message);
+    }
     return this.findById(agentId, id);
   }
 
@@ -810,18 +1005,18 @@ class Todo {
 
     const stmt = db.prepare(`
       SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN is_template = 0 THEN 1 ELSE 0 END) as active_tasks,
-        SUM(CASE WHEN status = 'pending' AND is_template = 0 THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN status = 'in_progress' AND is_template = 0 THEN 1 ELSE 0 END) as in_progress,
-        SUM(CASE WHEN status = 'completed' AND is_template = 0 THEN 1 ELSE 0 END) as completed,
-        SUM(CASE WHEN status = 'cancelled' AND is_template = 0 THEN 1 ELSE 0 END) as cancelled,
-        SUM(CASE WHEN status = 'blocked' AND is_template = 0 THEN 1 ELSE 0 END) as blocked,
-        SUM(CASE WHEN status = 'pending_validation' AND is_template = 0 THEN 1 ELSE 0 END) as pending_validation,
-        SUM(CASE WHEN status = 'validating' AND is_template = 0 THEN 1 ELSE 0 END) as validating,
-        SUM(CASE WHEN status = 'validation_failed' AND is_template = 0 THEN 1 ELSE 0 END) as validation_failed,
-        SUM(CASE WHEN priority = 'critical' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 THEN 1 ELSE 0 END) as critical_pending,
-        SUM(CASE WHEN priority = 'high' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 THEN 1 ELSE 0 END) as high_pending
+        SUM(CASE WHEN is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as total,
+        SUM(CASE WHEN is_template = 0 AND (archived = 0 OR archived IS NULL) AND status NOT IN ('completed', 'cancelled') THEN 1 ELSE 0 END) as active_tasks,
+        SUM(CASE WHEN status = 'pending' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN status = 'in_progress' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as in_progress,
+        SUM(CASE WHEN status = 'completed' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as completed,
+        SUM(CASE WHEN status = 'cancelled' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as cancelled,
+        SUM(CASE WHEN status = 'blocked' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as blocked,
+        SUM(CASE WHEN status = 'pending_validation' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as pending_validation,
+        SUM(CASE WHEN status = 'validating' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as validating,
+        SUM(CASE WHEN status = 'validation_failed' AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as validation_failed,
+        SUM(CASE WHEN priority = 'critical' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as critical_pending,
+        SUM(CASE WHEN priority = 'high' AND status NOT IN ('completed', 'cancelled') AND is_template = 0 AND (archived = 0 OR archived IS NULL) THEN 1 ELSE 0 END) as high_pending
       FROM todos
       WHERE agent_id = ?
     `);
@@ -841,11 +1036,7 @@ class Todo {
     const searchTerm = `%${query}%`;
     const todos = stmt.all(agentId, searchTerm, searchTerm, searchTerm);
 
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static hasCircularDependency(agentId, todoId, newDependencies) {
@@ -1152,7 +1343,14 @@ class Todo {
       WHERE id = ? AND agent_id = ?
     `);
     stmt.run(...values);
-    return this.findById(agentId, id);
+    const refreshed = this.findById(agentId, id);
+    try {
+      const JobRunService = require('../services/JobRunService');
+      JobRunService.markHeartbeat(agentId, refreshed, { source: 'todo_update_heartbeat' });
+    } catch (err) {
+      console.error('[Todo] markHeartbeat failed:', err.message);
+    }
+    return refreshed;
   }
 
   static recordAttempt(agentId, id, attemptResult) {
@@ -1178,7 +1376,8 @@ class Todo {
     return this.update(agentId, id, {
       attemptCount: newCount,
       attemptLog: newLog,
-      status: newStatus
+      status: newStatus,
+      ...(newStatus === 'blocked' ? { failureBucket: 'tool_failure' } : {})
     });
   }
 
@@ -1186,13 +1385,7 @@ class Todo {
     const db = getDb();
     const stmt = db.prepare('SELECT * FROM todos WHERE agent_id = ? AND parent_id = ? ORDER BY position ASC');
     const todos = stmt.all(agentId, parentId);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static cancelOrphanChildren(agentId) {
@@ -1250,13 +1443,7 @@ class Todo {
         AND (last_heartbeat IS NULL OR last_heartbeat < ?)
     `);
     const todos = stmt.all(agentId, cutoff);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   /**
@@ -1269,13 +1456,7 @@ class Todo {
       WHERE agent_id = ? AND status IN ('in_progress', 'validating', 'pending_validation')
     `);
     const todos = stmt.all(agentId);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static findProgressStalledTasks(agentId, stallMinutes = 15) {
@@ -1289,13 +1470,7 @@ class Todo {
         AND (updated_at IS NULL OR updated_at < ?)
     `);
     const todos = stmt.all(agentId, cutoff, cutoff);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   // ==================== 多智能体协作方法 ====================
@@ -1326,13 +1501,7 @@ class Todo {
         created_at DESC
     `);
     const todos = stmt.all(agentId);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static findCreatedByMe(agentId) {
@@ -1343,13 +1512,7 @@ class Todo {
       ORDER BY created_at DESC
     `);
     const todos = stmt.all(agentId);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static transfer(agentId, todoId, newAssignedAgentId, reason = '') {
@@ -1416,13 +1579,7 @@ class Todo {
       ORDER BY next_due_at ASC, created_at DESC
     `);
     const todos = stmt.all(agentId);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static findDueTemplates(agentId, referenceTime = new Date(), options = {}) {
@@ -1444,6 +1601,20 @@ class Todo {
     if (!template || !template.schedule) return template;
 
     const reference = coerceDate(referenceTime) || new Date();
+    if (shouldSkipCrossDayCatchup(template, reference)) {
+      const futureNextDue = this.computeNextDueAt(template.schedule, reference);
+      if (!futureNextDue) return template;
+      if (isSameInstant(template.next_due_at, futureNextDue)) {
+        return {
+          ...template,
+          next_due_at: futureNextDue
+        };
+      }
+      return this.update(agentId, template.id, {
+        nextDueAt: futureNextDue
+      });
+    }
+
     const baseTime = coerceDate(template.last_spawned_at) || coerceDate(template.created_at) || reference;
     const computedNextDue = this.computeNextDueAt(template.schedule, baseTime);
 
@@ -1508,10 +1679,10 @@ class Todo {
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
         origin_agent_id, assigned_agent_id, assigned_at, schedule, is_template, status,
-        task_category, created_at, updated_at,
+        task_category, task_spec, created_at, updated_at,
         transferred_from
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
     `);
 
     stmt.run(
@@ -1520,20 +1691,21 @@ class Todo {
       template.context || '', JSON.stringify(template.tags || []), JSON.stringify(template.dependencies || []), template.position,
       template.acceptance_criteria || '', template.criteria_confirmed ? 1 : 0, template.max_attempts,
       agentId, template.assigned_agent_id || null, assignedAt, null, 0, 'pending',
-      taskCategory,
+      taskCategory, template.task_spec ? JSON.stringify(template.task_spec) : null,
       replacedTask ? replacedTask.id : (replacesId || null)
     );
 
     // Update template: last_spawned_at and next_due_at
+    const spawnedAt = new Date();
     const nextDueAt = template.schedule
-      ? this.computeNextDueAt(template.schedule, new Date())
+      ? this.computeNextDueAt(template.schedule, spawnedAt)
       : null;
 
     const updateStmt = db.prepare(`
-      UPDATE todos SET last_spawned_at = CURRENT_TIMESTAMP, next_due_at = ?, updated_at = CURRENT_TIMESTAMP
+      UPDATE todos SET last_spawned_at = ?, next_due_at = ?, updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND agent_id = ?
     `);
-    updateStmt.run(nextDueAt, templateId, agentId);
+    updateStmt.run(spawnedAt.toISOString(), nextDueAt, templateId, agentId);
 
     const spawned = this.findById(agentId, newId);
     if (replacedTask) {
@@ -1606,13 +1778,7 @@ class Todo {
       'SELECT * FROM todos WHERE agent_id = ? AND parent_id = ? AND status = ?'
     );
     const todos = stmt.all(agentId, templateId, 'pending');
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+    return todos.map(hydrateTodoRecord);
   }
 
   static computeNextDueAt(schedule, fromTime) {

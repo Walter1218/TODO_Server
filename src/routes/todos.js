@@ -9,6 +9,7 @@ const CommandExecutor = require('../services/CommandExecutor');
 const ProgressValidator = require('../services/ProgressValidator');
 const TaskReportService = require('../services/TaskReportService');
 const TemplateNormalizationService = require('../services/TemplateNormalizationService');
+const OpsMetricsService = require('../services/OpsMetricsService');
 
 const router = express.Router({ mergeParams: true });
 
@@ -64,6 +65,9 @@ function buildNormalizedTodoPayload(agentId, rawPayload, options = {}) {
     assignedAgentId: rawPayload.assignedAgentId !== undefined
       ? rawPayload.assignedAgentId
       : rawPayload.assigned_agent_id,
+    taskSpec: rawPayload.taskSpec !== undefined
+      ? rawPayload.taskSpec
+      : rawPayload.task_spec,
     taskCategory: rawPayload.taskCategory !== undefined
       ? rawPayload.taskCategory
       : rawPayload.task_category
@@ -91,7 +95,8 @@ router.post('/', async (req, res) => {
       acceptanceCriteria: req.body.acceptanceCriteria,
       criteriaConfirmed: req.body.criteriaConfirmed,
       maxAttempts: req.body.maxAttempts,
-      taskCategory: req.body.taskCategory
+      taskCategory: req.body.taskCategory,
+      taskSpec: req.body.taskSpec
     }, {
       operation: 'create',
       enforceTemplateStandards: true
@@ -197,7 +202,7 @@ router.post('/', async (req, res) => {
 router.get('/', (req, res) => {
   try {
     const { agentId } = req.params;
-    const { status, priority, tags, limit, offset, projectId, isTemplate, title, source } = req.query;
+    const { status, priority, tags, limit, offset, projectId, isTemplate, title, source, todayOnly } = req.query;
 
     const filters = {};
     if (status) filters.status = status;
@@ -205,10 +210,12 @@ router.get('/', (req, res) => {
     if (tags) filters.tags = tags.split(',').map(t => t.trim());
     if (projectId) filters.projectId = projectId;
     if (isTemplate !== undefined) filters.isTemplate = isTemplate === 'true' || isTemplate === '1';
+    if (isTemplate === undefined) filters.isTemplate = false;
     if (title) filters.title = title;
     if (limit) filters.limit = parseInt(limit);
     if (offset) filters.offset = parseInt(offset);
     if (source) filters.source = source;
+    if (todayOnly !== undefined) filters.todayOnly = todayOnly === 'true' || todayOnly === '1';
 
     const todos = Todo.findAllByAgent(agentId, filters);
 
@@ -277,6 +284,25 @@ router.get('/stats', (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to fetch stats'
+    });
+  }
+});
+
+router.get('/stats/ops', (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const { hours } = req.query;
+    const metrics = OpsMetricsService.getAgentMetrics(agentId, { hours });
+
+    res.json({
+      success: true,
+      data: metrics
+    });
+  } catch (error) {
+    console.error('Error fetching ops metrics:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      message: 'Failed to fetch ops metrics'
     });
   }
 });
@@ -734,6 +760,7 @@ router.put('/:id', async (req, res) => {
       heartbeatStep: req.body.heartbeatStep,
       heartbeatBlockers: req.body.heartbeatBlockers,
       taskCategory: req.body.taskCategory,
+      taskSpec: req.body.taskSpec,
       assignmentNote
     }, {
       operation: 'update',
@@ -912,7 +939,27 @@ router.post('/:id/drive', async (req, res) => {
       Todo.updateStatus(agentId, id, 'in_progress');
     }
 
-    // 2. 获取 Framework 实例
+    // 2. 优先走新的 DriveOrchestrator，避免手动驱动回退到 legacy LLM 链路
+    const driveOrchestrator = req.app.get('driveOrchestrator');
+    if (driveOrchestrator) {
+      const forced = await driveOrchestrator.triggerTaskDrive(agentId, id, {
+        source: 'manual_api',
+        reason: 'manual_drive_route',
+        waitForCompletion: true,
+        setFocus: true,
+        allowPendingChildren: true
+      });
+      return res.json({
+        success: true,
+        data: {
+          task: Todo.findById(agentId, id),
+          orchestrated: true,
+          result: forced
+        }
+      });
+    }
+
+    // 3. 获取 Framework 实例
     const framework = req.app.get('driveFramework');
     if (!framework || !framework.initialized) {
       return res.status(503).json({
@@ -921,7 +968,7 @@ router.post('/:id/drive', async (req, res) => {
       });
     }
 
-    // 3. 执行前快照
+    // 4. 执行前快照
     const refreshedTask = Todo.findById(agentId, id);
     const preflight = CommandExecutor.preflightFromTask(refreshedTask);
     if (preflight && preflight.blockers && preflight.blockers.length > 0) {
@@ -955,14 +1002,14 @@ router.post('/:id/drive', async (req, res) => {
     }
     const before = ProgressValidator.snapshot(refreshedTask);
 
-    // 4. 构建 Work Prompt
+    // 5. 构建 Work Prompt
     const workPrompt = buildDrivePrompt(refreshedTask, { isManual: true });
 
-    // 5. 调用 LLM
+    // 6. 调用 LLM
     const result = await framework.processMessage(workPrompt);
     const reply = result.response.message;
 
-    // 6. 【增强】提取并执行 bash 命令
+    // 7. 【增强】提取并执行 bash 命令
     let commandsExecuted = [];
     const { commands, results } = await CommandExecutor.extractAndRun(reply, { task: refreshedTask });
     if (commands.length > 0) {
@@ -1001,7 +1048,7 @@ router.post('/:id/drive', async (req, res) => {
       }
     }
 
-    // 7. 解析 heartbeat 变更（结合命令执行结果）
+    // 8. 解析 heartbeat 变更（结合命令执行结果）
     const parsed = parseHeartbeatReply(refreshedTask, reply);
     if (parsed.changed) {
       Todo.updateHeartbeat(agentId, id, {
@@ -1011,11 +1058,11 @@ router.post('/:id/drive', async (req, res) => {
       });
     }
 
-    // 8. 更新 last_driven_at
+    // 9. 更新 last_driven_at
     const { getDb } = require('../db');
     getDb().prepare(`UPDATE todos SET last_driven_at = CURRENT_TIMESTAMP WHERE id = ?`).run(id);
 
-    // 9. 【新增】Progress 验证
+    // 10. 【新增】Progress 验证
     const afterRefreshed = Todo.findById(agentId, id);
     const after = ProgressValidator.snapshot(afterRefreshed);
     const { changed } = ProgressValidator.compare(before, after);
@@ -1028,7 +1075,7 @@ router.post('/:id/drive', async (req, res) => {
       metadata: { type: 'progress_report', task_id: id }
     });
 
-    // 10. 写入 contexts 记录
+    // 11. 写入 contexts 记录
     Context.create(agentId, {
       sessionId: 'manual-drive',
       role: 'system',
@@ -1036,7 +1083,7 @@ router.post('/:id/drive', async (req, res) => {
       metadata: { type: 'manual_drive', task_id: id, reply_length: reply.length }
     });
 
-    // 11. 返回结果
+    // 12. 返回结果
     res.json({
       success: true,
       data: {
@@ -1189,7 +1236,8 @@ router.post('/:id/sub-tasks', (req, res) => {
       priority: req.body.priority,
       context: req.body.context,
       tags: req.body.tags,
-      assignedAgentId: req.body.assignedAgentId !== undefined ? req.body.assignedAgentId : req.body.assigned_agent_id
+      assignedAgentId: req.body.assignedAgentId !== undefined ? req.body.assignedAgentId : req.body.assigned_agent_id,
+      taskSpec: req.body.taskSpec
     }, { operation: 'create' });
     const { title, priority, assignedAgentId } = normalizedData;
 
@@ -1656,30 +1704,16 @@ router.post('/:id/consult', async (req, res) => {
     }
 
     const report = await TaskReportService.generateReport(agentId, id);
-    const attempts = Array.isArray(task.attempt_log) ? task.attempt_log.slice(-10) : [];
-    const blockers = Array.isArray(task.heartbeat_blockers) ? task.heartbeat_blockers : [];
-
-    const prompt = `你是一个资深运维/数据工程排障助手。你将接手一个自动化任务（由智能体驱动执行），目前出现失败或阻塞。\n\n` +
-      `# 任务信息\n` +
-      `- 标题: ${task.title}\n` +
-      `- 状态: ${task.status}\n` +
-      `- 优先级: ${task.priority}\n` +
-      `- 进度: ${task.heartbeat_progress || 0}%\n` +
-      `- 最后步骤: ${task.heartbeat_step || ''}\n` +
-      `- 阻塞项: ${blockers.length ? blockers.join('；') : '无'}\n` +
-      `- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}\n\n` +
-      `# 最近尝试记录（最多10条）\n` +
-      `${attempts.map(a => `- [${a.timestamp}] ${a.success ? '成功' : '失败'} | ${a.reason || ''} | ${String(a.output || '').slice(0, 300)}`).join('\n') || '无'}\n\n` +
-      `# 执行与上下文摘要\n` +
-      `${JSON.stringify(report.execution || {}, null, 2)}\n\n` +
-      `# 用户问题\n` +
-      `${question || '请诊断核心卡点，并给出最小可落地的修复步骤（按优先级排序），以及需要补齐的环境/配置清单。'}\n\n` +
-      `请只返回 JSON：\n` +
-      `{\"summary\":\"...\",\"root_causes\":[\"...\"],\"fix_steps\":[\"...\"],\"preflight_checklist\":[\"...\"],\"template_improvements\":[\"...\"]}`;
+    const prompt = TaskReportService.buildConsultPrompt(task, report, question, {
+      maxAttempts: 3,
+      maxTimeline: 5,
+      maxCommands: 3
+    });
 
     const result = await llmManager.chat({
       messages: [{ role: 'user', content: prompt }],
-      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。'
+      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。',
+      maxTokens: 1200
     });
 
     const reply = result.content || '';

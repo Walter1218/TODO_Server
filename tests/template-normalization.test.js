@@ -141,4 +141,38 @@ describe('TemplateNormalizationService', () => {
     expect(updated.acceptance_criteria).toContain('调度规则');
     expect(updated.schedule).toBeNull();
   });
+
+  test('rule engine auto-fills task_spec for known data template without LLM', async () => {
+    const owner = createTestAgent('owner');
+    const template = Todo.create(owner.id, {
+      title: '每日资金流向数据增量同步（moneyflow）',
+      schedule: '5 17 * * 1-5',
+      isTemplate: true
+    });
+
+    db.prepare(`
+      UPDATE todos
+      SET acceptance_criteria = '',
+          task_spec = NULL
+      WHERE id = ?
+    `).run(template.id);
+
+    const service = new TemplateNormalizationService({
+      framework: {
+        modules: {
+          llmManager: {
+            hasProvider: () => false
+          }
+        }
+      }
+    });
+
+    const result = await service.normalizeNonCompliantTemplates(owner.id, { templateIds: [template.id] });
+    const updated = Todo.findById(owner.id, template.id);
+
+    expect(result.normalized).toBe(1);
+    expect(updated.task_spec).toBeTruthy();
+    expect(updated.task_spec.kind).toBe('data_task');
+    expect(updated.acceptance_criteria).toContain('库校验 SQL');
+  });
 });

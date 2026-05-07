@@ -128,30 +128,6 @@ class FocusState {
         score: this.calculateFocusScore(t, completedIds)
       })).sort((a, b) => b.score - a.score);
 
-      if (llmManager && llmManager.hasProvider && llmManager.hasProvider()) {
-        try {
-          const topCandidates = scored.slice(0, 5);
-          const prompt = this._buildFocusScorePrompt(topCandidates);
-          const result = await llmManager.chat({
-            messages: [{ role: 'user', content: prompt }],
-            system: '你是一个任务调度助手，请根据候选任务的信息选择最应该执行的任务，只返回 JSON。'
-          });
-          const reply = result.content || '';
-          const jsonMatch = reply.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            const chosenIndex = parseInt(parsed.chosen_index);
-            if (!isNaN(chosenIndex) && chosenIndex >= 0 && chosenIndex < topCandidates.length) {
-              const chosen = topCandidates[chosenIndex];
-              this.createOrUpdate(agentId, { currentTaskId: chosen.id });
-              return { ...chosen, focus_reason: `llm_selected: ${parsed.reason || ''}` };
-            }
-          }
-        } catch (e) {
-          console.error(`[FocusState] LLM 选择失败，回退到评分排序: ${e.message}`);
-        }
-      }
-
       const chosen = scored[0];
       this.createOrUpdate(agentId, { currentTaskId: chosen.id });
       return { ...chosen, focus_reason: 'ready_highest_score' };
@@ -203,30 +179,6 @@ class FocusState {
     }
 
     return score;
-  }
-
-  static _buildFocusScorePrompt(candidates) {
-    const candidateList = candidates.map((t, i) => {
-      let desc = `${i + 1}. [${t.priority}] ${t.title}`;
-      if (t.description) desc += ` — ${t.description.substring(0, 80)}`;
-      if (t.context) desc += ` (上下文: ${t.context.substring(0, 60)})`;
-      desc += ` [评分: ${t.score}]`;
-      return desc;
-    }).join('\n');
-
-    return `你是任务调度助手。请从以下候选任务中选择当前最应该执行的一个。
-
-选择标准：
-1. 紧急程度 — 用户最关心哪个？优先级高的优先
-2. 完成难度 — 哪个能快速产出结果？简单任务优先（快速交付）
-3. 依赖关系 — 哪个能解锁后续更多任务？
-4. 风险评估 — 哪个失败代价最大？
-
-候选任务列表：
-${candidateList}
-
-请只返回纯 JSON，不要包含其他文字：
-{"chosen_index": 0, "reason": "选择原因", "estimated_minutes": 30}`;
   }
 
   static async getFocusContext(agentId, llmManager) {

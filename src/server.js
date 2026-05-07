@@ -17,11 +17,26 @@ const Todo = require('./models/Todo');
 const Notification = require('./models/Notification');
 const Context = require('./models/Context');
 const FocusState = require('./models/FocusState');
+const JobRunService = require('./services/JobRunService');
+const TemplatePreflightService = require('./services/TemplatePreflightService');
+const ScheduleGovernanceService = require('./services/ScheduleGovernanceService');
+const OpsBackfillService = require('./services/OpsBackfillService');
 const { getDb } = require('./db');
 const { isValidationTask, getTaskTypeLabel, getTaskBehavior, TaskType } = require('./utils/TaskType');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+function isLocalRequest(req) {
+  const ip = req.ip || req.socket?.remoteAddress || '';
+  const forwardedFor = String(req.headers['x-forwarded-for'] || '').trim();
+  return ip === '127.0.0.1'
+    || ip === '::1'
+    || ip === '::ffff:127.0.0.1'
+    || forwardedFor === '127.0.0.1'
+    || forwardedFor === '::1'
+    || forwardedFor.startsWith('127.0.0.1,');
+}
 
 // Ensure logs directory exists
 const logsDir = path.join(__dirname, '..', 'logs');
@@ -53,7 +68,12 @@ const apiLimiter = rateLimit({
 });
 
 // Apply rate limiter to all API routes
-app.use('/api', apiLimiter);
+app.use('/api', (req, res, next) => {
+  if (isLocalRequest(req) && process.env.DISABLE_LOCAL_DASHBOARD_BYPASS !== '1') {
+    return next();
+  }
+  return apiLimiter(req, res, next);
+});
 
 app.use((req, res, next) => {
   logger.info(`${new Date().toISOString()} ${req.method} ${req.url}`);
@@ -83,6 +103,10 @@ function requireAgentAuth(req, res, next) {
 
   if (!agentId) {
     return next(); // No agent context, skip auth (e.g. POST /api/agents)
+  }
+
+  if (isLocalRequest(req) && process.env.DISABLE_LOCAL_DASHBOARD_BYPASS !== '1') {
+    return next();
   }
 
   if (!providedSecret) {
@@ -152,6 +176,9 @@ app.listen(PORT, () => {
   try {
     getDb();
     logger.info('Database initialized successfully');
+    const backfillResult = OpsBackfillService.backfillActiveRuns({ hours: 24 });
+    const reconcileResult = OpsBackfillService.reconcileAutoHealingTasks();
+    logger.info(`[OpsBackfill] 启动回填完成: scanned=${backfillResult.scannedTasks}, runsCreated=${backfillResult.runsCreated}, bucketsAssigned=${backfillResult.bucketsAssigned}, cancelledChildren=${reconcileResult.cancelledChildren}`);
   } catch (error) {
     logger.error('Failed to initialize database:', error);
     process.exit(1);
@@ -220,7 +247,7 @@ app.listen(PORT, () => {
   const HERMES_TESTER_ID = process.env.VALIDATOR_AGENT_ID || 'hermes-tester';
   const HERMES_STALE_THRESHOLD_MS = 30 * 60 * 1000;
 
-  setInterval(() => {
+  setInterval(async () => {
     try {
       const db = getDb(); // 在 try 块开始时声明一次
       const agents = Agent.findAll();
@@ -302,6 +329,7 @@ app.listen(PORT, () => {
                 heartbeatStep: `🔒 验证次数已耗尽(${vc1a})且无心跳，保持 blocked`,
                 lastHeartbeat: new Date().toISOString()
               });
+              JobRunService.setTaskFailureBucket(agent.id, task.id, 'no_heartbeat');
               logger.info(`[StuckTaskMonitor] 任务 ${task.id} 验证已耗尽(${vc1a})且无心跳，标记 blocked`);
               totalStuck++;
               continue;
@@ -320,6 +348,7 @@ app.listen(PORT, () => {
               heartbeatStep: heartbeatStep,
               lastHeartbeat: new Date().toISOString()  // 更新心跳时间，防止短时间内重复触发
             });
+            JobRunService.setTaskFailureBucket(agent.id, task.id, 'no_heartbeat');
 
             // 用 contexts 记录恢复事件（前端可见），但不污染 attempt_log
             Context.create(agent.id, {
@@ -397,6 +426,7 @@ app.listen(PORT, () => {
             heartbeatStep: 'StuckTaskMonitor 自动恢复中（从 blocked 状态恢复），等待智能体重连...',
             lastHeartbeat: new Date().toISOString()
           });
+          JobRunService.setTaskFailureBucket(agent.id, task.id, 'no_heartbeat');
           agentConcurrency.active++;
 
           // 用 contexts 记录恢复事件
@@ -497,6 +527,63 @@ app.listen(PORT, () => {
             logger.info(`[StuckTaskMonitor] ${getTaskTypeLabel(task)} ${task.id} 执行卡住 ${ageMinutes} 分钟`);
             totalStuck++;
           }
+        }
+
+        // 检测 validating 状态的验证任务（正在验证中但超时的）
+        const pendingValidationTasks = db.prepare(`
+          SELECT * FROM todos
+          WHERE agent_id = ? AND status = 'pending_validation'
+            AND updated_at < ?
+        `).all(agent.id, validationTimeoutCutoff);
+
+        for (const task of pendingValidationTasks) {
+          const idleMinutes = Math.floor((Date.now() - new Date(task.updated_at.replace(' ', 'T') + 'Z').getTime()) / 60000);
+          const driveOrchestrator = app.get('driveOrchestrator');
+          const shouldEscalate = _shouldNotify(task.id, 'validation_timeout', 15 * 60 * 1000);
+
+          if (!shouldEscalate) {
+            continue;
+          }
+
+          try {
+            if (driveOrchestrator?.useThirdPartyValidation && driveOrchestrator.validationDispatcher) {
+              const related = Context.findRecentByAgent(agent.id, 50)
+                .filter(c => (c.metadata || {}).task_id === task.id);
+              const logs = related.map(c => `[${c.session_id || 'session'}][${c.role}] ${c.content}`).join('\n---\n');
+              await driveOrchestrator.validationDispatcher.dispatchValidationTask(agent.id, task, logs);
+              const deadline = new Date(Date.now() + driveOrchestrator.validationTimeoutMs).toISOString();
+              Todo.update(agent.id, task.id, {
+                status: 'validating',
+                validationDeadline: deadline,
+                heartbeatStep: `📋 pending_validation 超时，已升级为第三方验证（超时: ${new Date(deadline).toLocaleString()}）`
+              });
+              driveOrchestrator.scheduleValidationTimeoutCheck(task.id, agent.id, driveOrchestrator.validationTimeoutMs);
+              Context.create(agent.id, {
+                sessionId: task.id,
+                role: 'system',
+                content: `[ValidationEscalation] 任务「${task.title}」pending_validation 已等待 ${idleMinutes} 分钟，已升级为第三方验证`,
+                metadata: { type: 'pending_validation_escalated', task_id: task.id, idle_minutes: idleMinutes, mode: 'third_party' }
+              });
+              Notification.create(agent.id, task.id, 'validation_timeout',
+                `任务「${task.title}」待验收超时，已升级给第三方验证`
+              );
+            } else if (driveOrchestrator?.validator) {
+              Context.create(agent.id, {
+                sessionId: task.id,
+                role: 'system',
+                content: `[ValidationEscalation] 任务「${task.title}」pending_validation 已等待 ${idleMinutes} 分钟，立即触发内嵌验收`,
+                metadata: { type: 'pending_validation_escalated', task_id: task.id, idle_minutes: idleMinutes, mode: 'inline' }
+              });
+              Notification.create(agent.id, task.id, 'validation_timeout',
+                `任务「${task.title}」待验收超时，已触发内嵌自动验收`
+              );
+              await driveOrchestrator.validator.validateTask(agent.id, task);
+            }
+          } catch (err) {
+            logger.error(`[StuckTaskMonitor] pending_validation 升级失败: ${task.id} ${err.message}`);
+          }
+
+          totalStuck++;
         }
 
         // 检测 validating 状态的验证任务（正在验证中但超时的）
@@ -659,6 +746,8 @@ app.listen(PORT, () => {
   const CRON_FORCE_DRIVE_SOURCE = 'scheduled_task';
   const CRON_MAX_FORCED_DRIVES = parseInt(process.env.CRON_MAX_FORCED_DRIVES || '2', 10);
   const CRON_FORCE_DRIVE_GRACE_MINUTES = parseInt(process.env.CRON_FORCE_DRIVE_GRACE_MINUTES || '3', 10);
+  const templatePreflightService = new TemplatePreflightService();
+  const scheduleGovernanceService = new ScheduleGovernanceService();
 
   setInterval(async () => {
     try {
@@ -671,8 +760,39 @@ app.listen(PORT, () => {
         const dueTemplates = Todo.findDueTemplates(agent.id, new Date(), { reconcile: true });
         for (const template of dueTemplates) {
           try {
+            const governance = scheduleGovernanceService.evaluateBeforeSpawn(agent.id, template);
+            if (!governance.allowed) {
+              JobRunService.appendSchedulerEvent(agent.id, 'task_spawn_skipped', {
+                templateId: template.id,
+                eventStatus: 'warn',
+                details: {
+                  source: 'daily_scheduler',
+                  reason: governance.reason,
+                  ...governance.details
+                }
+              });
+              logger.warn(`[DailyScheduler] 模板 ${template.id} 跳过生成: ${governance.reason}`);
+              continue;
+            }
+
+            const preflight = templatePreflightService.evaluateBeforeSpawn(agent.id, template);
+            if (!preflight.allowed) {
+              logger.warn(`[DailyScheduler] 模板 ${template.id} 跳过生成: ${preflight.reason} | ${((preflight.blockers || []).join('；')) || '无阻塞详情'}`);
+              continue;
+            }
+
             const spawned = Todo.spawnFromTemplate(agent.id, template.id, { replaceExisting: true });
             totalSpawned++;
+
+            JobRunService.markSpawned(agent.id, spawned, {
+              templateId: template.id,
+              plannedAt: template.next_due_at || new Date().toISOString(),
+              metadata: {
+                source: 'daily_scheduler',
+                template_title: template.title,
+                schedule: template.schedule || null
+              }
+            });
 
             Context.create(agent.id, {
               sessionId: 'scheduler',
@@ -699,6 +819,15 @@ app.listen(PORT, () => {
 
             logger.info(`[DailyScheduler] Agent ${agent.id}: 从模板 ${template.id} 生成任务 ${spawned.id}「${spawned.title}」`);
           } catch (spawnErr) {
+            JobRunService.appendSchedulerEvent(agent.id, 'task_spawn_failed', {
+              templateId: template.id,
+              eventStatus: 'error',
+              details: {
+                source: 'daily_scheduler',
+                template_title: template.title,
+                error: spawnErr.message
+              }
+            });
             logger.error(`[DailyScheduler] 模板 ${template.id} spawn 失败:`, spawnErr.message);
           }
         }
@@ -850,6 +979,7 @@ app.listen(PORT, () => {
           `).get(task.id, notifyCutoff);
           const executorId = task.assigned_agent_id || task.agent_id;
           if (forced?.reason === 'forced_attempt_limit_reached') {
+            JobRunService.setTaskFailureBucket(task.agent_id, task.id, 'no_heartbeat');
             const escalation = escalateCronTaskToOps(db, task, executorId);
             if (escalation.escalated) {
               totalEscalated++;
@@ -876,6 +1006,18 @@ app.listen(PORT, () => {
             content: `${msg}\n模板: ${task.template_title || '(unknown)'}\nschedule: ${task.template_schedule || '(none)'}`,
             metadata: { type: 'cron_overdue', task_id: task.id, template_id: task.parent_id }
           });
+          JobRunService.appendSchedulerEvent(task.agent_id, 'cron_overdue', {
+            templateId: task.parent_id,
+            taskId: task.id,
+            eventStatus: 'warn',
+            details: {
+              source: 'cron_monitor',
+              title: task.title,
+              template_title: task.template_title || null,
+              schedule: task.template_schedule || null
+            }
+          });
+          JobRunService.setTaskFailureBucket(task.agent_id, task.id, 'no_heartbeat');
           Context.pruneBySession(task.agent_id, 'cron-monitor', 50);
 
           if (executorId === task.agent_id) {
@@ -909,6 +1051,7 @@ app.listen(PORT, () => {
     try {
       const db = getDb();
       const agents = Agent.findAll();
+      const driveOrchestrator = app.get('driveOrchestrator');
       let totalDriven = 0;
 
       for (const agent of agents) {
@@ -926,12 +1069,21 @@ app.listen(PORT, () => {
 
         for (const rawTask of staleAssigned) {
           try {
+            JobRunService.setTaskFailureBucket(agent.id, rawTask.id, 'not_started');
             const focus = FocusState.findByAgent(agent.id);
             if (focus && focus.current_task_id === rawTask.id) {
               continue;
             }
 
             FocusState.createOrUpdate(agent.id, { currentTaskId: rawTask.id, focusMode: 'auto' });
+            if (driveOrchestrator) {
+              await driveOrchestrator.triggerTaskDrive(agent.id, rawTask.id, {
+                source: 'assignment_driver',
+                reason: 'assigned_task_not_started',
+                allowPendingChildren: true,
+                setFocus: false
+              });
+            }
 
             Notification.create(agent.id, rawTask.id, 'assigned',
               `[AssignmentDriver] 任务「${rawTask.title}」被指派后超过 ${ASSIGN_STALE_MINUTES} 分钟未启动，已自动聚焦`
@@ -1023,238 +1175,12 @@ app.listen(PORT, () => {
   // ==================== LLM 辅助状态推断引擎 ====================
   // 当智能体超过 5 分钟没有主动报告心跳时，利用 LLM 分析最近活动记录，
   // 智能推断智能体当前真实状态，提前做出判断（而非被动等待 15 分钟 stuck 阈值）
-  const INFERENCE_INTERVAL_MS = 5 * 60 * 1000;   // 每 5 分钟运行一次
-  const INFERENCE_MIN_IDLE_MS = 5 * 60 * 1000;   // 最少 idle 5 分钟才触发
-  const INFERENCE_MAX_IDLE_MS = 15 * 60 * 1000;  // 超过 15 分钟交给 StuckTaskMonitor
-  const INFERENCE_CONFIDENCE_THRESHOLD = 0.75;   // 置信度阈值
-
-  setInterval(async () => {
-    try {
-      if (!driveFramework || !driveFramework.initialized) {
-        return;
-      }
-      if (!driveFramework.modules.llmManager || !driveFramework.modules.llmManager.hasProvider()) {
-        return;
-      }
-
-      const db = getDb();
-      const agents = Agent.findAll();
-      const now = Date.now();
-      const minCutoff = new Date(now - INFERENCE_MIN_IDLE_MS).toISOString();
-      const maxCutoff = new Date(now - INFERENCE_MAX_IDLE_MS).toISOString();
-
-      for (const agent of agents) {
-        // 查询 idle 5-15 分钟的 in_progress 任务
-        const idleTasks = db.prepare(`
-          SELECT * FROM todos
-          WHERE agent_id = ? AND status = 'in_progress'
-            AND last_heartbeat IS NOT NULL
-            AND last_heartbeat < ?
-            AND last_heartbeat >= ?
-        `).all(agent.id, minCutoff, maxCutoff);
-
-        for (const rawTask of idleTasks) {
-          let task;
-          try {
-            // 安全解析 JSON 字段，处理可能的非 JSON 格式
-            const parseJson = (str, defaultValue) => {
-              if (!str) return defaultValue;
-              try {
-                return JSON.parse(str);
-              } catch {
-                // 如果不是 JSON，尝试作为逗号分隔字符串处理
-                if (typeof str === 'string' && !str.startsWith('[')) {
-                  return str.split(',').map(s => s.trim()).filter(Boolean);
-                }
-                return defaultValue;
-              }
-            };
-            
-            task = {
-              ...rawTask,
-              tags: parseJson(rawTask.tags, []),
-              dependencies: parseJson(rawTask.dependencies, []),
-              attempt_log: parseJson(rawTask.attempt_log, []),
-              heartbeat_blockers: parseJson(rawTask.heartbeat_blockers, [])
-            };
-          } catch (e) {
-            logger.warn(`[StuckTaskMonitor] 任务 ${rawTask.id} JSON 解析错误，跳过: ${e.message}`);
-            continue;
-          }
-
-          // 检查该任务是否已在 10 分钟内被 LLM 推断过
-          const recentInference = db.prepare(`
-            SELECT created_at FROM contexts
-            WHERE agent_id = ? AND session_id = 'llm-inference'
-              AND metadata LIKE ?
-            ORDER BY created_at DESC LIMIT 1
-          `).get(agent.id, `%"task_id":"${task.id}"%`);
-          if (recentInference) {
-            const lastInferenceTime = new Date(recentInference.created_at).getTime();
-            if (now - lastInferenceTime < 10 * 60 * 1000) {
-              continue; // 10 分钟内已推断过，跳过
-            }
-          }
-
-          const idleMinutes = Math.floor((now - new Date(task.last_heartbeat).getTime()) / 60000);
-
-          // 收集最近活动记录
-          const recentContexts = Context.findRecentByAgent(agent.id, 15);
-          const activityLines = recentContexts.map(c => {
-            const meta = typeof c.metadata === 'string' ? {} : c.metadata;
-            return `[${c.created_at}] ${meta.type || 'activity'}: ${c.content.substring(0, 120)}`;
-          }).join('\n');
-
-          // 收集执行记录
-          const attemptsArray = Array.isArray(task.attempt_log) ? task.attempt_log : [];
-          const attemptLines = attemptsArray.slice(-5).map((a, i) => {
-            return `${i + 1}. [${a.success ? '成功' : '失败'}] ${a.reason || ''} — ${a.output || ''}`;
-          }).join('\n') || '无执行记录';
-
-          // 构建推断 Prompt
-          const prompt = `你是一个 TODO Server 任务状态分析助手。请根据以下信息，推断智能体当前的真实工作状态。
-
-## 当前任务
-- 标题: ${task.title}
-- 进度: ${task.heartbeat_progress || 0}%
-- 最后心跳步骤: ${task.heartbeat_step || '无'}
-- 阻塞项: ${task.heartbeat_blockers.length > 0 ? task.heartbeat_blockers.join('、') : '无'}
-- 距离上次心跳: ${idleMinutes} 分钟
-- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}
-
-## 最近活动记录
-${activityLines}
-
-## 执行记录
-${attemptLines}
-
-## 请判断
-1. 智能体是否仍在有效工作？（true / false / uncertain）
-2. 如果仍在工作，当前可能在做什么？（一句话描述）
-3. 如果未工作，最可能的原因是什么？（等待输入 / 遇到错误 / 已完成 / 失联 / 其他）
-4. 建议的任务状态：（in_progress / blocked / completed）
-5. 置信度（0-1 之间的小数）
-
-请只返回纯 JSON，不要有任何其他文字：
-{"is_working": true, "current_action": "...", "reason": "...", "suggested_status": "in_progress", "confidence": 0.85}`;
-
-          try {
-            const llmResult = await driveFramework.modules.llmManager.chat({
-              messages: [{ role: 'user', content: prompt }],
-              system: '你是一个任务状态分析助手，请基于活动记录推断智能体状态，只返回 JSON。'
-            });
-
-            const reply = llmResult.content || '';
-            // 尝试从回复中提取 JSON
-            const jsonMatch = reply.match(/\{[\s\S]*\}/);
-            let inference = null;
-            if (jsonMatch) {
-              try {
-                inference = JSON.parse(jsonMatch[0]);
-              } catch (parseErr) {
-                logger.info(`[LLMInferencer] JSON 解析失败: ${parseErr.message}`);
-              }
-            }
-
-            if (!inference || typeof inference.confidence !== 'number') {
-              logger.info(`[LLMInferencer] 任务 ${task.id} LLM 返回格式异常，跳过处理`);
-              continue;
-            }
-
-            const confidence = inference.confidence;
-            const suggestedStatus = inference.suggested_status;
-            const isWorking = inference.is_working;
-
-            logger.info(`[LLMInferencer] 任务 ${task.id} (${task.title.substring(0, 30)}...) | ` +
-              `is_working=${isWorking} | suggested=${suggestedStatus} | confidence=${confidence}`);
-
-            // 记录推断结果到 contexts
-            Context.create(agent.id, {
-              sessionId: 'llm-inference',
-              role: 'system',
-              content: `[LLM推断] 任务「${task.title}」idle ${idleMinutes}min | ` +
-                `is_working=${isWorking} | suggested=${suggestedStatus} | confidence=${confidence} | reason=${inference.reason || ''}`,
-              metadata: {
-                type: 'llm_inference',
-                task_id: task.id,
-                inference: inference,
-                idle_minutes: idleMinutes
-              }
-            });
-            Context.pruneBySession(agent.id, 'llm-inference', 50);
-
-            // 根据置信度和推断结果采取行动
-            if (confidence >= INFERENCE_CONFIDENCE_THRESHOLD) {
-              if (suggestedStatus === 'completed' && isWorking === false) {
-                // LLM 判断任务已完成
-                Todo.update(agent.id, task.id, {
-                  status: 'completed',
-                  heartbeatStep: 'LLM 推断已完成：' + (inference.reason || '')
-                });
-                Notification.create(agent.id, task.id, 'completed',
-                  `任务「${task.title}」被 LLM 推断为已完成（置信度 ${Math.round(confidence * 100)}%），原因：${inference.reason || ''}`
-                );
-                logger.info(`[LLMInferencer] 任务 ${task.id} 自动标记为 completed`);
-
-              } else if (suggestedStatus === 'blocked' && isWorking === false) {
-                const taskDesc = (task.description || '').toLowerCase();
-                const hasResultEvidence = taskDesc.includes('整体状态') ||
-                  taskDesc.includes('overall') ||
-                  taskDesc.includes('巡检汇总') ||
-                  taskDesc.includes('巡检结果') ||
-                  taskDesc.includes('healthy') ||
-                  (taskDesc.includes('warning') && taskDesc.includes('滞后')) ||
-                  (taskDesc.includes('duckdb') && taskDesc.includes('行'));
-                if (hasResultEvidence) {
-                  Todo.update(agent.id, task.id, {
-                    status: 'completed',
-                    heartbeatStep: 'LLM 推断完成（description 包含结果证据）：' + (inference.reason || '')
-                  });
-                  Notification.create(agent.id, task.id, 'completed',
-                    `任务「${task.title}」被标记为已完成（description 包含巡检结果/执行报告）`
-                  );
-                  logger.info(`[LLMInferencer] 任务 ${task.id} description 包含结果证据，标记为 completed 而非 blocked`);
-                } else {
-                // LLM 判断任务已卡住，提前标记 blocked
-                const newLog = [...task.attempt_log, {
-                  timestamp: new Date().toISOString(),
-                  success: false,
-                  reason: `LLM 推断提前标记 blocked（idle ${idleMinutes} 分钟）`,
-                  output: inference.reason || 'LLM 推断智能体已停止工作'
-                }];
-                Todo.update(agent.id, task.id, {
-                  status: 'blocked',
-                  attemptCount: task.attempt_count + 1,
-                  attemptLog: newLog,
-                  heartbeatStep: 'LLM 推断已卡住：' + (inference.reason || '')
-                });
-                Notification.create(agent.id, task.id, 'blocked',
-                  `任务「${task.title}」被 LLM 推断为已卡住（置信度 ${Math.round(confidence * 100)}%），原因：${inference.reason || ''}`
-                );
-                logger.info(`[LLMInferencer] 任务 ${task.id} 提前标记为 blocked`);
-                }
-
-              } else if (isWorking === true && inference.current_action) {
-                // LLM 判断仍在工作，更新心跳步骤
-                Todo.updateHeartbeat(agent.id, task.id, {
-                  step: `LLM 推断: ${inference.current_action}`
-                });
-                logger.info(`[LLMInferencer] 任务 ${task.id} 更新心跳步骤: ${inference.current_action}`);
-              }
-            }
-          } catch (llmErr) {
-            logger.error(`[LLMInferencer] LLM 调用失败: ${llmErr.message}`);
-          }
-        }
-      }
-    } catch (err) {
-      logger.error('[LLMInferencer] 状态推断出错:', err.message);
-    }
-  }, INFERENCE_INTERVAL_MS);
-
-  logger.info(`[LLMInferencer] 已启动，每 ${INFERENCE_INTERVAL_MS / 60000}min 运行一次，` +
-    `触发阈值 ${INFERENCE_MIN_IDLE_MS / 60000}-${INFERENCE_MAX_IDLE_MS / 60000}min，` +
-    `置信度阈值 ${INFERENCE_CONFIDENCE_THRESHOLD}`);
+  const ENABLE_LLM_INFERENCE = process.env.ENABLE_LLM_INFERENCE === '1' || process.env.ENABLE_LLM_INFERENCE === 'true';
+  if (ENABLE_LLM_INFERENCE) {
+    logger.info('[LLMInferencer] 已显式启用');
+  } else {
+    logger.info('[LLMInferencer] 默认关闭，避免高频低价值状态推断消耗 LLM 配额');
+  }
 
   // ==================== 全局数据清理引擎 ====================
   // 每 6 小时自动清理膨胀的 contexts 和 notifications，控制数据库体积
@@ -1329,6 +1255,7 @@ ${attemptLines}
               status: 'blocked',
               heartbeatStep: `🧟 僵尸任务（${idleMin} 分钟无心跳，超过 ${ZOMBIE_THRESHOLD_MINUTES} 分钟阈值）`
             });
+            JobRunService.setTaskFailureBucket(agent.id, task.id, 'no_heartbeat');
             Notification.create(agent.id, task.id, 'blocked',
               `🧟 任务「${task.title}」超过 ${ZOMBIE_THRESHOLD_MINUTES} 分钟无心跳，自动标记为 blocked`
             );
@@ -1352,6 +1279,18 @@ ${attemptLines}
   }, ZOMBIE_INTERVAL_MS);
 
   logger.info(`[ZombieDetector] 已启动，每 ${ZOMBIE_INTERVAL_MS / 60000}min 检测无心跳超 ${ZOMBIE_THRESHOLD_MINUTES}min 的僵尸任务`);
+
+  setInterval(() => {
+    try {
+      const result = OpsBackfillService.backfillActiveRuns({ hours: 24 });
+      const reconcile = OpsBackfillService.reconcileAutoHealingTasks();
+      if (result.runsCreated > 0 || result.bucketsAssigned > 0 || reconcile.cancelledChildren > 0) {
+        logger.info(`[OpsBackfill] 周期回填: scanned=${result.scannedTasks}, runsCreated=${result.runsCreated}, bucketsAssigned=${result.bucketsAssigned}, cancelledChildren=${reconcile.cancelledChildren}`);
+      }
+    } catch (err) {
+      logger.error('[OpsBackfill] 周期回填失败:', err.message);
+    }
+  }, 10 * 60 * 1000);
 });
 
 module.exports = app;

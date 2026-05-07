@@ -2,6 +2,7 @@ const Agent = require('../models/Agent');
 const Todo = require('../models/Todo');
 const Context = require('../models/Context');
 const Notification = require('../models/Notification');
+const DataTaskSpecService = require('./DataTaskSpecService');
 
 function extractJsonObject(text) {
   if (!text) return null;
@@ -27,6 +28,33 @@ function normalizeSchedule(value) {
   const validCron = /^cron:\S+/.test(trimmed);
   const validLegacyCron = /^\d+\s+\d+\s+\S+\s+\S+\s+\S+$/.test(trimmed);
   return validDaily || validWeekly || validCron || validLegacyCron ? trimmed : null;
+}
+
+function clipText(value, maxLength = 400) {
+  if (typeof value !== 'string') return '';
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength)}...`;
+}
+
+function inferTaskCategory(template) {
+  const combined = `${template.title || ''} ${template.description || ''}`.toLowerCase();
+  if (combined.includes('巡检') || combined.includes('inspection') || combined.includes('监控')) return 'inspection';
+  if (combined.includes('备份') || combined.includes('backup')) return 'backup';
+  if (combined.includes('同步') || combined.includes('sync') || combined.includes('脚本') || combined.includes('数据')) return 'script';
+  if (combined.includes('修复') || combined.includes('fix') || combined.includes('代码') || combined.includes('改造')) return 'code_change';
+  return 'general';
+}
+
+function inferScheduleFromText(template) {
+  const text = `${template.title || ''} ${template.description || ''}`.toLowerCase();
+  if (/(每日|每天|daily)/.test(text)) return 'daily';
+  const weeklyMatch = text.match(/每周([一二三四五六日天]|mon|tue|wed|thu|fri|sat|sun)/i);
+  if (weeklyMatch) {
+    const value = weeklyMatch[1].toLowerCase();
+    const map = { '一': 'mon', '二': 'tue', '三': 'wed', '四': 'thu', '五': 'fri', '六': 'sat', '日': 'sun', '天': 'sun' };
+    return `weekly:${map[value] || value}`;
+  }
+  return null;
 }
 
 class TemplateNormalizationService {
@@ -61,6 +89,7 @@ class TemplateNormalizationService {
     if (!isNonEmptyString(template.description)) missingFields.push('description');
     if (!isNonEmptyString(template.acceptance_criteria)) missingFields.push('acceptance_criteria');
     if (!Number.isInteger(template.max_attempts) || template.max_attempts <= 0) missingFields.push('max_attempts');
+    if (DataTaskSpecService.looksLikeDataTask(template) && !template.task_spec) missingFields.push('task_spec');
 
     return {
       templateId: template.id,
@@ -101,14 +130,15 @@ class TemplateNormalizationService {
       '# 模板信息',
       JSON.stringify({
         id: template.id,
-        title: template.title,
-        description: template.description || '',
+        title: clipText(template.title, 120),
+        description: clipText(template.description || '', 500),
         schedule: template.schedule || null,
         assigned_agent_id: template.assigned_agent_id || null,
         task_category: template.task_category || null,
-        acceptance_criteria: template.acceptance_criteria || null,
+        acceptance_criteria: clipText(template.acceptance_criteria || '', 500) || null,
+        task_spec: template.task_spec || null,
         max_attempts: template.max_attempts,
-        context: template.context || ''
+        context: clipText(template.context || '', 400)
       }, null, 2),
       '',
       '# 缺失字段',
@@ -165,6 +195,94 @@ class TemplateNormalizationService {
     return patch;
   }
 
+  buildRuleBasedPatch(ownerAgentId, template) {
+    const patch = {};
+
+    if (!isNonEmptyString(template.assigned_agent_id)) {
+      patch.assignedAgentId = ownerAgentId;
+    }
+
+    if (!isNonEmptyString(template.task_category)) {
+      patch.taskCategory = inferTaskCategory(template);
+    }
+
+    if (!Number.isInteger(template.max_attempts) || template.max_attempts <= 0) {
+      patch.maxAttempts = 3;
+    }
+
+    if (!template.task_spec) {
+      const inferredTaskSpec = DataTaskSpecService.inferTaskSpec(template);
+      if (inferredTaskSpec) {
+        patch.taskSpec = inferredTaskSpec;
+      }
+    }
+
+    if (!isNonEmptyString(template.description)) {
+      patch.description = `按模板「${template.title}」执行既定作业，记录关键结果、异常项与后续处理建议。`;
+    }
+
+    if (!isNonEmptyString(template.acceptance_criteria)) {
+      const effectiveTaskSpec = patch.taskSpec || template.task_spec || DataTaskSpecService.inferTaskSpec(template);
+      if (effectiveTaskSpec) {
+        patch.acceptanceCriteria = DataTaskSpecService.buildAcceptanceCriteria(template.title, effectiveTaskSpec);
+      } else {
+        const category = patch.taskCategory || template.task_category || inferTaskCategory(template);
+        const criteriaMap = {
+          inspection: '输出巡检结论、异常项和处理建议，并明确是否需要人工介入。',
+          backup: '输出备份产物位置、完成时间和校验结果。',
+          script: '输出脚本执行结果、产出物位置和关键日志摘要。',
+          code_change: '说明改动内容、验证结果和回滚方式。',
+          general: '说明执行结果、关键产出和后续处理建议。'
+        };
+        patch.acceptanceCriteria = criteriaMap[category] || criteriaMap.general;
+      }
+    }
+
+    if (!normalizeSchedule(template.schedule)) {
+      const inferredSchedule = inferScheduleFromText(template);
+      if (inferredSchedule) {
+        patch.schedule = inferredSchedule;
+        patch.isTemplate = true;
+      }
+    }
+
+    return patch;
+  }
+
+  shouldSkipLlmNormalization(report, rulePatch, predictedRuleResult) {
+    if (Object.keys(rulePatch).length === 0) return false;
+    if (report.missingFields.some(field => field === 'description' || field === 'acceptance_criteria')) {
+      return false;
+    }
+    return predictedRuleResult.compliant || predictedRuleResult.missingFields.every(field => field === 'schedule');
+  }
+
+  buildRuleBasedDialogue(template, patch, remainingMissingFields) {
+    const requiresHumanReview = remainingMissingFields.length > 0;
+    return {
+      reply: JSON.stringify({
+        summary: requiresHumanReview ? '规则引擎已补齐确定性字段，剩余字段需要人工确认。' : '规则引擎已完成模板规范化。',
+        dialogue: [
+          { speaker: 'owner', message: `请修正模板 ${template.id} 的字段缺口` },
+          { speaker: 'governor', message: requiresHumanReview ? '已先按规则补齐确定性字段，剩余不确定项转人工确认。' : '已按规则补齐模板缺失字段，无需再调用模型。' }
+        ],
+        patch,
+        requiresHumanReview,
+        humanReviewReason: requiresHumanReview ? `仍缺少字段: ${remainingMissingFields.join(', ')}` : ''
+      }),
+      parsed: {
+        summary: requiresHumanReview ? '规则引擎已补齐确定性字段，剩余字段需要人工确认。' : '规则引擎已完成模板规范化。',
+        dialogue: [
+          { speaker: 'owner', message: `请修正模板 ${template.id} 的字段缺口` },
+          { speaker: 'governor', message: requiresHumanReview ? '已先按规则补齐确定性字段，剩余不确定项转人工确认。' : '已按规则补齐模板缺失字段，无需再调用模型。' }
+        ],
+        patch,
+        requiresHumanReview,
+        humanReviewReason: requiresHumanReview ? `仍缺少字段: ${remainingMissingFields.join(', ')}` : ''
+      }
+    };
+  }
+
   async requestDialogue(ownerAgentId, template, report) {
     const llmManager = this.getLlmManager();
     if (!llmManager || !llmManager.hasProvider || !llmManager.hasProvider()) {
@@ -174,7 +292,8 @@ class TemplateNormalizationService {
     const prompt = this.buildPrompt(ownerAgentId, template, report);
     const result = await llmManager.chat({
       messages: [{ role: 'user', content: prompt }],
-      system: '你是模板治理 agent，只返回 JSON，不输出额外说明。'
+      system: '你是模板治理 agent，只返回 JSON，不输出额外说明。',
+      maxTokens: 1200
     });
 
     const reply = result?.content || '';
@@ -229,8 +348,15 @@ class TemplateNormalizationService {
       metadata: { type: 'template_normalization_request', template_id: template.id, owner_agent_id: ownerAgentId }
     });
 
-    const dialogue = await this.requestDialogue(ownerAgentId, template, report);
-    const patch = this.sanitizePatch(ownerAgentId, template, dialogue.parsed);
+    const rulePatch = this.buildRuleBasedPatch(ownerAgentId, template);
+    const predictedRuleResult = this.evaluateTemplate({ ...template, ...rulePatch, assigned_agent_id: rulePatch.assignedAgentId || template.assigned_agent_id, task_category: rulePatch.taskCategory || template.task_category, acceptance_criteria: rulePatch.acceptanceCriteria || template.acceptance_criteria, task_spec: rulePatch.taskSpec || template.task_spec, max_attempts: rulePatch.maxAttempts || template.max_attempts });
+    const llmManager = this.getLlmManager();
+    const llmAvailable = Boolean(llmManager && llmManager.hasProvider && llmManager.hasProvider());
+    const canSkipLlm = !llmAvailable || this.shouldSkipLlmNormalization(report, rulePatch, predictedRuleResult);
+    const dialogue = canSkipLlm
+      ? this.buildRuleBasedDialogue(template, rulePatch, predictedRuleResult.missingFields)
+      : await this.requestDialogue(ownerAgentId, template, report);
+    const patch = canSkipLlm ? rulePatch : this.sanitizePatch(ownerAgentId, template, dialogue.parsed);
 
     Context.create(this.governorAgentId, {
       sessionId,

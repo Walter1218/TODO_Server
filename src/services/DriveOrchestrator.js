@@ -4,11 +4,14 @@ const FocusState = require('../models/FocusState');
 const Context = require('../models/Context');
 const Notification = require('../models/Notification');
 const Agent = require('../models/Agent');
+const JobRunService = require('./JobRunService');
 const CommandExecutor = require('./CommandExecutor');
 const ProgressValidator = require('./ProgressValidator');
 const ValidatorService = require('./ValidatorService');
 const ValidationDispatchService = require('./ValidationDispatchService');
 const TaskReportService = require('./TaskReportService');
+const TaskPlanService = require('./TaskPlanService');
+const DataTaskSpecService = require('./DataTaskSpecService');
 const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper');
 const {
   TOOL_DEFINITIONS,
@@ -28,8 +31,8 @@ const DEFAULTS = {
   validationTimeoutMs: 30 * 60 * 1000,
   maxValidationAttempts: 3,
   validationCooldownMs: 2 * 60 * 1000,
-  toolLoopMaxIterations: 6,
-  toolLoopTokenBudget: 50000,
+  toolLoopMaxIterations: 4,
+  toolLoopTokenBudget: 12000,
   maxNoProgressRounds: 2,
   maxForcedCronDrivesPerTask: 2,
 };
@@ -88,30 +91,16 @@ class DriveOrchestrator {
     } catch (e) {}
 
     const report = await TaskReportService.generateReport(agentId, taskId);
-    const attempts = Array.isArray(task.attempt_log) ? task.attempt_log.slice(-10) : [];
-    const blockers = Array.isArray(task.heartbeat_blockers) ? task.heartbeat_blockers : [];
-
-    const prompt = `你是一个资深运维/数据工程排障助手。你将接手一个自动化任务（由智能体驱动执行），目前出现失败或阻塞。\n\n` +
-      `# 任务信息\n` +
-      `- 标题: ${task.title}\n` +
-      `- 状态: ${task.status}\n` +
-      `- 优先级: ${task.priority}\n` +
-      `- 进度: ${task.heartbeat_progress || 0}%\n` +
-      `- 最后步骤: ${task.heartbeat_step || ''}\n` +
-      `- 阻塞项: ${blockers.length ? blockers.join('；') : '无'}\n` +
-      `- 尝试次数: ${task.attempt_count || 0}/${task.max_attempts || 3}\n\n` +
-      `# 最近尝试记录（最多10条）\n` +
-      `${attempts.map(a => `- [${a.timestamp}] ${a.success ? '成功' : '失败'} | ${a.reason || ''} | ${String(a.output || '').slice(0, 300)}`).join('\n') || '无'}\n\n` +
-      `# 执行与上下文摘要\n` +
-      `${JSON.stringify(report.execution || {}, null, 2)}\n\n` +
-      `# 用户问题\n` +
-      `${question || '请诊断核心卡点，并给出最小可落地的修复步骤（按优先级排序），以及需要补齐的环境/配置清单。'}\n\n` +
-      `请只返回 JSON：\n` +
-      `{\"summary\":\"...\",\"root_causes\":[\"...\"],\"fix_steps\":[\"...\"],\"preflight_checklist\":[\"...\"],\"template_improvements\":[\"...\"]}`;
+    const prompt = TaskReportService.buildConsultPrompt(task, report, question, {
+      maxAttempts: 3,
+      maxTimeline: 5,
+      maxCommands: 3
+    });
 
     const result = await llmManager.chat({
       messages: [{ role: 'user', content: prompt }],
-      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。'
+      system: '你是一个排障助手，只返回 JSON，不要输出任何额外文字。',
+      maxTokens: 1200
     });
 
     const reply = result.content || '';
@@ -275,6 +264,7 @@ class DriveOrchestrator {
         console.error(`[DriveOrchestrator] 内嵌验证失败: ${err.message}`);
         Todo.updateStatus(agentId, taskId, 'validation_failed');
       }
+      TaskPlanService.syncTaskExecution(agentId, Todo.findById(agentId, taskId) || task);
       Context.create(agentId, {
         sessionId: 'validation-timeout-fallback',
         role: 'system',
@@ -292,6 +282,10 @@ class DriveOrchestrator {
     if (!task) return false;
     const drivable = ['pending', 'in_progress'].includes(task.status);
     if (!drivable) return false;
+    if (task.validation_deadline && /延期|等待下次调度/.test(task.heartbeat_step || '')) {
+      const deadline = new Date(task.validation_deadline).getTime();
+      if (Number.isFinite(deadline) && Date.now() < deadline) return false;
+    }
     if (this.drivingTasks.has(task.id)) return false;
     if (task.is_template) return false;
     if (task.archived) return false;
@@ -360,6 +354,91 @@ class DriveOrchestrator {
     const progressMsg = results?.length > 0 ? `\n\n📊 上次执行结果:\n${CommandExecutor.buildExecutionSummary(results)}` : '';
     const validationMsg = validationFeedback ? `\n\n📋 上次验证失败反馈（请务必解决）:\n${validationFeedback}` : '';
     return `${baseMsg}${progressMsg}${validationMsg}`;
+  }
+
+  async _runOfficialExecution(agentId, task) {
+    const execution = DataTaskSpecService.getOfficialExecution(task);
+    if (!execution?.command) return null;
+
+    const commands = [{ index: 0, command: execution.command, source: 'official_script' }];
+    const results = await CommandExecutor.executeCommands(commands, {
+      timeoutMs: execution.timeoutMs || 300000,
+      cwd: execution.cwd || process.env.HOME,
+      maxCommands: 1
+    });
+
+    await Context.create(agentId, {
+      sessionId: 'drive-orchestrator',
+      role: 'system',
+      content: `[DriveOrchestrator] 正式脚本执行结果:\n${CommandExecutor.buildExecutionSummary(results)}`,
+      metadata: { type: 'official_execution', task_id: task.id, script_path: execution.scriptPath }
+    });
+
+    const attemptSummary = CommandExecutor.summarizeAttemptFromResults(results);
+    Todo.recordAttempt(agentId, task.id, {
+      success: attemptSummary.success,
+      reason: attemptSummary.reason,
+      output: attemptSummary.output
+    });
+
+    if (!attemptSummary.success) {
+      const bucket = attemptSummary.blockers && attemptSummary.blockers.length > 0 ? 'env_missing' : 'tool_failure';
+      JobRunService.markFailure(agentId, Todo.findById(agentId, task.id) || task, bucket, {
+        source: 'official_execution',
+        blockers: attemptSummary.blockers || [],
+        reason: attemptSummary.reason,
+        scriptPath: execution.scriptPath
+      });
+      return {
+        success: false,
+        attempts: 1,
+        officialExecution: true,
+        commands: results,
+        blocked: bucket === 'env_missing',
+        blockers: attemptSummary.blockers || []
+      };
+    }
+
+    const stepLabel = execution.scriptPath ? `🚀 已执行正式脚本: ${execution.scriptPath}` : '🚀 已执行正式脚本';
+    Todo.update(agentId, task.id, {
+      heartbeatProgress: 100,
+      heartbeatStep: stepLabel,
+      status: 'pending_validation',
+      completionReport: JSON.stringify({
+        summary: '已执行正式脚本，进入规则验收',
+        executionMode: 'official_script',
+        scriptPath: execution.scriptPath,
+        updatedAt: new Date().toISOString()
+      })
+    });
+    JobRunService.markPendingValidation(agentId, Todo.findById(agentId, task.id) || task, {
+      source: 'official_execution',
+      scriptPath: execution.scriptPath
+    });
+
+    const validationResult = await this.validator.validateTask(agentId, Todo.findById(agentId, task.id) || task);
+    const latest = Todo.findById(agentId, task.id) || task;
+    if (validationResult.pass) {
+      JobRunService.markValidated(agentId, latest, true, {
+        source: 'official_execution'
+      });
+    } else if (!validationResult.deferred) {
+      JobRunService.markValidated(agentId, latest, false, {
+        source: 'official_execution',
+        reason: validationResult.reason
+      });
+    }
+
+    return {
+      success: validationResult.pass,
+      attempts: 1,
+      officialExecution: true,
+      validationTriggered: true,
+      deferred: Boolean(validationResult.deferred),
+      commands: results,
+      validator: validationResult.validator,
+      reason: validationResult.reason
+    };
   }
 
   _extractUsageTokens(usage) {
@@ -508,10 +587,17 @@ class DriveOrchestrator {
         max_forced_attempts: maxForcedAttempts
       }
     });
+    JobRunService.appendSchedulerEvent(agentId, 'forced_drive_requested', {
+      templateId: freshTask.parent_id || null,
+      taskId: freshTask.id,
+      eventStatus: 'info',
+      details: { source, reason, forced_attempt: forcedAttemptCount + 1 }
+    });
 
     const runner = async () => {
       this.drivingTasks.add(freshTask.id);
       try {
+        JobRunService.markDriveStarted(agentId, freshTask, { source, reason, mode: 'forced' });
         const result = await this.driveTask(agentId, Todo.findById(agentId, freshTask.id) || freshTask);
         await Context.create(agentId, {
           sessionId: 'drive-orchestrator',
@@ -528,6 +614,13 @@ class DriveOrchestrator {
             validation_triggered: !!result?.validationTriggered
           }
         });
+        if (result?.blocked) {
+          JobRunService.markFailure(agentId, Todo.findById(agentId, freshTask.id) || freshTask, 'tool_failure', {
+            source,
+            reason,
+            mode: 'forced'
+          });
+        }
         return result;
       } finally {
         this.drivingTasks.delete(freshTask.id);
@@ -618,8 +711,14 @@ class DriveOrchestrator {
 
     Todo.update(agentId, task.id, {
       status: 'blocked',
+      failureBucket: contextType === 'env_blocked' ? 'env_missing' : 'human_blocked',
       heartbeatStep: `⛔ ${reasonPrefix}：${blockerText}`,
       heartbeatBlockers: mergedBlockers
+    });
+    JobRunService.markFailure(agentId, Todo.findById(agentId, task.id) || task, contextType === 'env_blocked' ? 'env_missing' : 'human_blocked', {
+      reasonPrefix,
+      blockers: mergedBlockers,
+      contextType
     });
 
     Context.create(agentId, {
@@ -635,13 +734,55 @@ class DriveOrchestrator {
 
     try {
       const blockedTask = Todo.findById(agentId, task.id);
-      const consultRes = await this.consultTask(agentId, task.id, blockedTask, `任务因「${reasonPrefix}」被阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。`);
-      if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
-        this._createAutoHealingTask(agentId, task.id, consultRes.parsed.fix_steps);
+      const localPlan = this._buildDeterministicHealingPlan(blockedTask, mergedBlockers, reasonPrefix);
+      if (localPlan.fix_steps.length > 0) {
+        this._createAutoHealingTask(agentId, task.id, localPlan.fix_steps);
+      } else {
+        const consultRes = await this.consultTask(agentId, task.id, blockedTask, `任务因「${reasonPrefix}」被阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。`);
+        if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
+          this._createAutoHealingTask(agentId, task.id, consultRes.parsed.fix_steps);
+        }
       }
     } catch (e) {
       console.error('[DriveOrchestrator] 自动排障失败:', e.message);
     }
+  }
+
+  _buildDeterministicHealingPlan(task, blockers = [], reasonPrefix = '') {
+    const lowerText = `${reasonPrefix}\n${(blockers || []).join('\n')}\n${task?.description || ''}`.toLowerCase();
+    const fixSteps = [];
+    const checklist = [];
+
+    if (/目录不存在|path not found|no such file or directory|不存在/.test(lowerText)) {
+      fixSteps.push('检查任务依赖的目录或文件路径是否存在，缺失则先创建目录并补齐输入文件。');
+      checklist.push('目录路径', '输入文件');
+    }
+    if (/环境变量|env|未设置/.test(lowerText)) {
+      fixSteps.push('检查任务依赖的环境变量配置，补齐 .env 或运行时变量后重新执行。');
+      checklist.push('环境变量');
+    }
+    if (/python|脚本|script not found|module not found/.test(lowerText)) {
+      fixSteps.push('确认 Python 脚本路径和依赖包是否可用，必要时安装缺失依赖并执行一次 --help 或最小验证命令。');
+      checklist.push('Python 依赖', '脚本路径');
+    }
+    if (/command not found|not found/.test(lowerText)) {
+      fixSteps.push('检查任务依赖的可执行命令是否已安装并在 PATH 中可见。');
+      checklist.push('系统命令');
+    }
+    if (/权限|permission denied/.test(lowerText)) {
+      fixSteps.push('检查目标目录和脚本的读写执行权限，补齐权限后再重试。');
+      checklist.push('目录权限', '脚本权限');
+    }
+
+    if (fixSteps.length === 0 && blockers.length > 0) {
+      fixSteps.push(`逐项核对阻塞信息并补齐依赖：${blockers.join('；')}`);
+    }
+
+    return {
+      summary: fixSteps.length > 0 ? '规则引擎已生成最小修复步骤' : '暂无确定性规则修复路径',
+      fix_steps: [...new Set(fixSteps)],
+      preflight_checklist: [...new Set(checklist)]
+    };
   }
 
   async _handleStructuredToolResults(agentId, task, toolResults) {
@@ -699,7 +840,7 @@ class DriveOrchestrator {
       const response = await llmManager.chat({
         messages: [...messages],
         tools: TOOL_DEFINITIONS,
-        maxTokens: Math.min(16000, remainingBudget)
+        maxTokens: Math.min(3000, remainingBudget)
       });
       totalTokens += this._extractUsageTokens(response.usage);
 
@@ -833,13 +974,84 @@ class DriveOrchestrator {
     };
   }
 
+  _mergeRetryContext(planOverlay, retryContext) {
+    return [planOverlay, retryContext].filter(Boolean).join('\n\n');
+  }
+
   async driveTask(agentId, task) {
-    const task_ = await this.prepareTaskState(task);
+    const planGate = TaskPlanService.ensureExecutablePlan(agentId, task);
+    if (planGate.required && !planGate.approved) {
+      return {
+        success: false,
+        blocked: true,
+        enforcedPlan: true,
+        reason: planGate.reason || 'plan_review_blocked'
+      };
+    }
+
+    const task_ = await this.prepareTaskState(planGate.task || task);
     if (!task_) return { success: false, attempts: 0, reason: 'prepare_failed' };
+
+    if (planGate.required) {
+      const currentStep = TaskPlanService.getCurrentStep(agentId, task_);
+      if (currentStep?.step_key === 'inspect') {
+        const inspectResult = TaskPlanService.completeInspectStep(agentId, task_);
+        return {
+          success: true,
+          attempts: 0,
+          enforcedPlan: true,
+          planAdvanced: inspectResult.advanced,
+          step: 'inspect'
+        };
+      }
+
+      if (currentStep?.step_key === 'verify') {
+        const synced = TaskPlanService.syncTaskExecution(agentId, task_);
+        const latestTask = synced.task || Todo.findById(agentId, task_.id) || task_;
+        return {
+          success: latestTask.status === 'completed',
+          attempts: 0,
+          enforcedPlan: true,
+          waitingValidation: ['pending_validation', 'validating'].includes(latestTask.status),
+          blocked: latestTask.status === 'validation_failed',
+          step: 'verify'
+        };
+      }
+
+      if (currentStep?.step_key === 'execute') {
+        const activeStep = TaskPlanService.markExecuteStarted(agentId, task_) || currentStep;
+        const planOverlay = TaskPlanService.buildExecutionOverlay(activeStep);
+        const result = await this._driveTaskCore(agentId, Todo.findById(agentId, task_.id) || task_, planOverlay);
+        const synced = TaskPlanService.syncTaskExecution(agentId, Todo.findById(agentId, task_.id) || task_);
+        const latestTask = synced.task || Todo.findById(agentId, task_.id) || task_;
+        return {
+          ...result,
+          enforcedPlan: true,
+          step: 'execute',
+          planStatus: latestTask.plan_status,
+          executionState: latestTask.execution_state
+        };
+      }
+    }
+
+    const result = await this._driveTaskCore(agentId, task_);
+    TaskPlanService.syncTaskExecution(agentId, Todo.findById(agentId, task_.id) || task_);
+    return result;
+  }
+
+  async _driveTaskCore(agentId, task, planOverlay = null) {
+    const task_ = task;
     getDb().prepare(`UPDATE todos SET last_driven_at = CURRENT_TIMESTAMP WHERE id = ?`).run(task_.id);
+    JobRunService.markDriveStarted(agentId, task_, { source: 'drive_orchestrator', mode: 'auto' });
+
+    const officialExecutionResult = await this._runOfficialExecution(agentId, task_);
+    if (officialExecutionResult) {
+      return officialExecutionResult;
+    }
 
     let attempt = 0;
     let retryContext = task_._validationFeedback ? `📋 验证失败反馈（请务必解决）:\n${task_._validationFeedback}` : null;
+    retryContext = this._mergeRetryContext(planOverlay, retryContext);
     let lastResults = null;
     let lastReply = null;
 
@@ -881,8 +1093,15 @@ class DriveOrchestrator {
         const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...preflight.blockers])];
         Todo.update(agentId, task_.id, {
           status: 'blocked',
+          failureBucket: 'env_missing',
           heartbeatStep: `⛔ Preflight 阻塞：${preflight.blockers.join('；')}`,
           heartbeatBlockers: mergedBlockers
+        });
+        JobRunService.markFailure(agentId, Todo.findById(agentId, task_.id) || task_, 'env_missing', {
+          source: 'preflight',
+          blockers: preflight.blockers,
+          spec: preflight.spec,
+          notes: preflight.notes
         });
         await Context.create(agentId, {
           sessionId: task_.id,
@@ -893,14 +1112,9 @@ class DriveOrchestrator {
         Notification.create(agentId, task_.id, 'blocked',
           `任务「${task_.title}」Preflight 阻塞：${preflight.blockers.join('；')}`
         );
-        try {
-          const blockedTask = Todo.findById(agentId, task_.id);
-          const consultRes = await this.consultTask(agentId, task_.id, blockedTask, 'Preflight 检测到环境缺失导致阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
-          if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
-            this._createAutoHealingTask(agentId, task_.id, consultRes.parsed.fix_steps);
-          }
-        } catch (e) {
-          console.error('[DriveOrchestrator] Preflight Auto-Healing 失败:', e.message);
+        const localPlan = this._buildDeterministicHealingPlan(Todo.findById(agentId, task_.id) || task_, preflight.blockers, 'Preflight 检测到环境缺失导致阻塞');
+        if (localPlan.fix_steps.length > 0) {
+          this._createAutoHealingTask(agentId, task_.id, localPlan.fix_steps);
         }
         return { success: false, attempts: attempt + 1, blocked: true, blockers: preflight.blockers, preflight: true };
       }
@@ -926,8 +1140,16 @@ class DriveOrchestrator {
           content: `[DriveOrchestrator] LLM 调用失败: ${llmErr.message}`,
           metadata: { type: 'llm_error', task_id: task_.id, attempt: attempt + 1 },
         });
+        JobRunService.markFailure(agentId, Todo.findById(agentId, task_.id) || task_, 'llm_unstable', {
+          source: 'drive_orchestrator',
+          attempt: attempt + 1,
+          error: llmErr.message
+        });
         attempt++;
-        retryContext = `【自动重试 #${attempt + 1}】LLM 调用失败: ${llmErr.message}`;
+        retryContext = this._mergeRetryContext(
+          planOverlay,
+          `【自动重试 #${attempt + 1}】LLM 调用失败: ${llmErr.message}`
+        );
         continue;
       }
 
@@ -967,12 +1189,21 @@ class DriveOrchestrator {
           reason: attemptSummary.reason,
           output: attemptSummary.output
         });
+        if (!attemptSummary.success) {
+          const bucket = attemptSummary.blockers && attemptSummary.blockers.length > 0 ? 'env_missing' : 'tool_failure';
+          JobRunService.markFailure(agentId, Todo.findById(agentId, task_.id) || task_, bucket, {
+            source: 'command_execution',
+            blockers: attemptSummary.blockers || [],
+            reason: attemptSummary.reason
+          });
+        }
 
         if (!attemptSummary.success && attemptSummary.blockers && attemptSummary.blockers.length > 0) {
           const latest = Todo.findById(agentId, task_.id);
           const mergedBlockers = [...new Set([...(latest.heartbeat_blockers || []), ...attemptSummary.blockers])];
           Todo.update(agentId, task_.id, {
             status: 'blocked',
+            failureBucket: 'env_missing',
             heartbeatStep: `⛔ 环境缺失/阻塞：${attemptSummary.blockers.join('；')}`,
             heartbeatBlockers: mergedBlockers
           });
@@ -988,14 +1219,9 @@ class DriveOrchestrator {
             `任务「${task_.title}」环境缺失，已阻塞：${attemptSummary.blockers.join('；')}`
           );
 
-          try {
-            const blockedTask = Todo.findById(agentId, task_.id);
-            const consultRes = await this.consultTask(agentId, task_.id, blockedTask, '任务已被环境缺失阻塞。请给出最小修复步骤与需要补齐的环境/目录/依赖清单。');
-            if (consultRes && consultRes.parsed && Array.isArray(consultRes.parsed.fix_steps) && consultRes.parsed.fix_steps.length > 0) {
-              this._createAutoHealingTask(agentId, task_.id, consultRes.parsed.fix_steps);
-            }
-          } catch (e) {
-            console.error('[DriveOrchestrator] Execution Auto-Healing 失败:', e.message);
+          const localPlan = this._buildDeterministicHealingPlan(Todo.findById(agentId, task_.id) || task_, attemptSummary.blockers, '任务已被环境缺失阻塞');
+          if (localPlan.fix_steps.length > 0) {
+            this._createAutoHealingTask(agentId, task_.id, localPlan.fix_steps);
           }
 
           return { success: false, attempts: attempt + 1, reply, commands: execResults, blocked: true, blockers: attemptSummary.blockers };
@@ -1034,6 +1260,9 @@ class DriveOrchestrator {
               metadata: { type: 'validation_task_complete', task_id: task_.id },
             });
             Todo.update(agentId, task_.id, { status: 'completed', heartbeatStep: '✅ 验证任务已完成' });
+            JobRunService.markCompleted(agentId, Todo.findById(agentId, task_.id) || refreshedForValidation, {
+              source: 'validation_task_auto_complete'
+            });
             return { success: true, validationTriggered: false, attempts: attempt + 1 };
           }
 
@@ -1054,6 +1283,9 @@ class DriveOrchestrator {
               metadata: { type: 'auto_validation_trigger', task_id: task_.id },
             });
             Todo.update(agentId, task_.id, { status: 'pending_validation' });
+            JobRunService.markPendingValidation(agentId, Todo.findById(agentId, task_.id) || refreshedForValidation, {
+              source: 'drive_progress_100'
+            });
             return { success: true, validationTriggered: true, attempts: attempt + 1 };
           }
         }
@@ -1074,6 +1306,9 @@ class DriveOrchestrator {
               metadata: { type: 'fallback_validation_trigger', task_id: task_.id },
             });
             Todo.update(agentId, task_.id, { status: 'pending_validation' });
+            JobRunService.markPendingValidation(agentId, Todo.findById(agentId, task_.id) || freshTask, {
+              source: 'drive_validation_fallback'
+            });
             return { success: true, validationTriggered: true, attempts: attempt + 1, changed: false };
           }
         }
@@ -1083,7 +1318,10 @@ class DriveOrchestrator {
       lastResults = execResults;
 
       if (attempt + 1 < this.maxRetries) {
-        retryContext = this.buildRetryContext(lastResults, attempt, task_._validationFeedback || null);
+        retryContext = this._mergeRetryContext(
+          planOverlay,
+          this.buildRetryContext(lastResults, attempt, task_._validationFeedback || null)
+        );
       }
       attempt++;
     }
@@ -1093,7 +1331,12 @@ class DriveOrchestrator {
     );
 
     Todo.update(agentId, task_.id, {
+      failureBucket: 'tool_failure',
       heartbeatStep: '⚠️ 等待人工介入',
+    });
+    JobRunService.markFailure(agentId, Todo.findById(agentId, task_.id) || task_, 'tool_failure', {
+      source: 'drive_orchestrator',
+      reason: 'stalled_after_retries'
     });
 
     try {
@@ -1243,22 +1486,34 @@ class DriveOrchestrator {
             const validationResult = await this.validator.validateTask(pv.agent_id, pv);
             if (validationResult.pass) {
               Todo.updateStatus(pv.agent_id, pv.id, 'completed');
+              JobRunService.markValidated(pv.agent_id, Todo.findById(pv.agent_id, pv.id) || pv, true, {
+                source: 'validator_service'
+              });
               totalDriven++;
             } else {
               const refreshed = Todo.findById(pv.agent_id, pv.id);
               if (this._hasValidationExhausted(refreshed)) {
                 Todo.update(pv.agent_id, pv.id, {
                   status: 'blocked',
+                  failureBucket: 'validation_failed',
                   heartbeatStep: `🔒 验证次数已达上限(${this.maxValidationAttempts}次)，需要人工介入`
                 });
                 Notification.create(pv.agent_id, pv.id, 'validation_exhausted',
                   `任务「${pv.title}」验证失败已达 ${this.maxValidationAttempts} 次，已标记为阻塞`
                 );
+                JobRunService.markValidated(pv.agent_id, Todo.findById(pv.agent_id, pv.id) || refreshed || pv, false, {
+                  source: 'validator_service',
+                  exhausted: true
+                });
               } else {
                 Todo.updateStatus(pv.agent_id, pv.id, 'validation_failed');
+                JobRunService.markValidated(pv.agent_id, Todo.findById(pv.agent_id, pv.id) || refreshed || pv, false, {
+                  source: 'validator_service'
+                });
               }
               totalStalled++;
             }
+            TaskPlanService.syncTaskExecution(pv.agent_id, Todo.findById(pv.agent_id, pv.id) || pv);
           }
         } catch (err) {
           console.error(`[DriveOrchestrator] validation ${pv.id} error:`, err.message);

@@ -77,6 +77,12 @@ function initializeSchema() {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       completed_at DATETIME,
       expected_duration_minutes INTEGER,
+      task_spec TEXT,
+      failure_bucket TEXT,
+      circuit_open_until DATETIME,
+      last_preflight_at DATETIME,
+      last_preflight_status TEXT,
+      last_preflight_report TEXT DEFAULT '',
       FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
       FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL,
       FOREIGN KEY (parent_id) REFERENCES todos(id) ON DELETE CASCADE
@@ -139,7 +145,8 @@ function initializeSchema() {
     { col: 'heartbeat_progress', type: 'REAL DEFAULT 0' },
     { col: 'heartbeat_step', type: 'TEXT DEFAULT \'\'' },
     { col: 'heartbeat_blockers', type: 'TEXT DEFAULT \'[]\'' },
-    { col: 'task_category', type: 'TEXT DEFAULT \'general\'' }
+    { col: 'task_category', type: 'TEXT DEFAULT \'general\'' },
+    { col: 'task_spec', type: 'TEXT' }
   ];
 
   for (const mig of todoMigrations) {
@@ -204,6 +211,11 @@ function initializeSchema() {
   const schedulerMigrations = [
     { col: 'next_due_at', type: 'DATETIME' },
     { col: 'last_spawned_at', type: 'DATETIME' },
+    { col: 'failure_bucket', type: 'TEXT' },
+    { col: 'circuit_open_until', type: 'DATETIME' },
+    { col: 'last_preflight_at', type: 'DATETIME' },
+    { col: 'last_preflight_status', type: 'TEXT' },
+    { col: 'last_preflight_report', type: "TEXT DEFAULT ''" },
   ];
 
   for (const mig of schedulerMigrations) {
@@ -238,6 +250,100 @@ function initializeSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_notifications_agent ON task_notifications(agent_id, read);
     CREATE INDEX IF NOT EXISTS idx_notifications_task ON task_notifications(task_id);
+
+    CREATE TABLE IF NOT EXISTS job_runs (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL UNIQUE,
+      template_id TEXT,
+      planned_at DATETIME,
+      spawned_at DATETIME,
+      started_at DATETIME,
+      first_heartbeat_at DATETIME,
+      pending_validation_at DATETIME,
+      completed_at DATETIME,
+      validated_at DATETIME,
+      final_status TEXT DEFAULT 'pending',
+      failure_bucket TEXT,
+      metadata TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE,
+      FOREIGN KEY (template_id) REFERENCES todos(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_runs_agent_status ON job_runs(agent_id, final_status);
+    CREATE INDEX IF NOT EXISTS idx_job_runs_template ON job_runs(template_id);
+
+    CREATE TABLE IF NOT EXISTS scheduler_events (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      template_id TEXT,
+      task_id TEXT,
+      event_type TEXT NOT NULL,
+      event_status TEXT DEFAULT 'info',
+      details TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (template_id) REFERENCES todos(id) ON DELETE SET NULL,
+      FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_scheduler_events_agent_created ON scheduler_events(agent_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_scheduler_events_template ON scheduler_events(template_id);
+
+    CREATE TABLE IF NOT EXISTS task_plans (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      revision INTEGER DEFAULT 1,
+      status TEXT DEFAULT 'draft',
+      source TEXT DEFAULT 'system_rule',
+      summary TEXT DEFAULT '',
+      review_notes TEXT DEFAULT '',
+      metadata TEXT DEFAULT '{}',
+      approved_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_plans_task_status ON task_plans(task_id, status, revision);
+
+    CREATE TABLE IF NOT EXISTS task_plan_steps (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      step_key TEXT NOT NULL,
+      step_order INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      instruction TEXT DEFAULT '',
+      status TEXT DEFAULT 'pending',
+      completion_notes TEXT DEFAULT '',
+      metadata TEXT DEFAULT '{}',
+      completed_at DATETIME,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (plan_id) REFERENCES task_plans(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_plan_steps_plan_order ON task_plan_steps(plan_id, step_order);
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id TEXT PRIMARY KEY,
+      agent_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      plan_id TEXT,
+      step_id TEXT,
+      event_type TEXT NOT NULL,
+      event_status TEXT DEFAULT 'info',
+      details TEXT DEFAULT '{}',
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (agent_id) REFERENCES agents(id) ON DELETE CASCADE,
+      FOREIGN KEY (task_id) REFERENCES todos(id) ON DELETE CASCADE,
+      FOREIGN KEY (plan_id) REFERENCES task_plans(id) ON DELETE SET NULL,
+      FOREIGN KEY (step_id) REFERENCES task_plan_steps(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_task_events_task_created ON task_events(task_id, created_at);
   `);
 
   // Migration: update status CHECK constraint to include 'blocked'
@@ -351,6 +457,7 @@ function initializeSchema() {
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           completed_at DATETIME,
           expected_duration_minutes INTEGER,
+          task_spec TEXT,
           schedule TEXT,
           is_template BOOLEAN DEFAULT 0,
           origin_agent_id TEXT,
@@ -379,7 +486,7 @@ function initializeSchema() {
           schedule, is_template, origin_agent_id, assigned_agent_id,
           assignment_note, assigned_at, transferred_from, archived,
           next_due_at, last_spawned_at, last_driven_at,
-          validation_report, validated_by, validation_count, task_category
+          validation_report, validated_by, validation_count, task_category, task_spec
         )
         SELECT 
           id, agent_id, project_id, parent_id, title, description, status, priority,
@@ -390,7 +497,7 @@ function initializeSchema() {
           schedule, is_template, origin_agent_id, assigned_agent_id,
           assignment_note, assigned_at, transferred_from, archived,
           next_due_at, last_spawned_at, last_driven_at,
-          validation_report, validated_by, validation_count, 'general' as task_category
+          validation_report, validated_by, validation_count, 'general' as task_category, NULL as task_spec
         FROM todos;
         DROP TABLE todos;
         ALTER TABLE todos_new RENAME TO todos;
@@ -456,6 +563,7 @@ function initializeSchema() {
         'max_attempts', 'attempt_count', 'attempt_log', 'last_heartbeat',
         'heartbeat_progress', 'heartbeat_step', 'heartbeat_blockers', 'position',
         'created_at', 'updated_at', 'completed_at', 'expected_duration_minutes',
+        'task_spec',
         'schedule', 'is_template', 'origin_agent_id', 'assigned_agent_id',
         'assignment_note', 'assigned_at', 'transferred_from', 'archived',
         'next_due_at', 'last_spawned_at', 'last_driven_at',
@@ -492,6 +600,7 @@ function initializeSchema() {
           updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
           completed_at DATETIME,
           expected_duration_minutes INTEGER,
+          task_spec TEXT,
           schedule TEXT,
           is_template BOOLEAN DEFAULT 0,
           origin_agent_id TEXT,
@@ -531,6 +640,25 @@ function initializeSchema() {
     }
   } catch (err) {
     console.log('[DB] Migration: failed/validating CHECK update skipped:', err.message);
+  }
+
+  const complexExecutionMigrations = [
+    { col: 'requires_plan', type: 'BOOLEAN DEFAULT 0' },
+    { col: 'plan_status', type: "TEXT DEFAULT 'not_required'" },
+    { col: 'current_plan_id', type: 'TEXT' },
+    { col: 'current_step_id', type: 'TEXT' },
+    { col: 'execution_state', type: "TEXT DEFAULT 'idle'" },
+    { col: 'lease_expires_at', type: 'DATETIME' },
+    { col: 'last_action_at', type: 'DATETIME' }
+  ];
+
+  for (const mig of complexExecutionMigrations) {
+    try {
+      database.exec(`ALTER TABLE todos ADD COLUMN ${mig.col} ${mig.type}`);
+      console.log(`[DB] Migration: todos.${mig.col} added`);
+    } catch (err) {
+      // Column already exists
+    }
   }
 }
 

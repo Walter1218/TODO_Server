@@ -17,6 +17,8 @@ const Agent = require('../src/models/Agent');
 const Todo = require('../src/models/Todo');
 const Context = require('../src/models/Context');
 const DriveOrchestrator = require('../src/services/DriveOrchestrator');
+const TaskPlanService = require('../src/services/TaskPlanService');
+const CommandExecutor = require('../src/services/CommandExecutor');
 const StructuredDriveTools = require('../src/utils/StructuredDriveTools');
 
 function createTestAgent(name = 'drive-agent') {
@@ -68,7 +70,11 @@ describe('StructuredDriveTools', () => {
       buildToolCall('proposeCompletion', {
         summary: 'Task finished',
         criteriaMet: ['完成主要逻辑'],
-        evidence: 'Unit test evidence'
+        evidence: 'Unit test evidence',
+        completionDetails: {
+          dataLocation: '/tmp/output.json',
+          artifacts: ['/tmp/output.json']
+        }
       }),
       agent.id,
       todo.id,
@@ -80,6 +86,9 @@ describe('StructuredDriveTools', () => {
     expect(result.action).toBe('task_pending_validation');
     expect(refreshed.status).toBe('pending_validation');
     expect(refreshed.heartbeat_progress).toBe(100);
+    const report = JSON.parse(refreshed.completion_report);
+    expect(report.validationEvidence.criteriaMet).toContain('完成主要逻辑');
+    expect(report.validationEvidence.artifacts).toContain('/tmp/output.json');
   });
 });
 
@@ -146,12 +155,16 @@ describe('DriveOrchestrator tool loop', () => {
 
     const result = await orchestrator.driveTask(agent.id, todo);
     const refreshed = Todo.findById(agent.id, todo.id);
+    const run = db.prepare('SELECT * FROM job_runs WHERE task_id = ?').get(todo.id);
 
     expect(result.success).toBe(true);
     expect(result.validationTriggered).toBe(true);
     expect(result.toolLoop).toBe(true);
     expect(refreshed.status).toBe('pending_validation');
     expect(refreshed.heartbeat_progress).toBe(100);
+    expect(run).toBeDefined();
+    expect(run.pending_validation_at).toBeTruthy();
+    expect(run.final_status).toBe('pending_validation');
     expect(chat).toHaveBeenCalledTimes(2);
   });
 
@@ -382,5 +395,224 @@ describe('DriveOrchestrator tool loop', () => {
     expect(refreshed.heartbeat_step).toContain('尝试次数已达上限');
     expect(orchestrator.driveTask).not.toHaveBeenCalled();
     expect(contexts.some(c => c.metadata?.type === 'attempt_limit_exhausted' && c.metadata?.task_id === exhaustedInstance.id)).toBe(true);
+  });
+
+  test('driveTask creates approved plan and advances inspect before execute for complex default tasks', async () => {
+    const defaultAgent = createTestAgent('hermes-default');
+    const complexTodo = Todo.create(defaultAgent.id, {
+      title: '修复 default 数据任务',
+      description: '需要先检查 duckdb 表、确认依赖脚本和目标目录，再执行数据修复并补齐结果证据，避免直接跳过排查步骤。',
+      acceptanceCriteria: '1. 明确输入输出\n2. 完成修复\n3. 提交可复核证据',
+      taskCategory: 'script',
+      taskSpec: {
+        target: 'local.duckdb',
+        verify: 'SELECT 1'
+      }
+    });
+    const chat = jest.fn();
+    const orchestrator = new DriveOrchestrator({ maxRetries: 1 });
+    orchestrator.framework = {
+      modules: {
+        llmManager: {
+          hasProvider: () => true,
+          chat
+        }
+      }
+    };
+
+    const result = await orchestrator.driveTask(defaultAgent.id, complexTodo);
+    const refreshed = Todo.findById(defaultAgent.id, complexTodo.id);
+    const plan = db.prepare('SELECT * FROM task_plans WHERE task_id = ?').get(complexTodo.id);
+    const steps = db.prepare('SELECT * FROM task_plan_steps WHERE plan_id = ? ORDER BY step_order ASC').all(plan.id);
+
+    expect(result.success).toBe(true);
+    expect(result.enforcedPlan).toBe(true);
+    expect(result.planAdvanced).toBe(true);
+    expect(result.step).toBe('inspect');
+    expect(chat).not.toHaveBeenCalled();
+    expect(refreshed.status).toBe('in_progress');
+    expect(refreshed.requires_plan).toBe(true);
+    expect(refreshed.plan_status).toBe('approved');
+    expect(refreshed.execution_state).toBe('ready');
+    expect(steps.map(step => step.status)).toEqual(['completed', 'in_progress', 'pending']);
+    expect(steps[1].id).toBe(refreshed.current_step_id);
+  });
+
+  test('driveTask executes approved execute step and moves plan into verify state', async () => {
+    const defaultAgent = createTestAgent('hermes-default');
+    const complexTodo = Todo.create(defaultAgent.id, {
+      title: '同步 default 指标结果',
+      description: '先检查输入数据，再执行同步脚本，最后提交验收证据。',
+      acceptanceCriteria: '1. 同步完成\n2. 输出结果位置\n3. 进入待验证',
+      taskCategory: 'script',
+      taskSpec: {
+        targetTable: 'metrics_daily',
+        verifySql: 'SELECT count(*) FROM metrics_daily'
+      }
+    });
+    const chat = jest.fn()
+      .mockResolvedValueOnce({
+        content: '',
+        usage: { totalTokens: 100 },
+        toolCalls: [
+          buildToolCall('executeCommand', {
+            command: 'node -e "process.stdout.write(\'ok\')"'
+          }, 'tc-step-1'),
+          buildToolCall('updateProgress', {
+            progress: 80,
+            step: '执行同步脚本'
+          }, 'tc-step-2')
+        ]
+      })
+      .mockResolvedValueOnce({
+        content: '',
+        usage: { totalTokens: 100 },
+        toolCalls: [
+          buildToolCall('proposeCompletion', {
+            summary: '同步完成',
+            criteriaMet: ['同步完成', '输出结果位置', '进入待验证'],
+            evidence: 'command ok'
+          }, 'tc-step-3')
+        ]
+      });
+
+    const orchestrator = new DriveOrchestrator({
+      maxRetries: 1,
+      toolLoopMaxIterations: 4,
+      maxNoProgressRounds: 2
+    });
+    orchestrator.framework = {
+      modules: {
+        llmManager: {
+          hasProvider: () => true,
+          chat
+        }
+      }
+    };
+
+    await orchestrator.driveTask(defaultAgent.id, complexTodo);
+    const result = await orchestrator.driveTask(defaultAgent.id, Todo.findById(defaultAgent.id, complexTodo.id));
+    const refreshed = Todo.findById(defaultAgent.id, complexTodo.id);
+    const verifyStep = db.prepare('SELECT * FROM task_plan_steps WHERE id = ?').get(refreshed.current_step_id);
+
+    expect(result.success).toBe(true);
+    expect(result.validationTriggered).toBe(true);
+    expect(result.enforcedPlan).toBe(true);
+    expect(result.step).toBe('execute');
+    expect(refreshed.status).toBe('pending_validation');
+    expect(refreshed.plan_status).toBe('approved');
+    expect(refreshed.execution_state).toBe('waiting_validation');
+    expect(verifyStep.step_key).toBe('verify');
+    expect(chat).toHaveBeenCalledTimes(2);
+  });
+
+  test('TaskPlanService syncTaskExecution closes verify step when task is completed', async () => {
+    const defaultAgent = createTestAgent('hermes-default');
+    const complexTodo = Todo.create(defaultAgent.id, {
+      title: '分析 default 卡点任务',
+      description: '需要先检查，再执行，再等待验证闭环。',
+      acceptanceCriteria: '提交结果摘要与证据',
+      taskCategory: 'code_change',
+      taskSpec: {
+        evidence: 'report.md'
+      }
+    });
+    const orchestrator = new DriveOrchestrator({ maxRetries: 1 });
+    orchestrator.framework = {
+      modules: {
+        llmManager: {
+          hasProvider: () => true,
+          chat: jest.fn()
+            .mockResolvedValueOnce({
+              content: '',
+              usage: { totalTokens: 100 },
+              toolCalls: [
+                buildToolCall('proposeCompletion', {
+                  summary: '分析完成',
+                  criteriaMet: ['提交结果摘要与证据'],
+                  evidence: 'report ready'
+                }, 'tc-final-1')
+              ]
+            })
+        }
+      }
+    };
+
+    await orchestrator.driveTask(defaultAgent.id, complexTodo);
+    await orchestrator.driveTask(defaultAgent.id, Todo.findById(defaultAgent.id, complexTodo.id));
+    Todo.updateStatus(defaultAgent.id, complexTodo.id, 'completed');
+    TaskPlanService.syncTaskExecution(defaultAgent.id, Todo.findById(defaultAgent.id, complexTodo.id));
+
+    const refreshed = Todo.findById(defaultAgent.id, complexTodo.id);
+    const steps = db.prepare(`
+      SELECT step_key, status
+      FROM task_plan_steps
+      WHERE plan_id = ?
+      ORDER BY step_order ASC
+    `).all(refreshed.current_plan_id);
+
+    expect(refreshed.plan_status).toBe('completed');
+    expect(refreshed.execution_state).toBe('completed');
+    expect(refreshed.current_step_id).toBeNull();
+    expect(steps).toEqual([
+      { step_key: 'inspect', status: 'completed' },
+      { step_key: 'execute', status: 'completed' },
+      { step_key: 'verify', status: 'completed' }
+    ]);
+  });
+
+  test('data task prefers official script execution and skips llm fallback', async () => {
+    const execSpy = jest.spyOn(CommandExecutor, 'executeCommands').mockResolvedValue([
+      {
+        index: 0,
+        command: 'python3 fetch_top_list.py',
+        output: 'ok',
+        stdout: 'ok',
+        stderr: '',
+        exitCode: 0,
+        success: true,
+        duration: 12
+      }
+    ]);
+    const processMessage = jest.fn();
+
+    const dataTask = Todo.create(agent.id, {
+      title: '每日龙虎榜数据增量同步（top_list）',
+      description: '通过正式脚本补齐数据'
+    });
+    const orchestrator = new DriveOrchestrator({
+      maxRetries: 1,
+      toolLoopMaxIterations: 2,
+      maxNoProgressRounds: 1
+    });
+    orchestrator.framework = {
+      processMessage,
+      modules: {
+        llmManager: {
+          hasProvider: () => false
+        }
+      }
+    };
+    orchestrator.validator = {
+      validateTask: jest.fn().mockResolvedValue({
+        applied: true,
+        pass: true,
+        score: 92,
+        reason: '规则通过',
+        validator: 'policy:data_task'
+      })
+    };
+
+    const result = await orchestrator.driveTask(agent.id, dataTask);
+    const refreshed = Todo.findById(agent.id, dataTask.id);
+
+    expect(result.officialExecution).toBe(true);
+    expect(result.validationTriggered).toBe(true);
+    expect(execSpy).toHaveBeenCalledTimes(1);
+    expect(processMessage).not.toHaveBeenCalled();
+    expect(orchestrator.validator.validateTask).toHaveBeenCalledTimes(1);
+    expect(refreshed.status).toBe('pending_validation');
+
+    execSpy.mockRestore();
   });
 });

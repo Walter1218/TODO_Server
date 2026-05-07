@@ -58,6 +58,42 @@ describe('Todo CRUD', () => {
     expect(updated.status).toBe('in_progress');
   });
 
+  test('persists task_spec and clones it from template to spawned task', () => {
+    const template = Todo.create(agent.id, {
+      title: '每日资金流向数据增量同步（moneyflow）',
+      schedule: '5 17 * * 1-5',
+      isTemplate: true,
+      taskSpec: {
+        kind: 'data_task',
+        engine: 'duckdb',
+        path: '/tmp/example.duckdb',
+        checks: [{ label: 'x', sql: 'SELECT 1 AS passed' }]
+      }
+    });
+
+    const foundTemplate = Todo.findById(agent.id, template.id);
+    const spawned = Todo.spawnFromTemplate(agent.id, template.id);
+
+    expect(foundTemplate.task_spec).toBeTruthy();
+    expect(foundTemplate.task_spec.kind).toBe('data_task');
+    expect(spawned.task_spec).toBeTruthy();
+    expect(spawned.task_spec.path).toBe('/tmp/example.duckdb');
+  });
+
+  test('spawnFromTemplate stores last_spawned_at in ISO format', () => {
+    const template = Todo.create(agent.id, {
+      title: '每日龙虎榜数据增量同步（top_list）',
+      schedule: '10 17 * * 1-5',
+      isTemplate: true
+    });
+
+    Todo.spawnFromTemplate(agent.id, template.id);
+    const refreshed = Todo.findById(agent.id, template.id);
+
+    expect(refreshed.last_spawned_at).toMatch(/T/);
+    expect(refreshed.last_spawned_at).toMatch(/Z$/);
+  });
+
   test('delete todo', () => {
     const todo = Todo.create(agent.id, { title: 'To Delete' });
     const deleted = Todo.delete(agent.id, todo.id);
@@ -90,6 +126,17 @@ describe('Todo CRUD', () => {
     expect(completed.length).toBe(1);
   });
 
+  test('find todos by agent with todayOnly excludes historical instances', () => {
+    const todayTask = Todo.create(agent.id, { title: 'Today Task' });
+    const oldTask = Todo.create(agent.id, { title: 'Old Task' });
+    db.prepare("UPDATE todos SET created_at = datetime('now', 'localtime', '-1 day') WHERE id = ?").run(oldTask.id);
+
+    const todos = Todo.findAllByAgent(agent.id, { todayOnly: true });
+
+    expect(todos.map(t => t.id)).toContain(todayTask.id);
+    expect(todos.map(t => t.id)).not.toContain(oldTask.id);
+  });
+
   test('search todos by text', () => {
     Todo.create(agent.id, { title: 'Deploy to production', description: 'Run the deploy script' });
     Todo.create(agent.id, { title: 'Write unit tests', description: 'Test the API endpoints' });
@@ -115,6 +162,22 @@ describe('Todo CRUD', () => {
     expect(stats.in_progress).toBe(1);
     expect(stats.completed).toBe(1);
     expect(stats.critical_pending).toBe(1);
+  });
+
+  test('get stats excludes archived history from total and active counts', () => {
+    const active = Todo.create(agent.id, { title: 'Active Task', priority: 'high' });
+    const archivedCompleted = Todo.create(agent.id, { title: 'Archived Completed' });
+    Todo.complete(agent.id, archivedCompleted.id);
+    Todo.update(agent.id, archivedCompleted.id, { archived: true });
+    const archivedPending = Todo.create(agent.id, { title: 'Archived Pending' });
+    Todo.update(agent.id, archivedPending.id, { archived: true });
+
+    const stats = Todo.getStats(agent.id);
+    expect(stats.total).toBe(1);
+    expect(stats.active_tasks).toBe(1);
+    expect(stats.pending).toBe(1);
+    expect(stats.completed).toBe(0);
+    expect(Todo.findById(agent.id, active.id).title).toBe('Active Task');
   });
 });
 
@@ -228,6 +291,10 @@ describe('Heartbeat and Retry', () => {
     expect(updated.heartbeat_step).toBe('Testing');
     expect(updated.heartbeat_blockers).toContain('Waiting for review');
     expect(updated.last_heartbeat).toBeTruthy();
+
+    const run = db.prepare('SELECT * FROM job_runs WHERE task_id = ?').get(todo.id);
+    expect(run).toBeDefined();
+    expect(run.first_heartbeat_at).toBeTruthy();
   });
 
   test('record successful attempt', () => {
@@ -251,6 +318,32 @@ describe('Heartbeat and Retry', () => {
 
     expect(blocked.status).toBe('blocked');
     expect(blocked.attempt_count).toBe(2);
+    expect(blocked.failure_bucket).toBe('tool_failure');
+
+    const run = db.prepare('SELECT * FROM job_runs WHERE task_id = ?').get(todo.id);
+    expect(run.final_status).toBe('blocked');
+    expect(run.failure_bucket).toBe('tool_failure');
+  });
+});
+
+describe('Job run state sync', () => {
+  let agent;
+  beforeEach(() => {
+    agent = createTestAgent();
+  });
+
+  test('completed todo clears failure bucket and records completion time', () => {
+    const todo = Todo.create(agent.id, { title: 'Complete with run sync' });
+    Todo.update(agent.id, todo.id, { status: 'blocked', failureBucket: 'tool_failure' });
+
+    const completed = Todo.update(agent.id, todo.id, { status: 'completed' });
+    const run = db.prepare('SELECT * FROM job_runs WHERE task_id = ?').get(todo.id);
+
+    expect(completed.status).toBe('completed');
+    expect(completed.failure_bucket).toBeNull();
+    expect(run.final_status).toBe('completed');
+    expect(run.failure_bucket).toBeNull();
+    expect(run.completed_at).toBeTruthy();
   });
 });
 
@@ -490,6 +583,48 @@ describe('Templates and Scheduling', () => {
 
     expect(dueTemplates.map(t => t.id)).not.toContain(template.id);
     expect(refreshed.next_due_at).toBe('2026-05-07T09:05:00.000Z');
+  });
+
+  test('findDueTemplates skips cross-day catch-up for market-close templates', () => {
+    const template = Todo.create(agent.id, {
+      title: '每日资金流向数据增量同步（moneyflow）',
+      schedule: '5 17 * * 1-5',
+      isTemplate: true,
+      description: '每日收盘后同步 A股资金流向数据'
+    });
+
+    db.prepare(`
+      UPDATE todos
+      SET last_spawned_at = ?, next_due_at = ?
+      WHERE id = ? AND agent_id = ?
+    `).run('2026-05-07 07:24:11', '2026-05-07T09:05:00.000Z', template.id, agent.id);
+
+    const dueTemplates = Todo.findDueTemplates(agent.id, new Date('2026-05-08T01:07:49+08:00'), { reconcile: true });
+    const refreshed = Todo.findById(agent.id, template.id);
+
+    expect(dueTemplates.map(t => t.id)).not.toContain(template.id);
+    expect(refreshed.next_due_at).toBe('2026-05-08T09:05:00.000Z');
+  });
+
+  test('findDueTemplates skips cross-day catch-up for top_list templates after SQLite-style timestamps', () => {
+    const template = Todo.create(agent.id, {
+      title: '每日龙虎榜数据增量同步（top_list）',
+      schedule: '10 17 * * 1-5',
+      isTemplate: true,
+      description: '每日收盘后同步龙虎榜数据'
+    });
+
+    db.prepare(`
+      UPDATE todos
+      SET last_spawned_at = ?, next_due_at = ?
+      WHERE id = ? AND agent_id = ?
+    `).run('2026-05-07 09:21:45', '2026-05-07T09:10:00.000Z', template.id, agent.id);
+
+    const dueTemplates = Todo.findDueTemplates(agent.id, new Date('2026-05-08T01:21:00+08:00'), { reconcile: true });
+    const refreshed = Todo.findById(agent.id, template.id);
+
+    expect(dueTemplates.map(t => t.id)).not.toContain(template.id);
+    expect(refreshed.next_due_at).toBe('2026-05-08T09:10:00.000Z');
   });
 });
 
