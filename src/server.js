@@ -656,26 +656,19 @@ app.listen(PORT, () => {
 
   // 定时调度任务引擎：每分钟检查到期的模板任务并生成实例
   const SCHEDULER_INTERVAL_MS = 60 * 1000;
+  const CRON_FORCE_DRIVE_SOURCE = 'scheduled_task';
+  const CRON_MAX_FORCED_DRIVES = parseInt(process.env.CRON_MAX_FORCED_DRIVES || '2', 10);
+  const CRON_FORCE_DRIVE_GRACE_MINUTES = parseInt(process.env.CRON_FORCE_DRIVE_GRACE_MINUTES || '3', 10);
 
-  setInterval(() => {
+  setInterval(async () => {
     try {
       const agents = Agent.findAll();
       let totalSpawned = 0;
+      let totalForced = 0;
+      const driveOrchestrator = app.get('driveOrchestrator');
 
       for (const agent of agents) {
-        // Fix legacy templates that have schedule but no next_due_at
-        const templates = Todo.findTemplates(agent.id);
-        for (const template of templates) {
-          if (template.schedule && !template.next_due_at) {
-            const nextDue = Todo.computeNextDueAt(template.schedule, new Date());
-            if (nextDue) {
-              Todo.update(agent.id, template.id, { nextDueAt: nextDue });
-              logger.info(`[DailyScheduler] 修复旧模板 ${template.id} 的 next_due_at: ${nextDue}`);
-            }
-          }
-        }
-
-        const dueTemplates = Todo.findDueTemplates(agent.id);
+        const dueTemplates = Todo.findDueTemplates(agent.id, new Date(), { reconcile: true });
         for (const template of dueTemplates) {
           try {
             const spawned = Todo.spawnFromTemplate(agent.id, template.id, { replaceExisting: true });
@@ -689,8 +682,20 @@ app.listen(PORT, () => {
             });
 
             Notification.create(agent.id, spawned.id, 'assigned',
-              `定时模板「${template.title}」已生成执行实例，等待 cron job 认领执行`
+              `定时模板「${template.title}」已生成执行实例，系统将立即尝试驱动`
             );
+
+            if (driveOrchestrator) {
+              const forced = await driveOrchestrator.triggerTaskDrive(agent.id, spawned.id, {
+                source: CRON_FORCE_DRIVE_SOURCE,
+                reason: 'template_spawned_immediate_drive',
+                allowPendingChildren: true,
+                maxForcedAttempts: CRON_MAX_FORCED_DRIVES
+              });
+              if (forced?.queued) {
+                totalForced++;
+              }
+            }
 
             logger.info(`[DailyScheduler] Agent ${agent.id}: 从模板 ${template.id} 生成任务 ${spawned.id}「${spawned.title}」`);
           } catch (spawnErr) {
@@ -699,8 +704,8 @@ app.listen(PORT, () => {
         }
       }
 
-      if (totalSpawned > 0) {
-        logger.info(`[DailyScheduler] 本次共生成 ${totalSpawned} 个定时任务实例`);
+      if (totalSpawned > 0 || totalForced > 0) {
+        logger.info(`[DailyScheduler] 本次共生成 ${totalSpawned} 个定时任务实例，立即强制驱动 ${totalForced} 个`);
       }
     } catch (err) {
       logger.error('[DailyScheduler] 调度检查时出错:', err.message);
@@ -713,12 +718,80 @@ app.listen(PORT, () => {
   const CRON_NAG_COOLDOWN_MINUTES = parseInt(process.env.CRON_NAG_COOLDOWN_MINUTES || '60', 10);
   const CRON_MONITOR_OPS_AGENT_ID = process.env.CRON_MONITOR_OPS_AGENT_ID || 'hermes-ops';
   const CRON_MONITOR_INTERVAL_MS = 60 * 1000;
+  const hasCronEscalation = (db, agentId, taskId) => {
+    const row = db.prepare(`
+      SELECT id FROM contexts
+      WHERE agent_id = ?
+        AND session_id = 'cron-monitor'
+        AND metadata LIKE '%"type":"cron_force_drive_escalated"%'
+        AND metadata LIKE ?
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(agentId, `%"task_id":"${taskId}"%`);
+    return !!row;
+  };
+  const escalateCronTaskToOps = (db, task, executorId) => {
+    if (!CRON_MONITOR_OPS_AGENT_ID || !Agent.exists(CRON_MONITOR_OPS_AGENT_ID)) {
+      return { escalated: false, reason: 'ops_agent_unavailable' };
+    }
+    if (hasCronEscalation(db, task.agent_id, task.id)) {
+      return { escalated: false, reason: 'already_escalated' };
+    }
 
-  setInterval(() => {
+    const note = `[CronMonitor] 定时任务连续强制驱动仍未启动，升级给 ${CRON_MONITOR_OPS_AGENT_ID} 接管`;
+    if (task.assigned_agent_id && task.assigned_agent_id !== CRON_MONITOR_OPS_AGENT_ID) {
+      Todo.transfer(task.agent_id, task.id, CRON_MONITOR_OPS_AGENT_ID, note);
+    } else if (!task.assigned_agent_id) {
+      Todo.assign(task.agent_id, task.id, CRON_MONITOR_OPS_AGENT_ID, note);
+    }
+
+    FocusState.createOrUpdate(CRON_MONITOR_OPS_AGENT_ID, { currentTaskId: task.id, focusMode: 'auto' });
+
+    const content = `[CronMonitor] 定时实例「${task.title}」(ID: ${task.id}) 连续强制驱动仍无心跳，已升级给 ${CRON_MONITOR_OPS_AGENT_ID} 接管。\n原执行方: ${executorId || task.agent_id}\n模板: ${task.template_title || '(unknown)'}\nschedule: ${task.template_schedule || '(none)'}`;
+    Context.create(task.agent_id, {
+      sessionId: 'cron-monitor',
+      role: 'system',
+      content,
+      metadata: {
+        type: 'cron_force_drive_escalated',
+        task_id: task.id,
+        template_id: task.parent_id,
+        from_agent_id: executorId || task.agent_id,
+        to_agent_id: CRON_MONITOR_OPS_AGENT_ID
+      }
+    });
+    Context.create(CRON_MONITOR_OPS_AGENT_ID, {
+      sessionId: 'cron-monitor',
+      role: 'system',
+      content,
+      metadata: {
+        type: 'cron_force_drive_escalated',
+        task_id: task.id,
+        template_id: task.parent_id,
+        from_agent_id: executorId || task.agent_id,
+        to_agent_id: CRON_MONITOR_OPS_AGENT_ID
+      }
+    });
+    Notification.create(CRON_MONITOR_OPS_AGENT_ID, task.id, 'assigned',
+      `[CronMonitor] 定时实例「${task.title}」连续强制驱动失败，已升级给你接管`
+    );
+    if (task.agent_id !== CRON_MONITOR_OPS_AGENT_ID) {
+      Notification.create(task.agent_id, task.id, 'stalled',
+        `[CronMonitor] 定时实例「${task.title}」已升级给 ${CRON_MONITOR_OPS_AGENT_ID} 接管`
+      );
+    }
+
+    return { escalated: true, to: CRON_MONITOR_OPS_AGENT_ID };
+  };
+
+  setInterval(async () => {
     try {
       const db = getDb();
+      const driveOrchestrator = app.get('driveOrchestrator');
       const overdueCutoff = new Date(Date.now() - CRON_START_GRACE_MINUTES * 60 * 1000).toISOString();
+      const forceCutoff = new Date(Date.now() - CRON_FORCE_DRIVE_GRACE_MINUTES * 60 * 1000).toISOString();
       const notifyCutoff = new Date(Date.now() - CRON_NAG_COOLDOWN_MINUTES * 60 * 1000).toISOString();
+      const overdueCutoffMs = Date.parse(overdueCutoff);
 
       let overdue;
       try {
@@ -735,16 +808,38 @@ app.listen(PORT, () => {
             AND (t.last_heartbeat IS NULL OR t.last_heartbeat = '')
           ORDER BY t.created_at ASC
           LIMIT 50
-        `).all(overdueCutoff);
+        `).all(forceCutoff);
       } catch (sqlErr) {
         logger.error('[CronExecutionMonitor] SQL 查询出错:', sqlErr.message);
         return;
       }
 
       let totalNagged = 0;
+      let totalForced = 0;
+      let totalEscalated = 0;
 
       for (const task of overdue) {
         try {
+          let forced = null;
+          if (driveOrchestrator) {
+            forced = await driveOrchestrator.triggerTaskDrive(task.agent_id, task.id, {
+              source: CRON_FORCE_DRIVE_SOURCE,
+              reason: 'cron_no_heartbeat_recovery',
+              allowPendingChildren: true,
+              maxForcedAttempts: CRON_MAX_FORCED_DRIVES
+            });
+            if (forced?.queued) {
+              totalForced++;
+            }
+          }
+
+          const taskCreatedAtMs = task.created_at
+            ? new Date(task.created_at.replace(' ', 'T') + 'Z').getTime()
+            : 0;
+          if (!taskCreatedAtMs || taskCreatedAtMs > overdueCutoffMs) {
+            continue;
+          }
+
           const alreadyNotified = db.prepare(`
             SELECT id FROM task_notifications
             WHERE task_id = ?
@@ -753,9 +848,16 @@ app.listen(PORT, () => {
               AND created_at >= ?
             LIMIT 1
           `).get(task.id, notifyCutoff);
+          const executorId = task.assigned_agent_id || task.agent_id;
+          if (forced?.reason === 'forced_attempt_limit_reached') {
+            const escalation = escalateCronTaskToOps(db, task, executorId);
+            if (escalation.escalated) {
+              totalEscalated++;
+            }
+          }
+
           if (alreadyNotified) continue;
 
-          const executorId = task.assigned_agent_id || task.agent_id;
           const msg = `[CronMonitor] 定时实例超过 ${CRON_START_GRACE_MINUTES} 分钟仍未开始（无心跳）：「${task.title}」(ID: ${task.id})`;
 
           if (Agent.exists(executorId)) {
@@ -789,15 +891,15 @@ app.listen(PORT, () => {
         }
       }
 
-      if (totalNagged > 0) {
-        logger.info(`[CronExecutionMonitor] 本次标记/提醒 ${totalNagged} 个未按时启动的定时实例（阈值 ${CRON_START_GRACE_MINUTES}min）`);
+      if (totalNagged > 0 || totalForced > 0 || totalEscalated > 0) {
+        logger.info(`[CronExecutionMonitor] 本次强制驱动 ${totalForced} 个未启动定时实例，升级 ${totalEscalated} 个，提醒 ${totalNagged} 个（强制阈值 ${CRON_FORCE_DRIVE_GRACE_MINUTES}min，提醒阈值 ${CRON_START_GRACE_MINUTES}min）`);
       }
     } catch (err) {
       logger.error('[CronExecutionMonitor] 扫描出错:', err.message, err.stack?.split('\n').slice(0, 3).join(' '));
     }
   }, CRON_MONITOR_INTERVAL_MS);
 
-  logger.info(`[CronExecutionMonitor] 已启动，每 ${CRON_MONITOR_INTERVAL_MS / 1000}s 扫描 pending 定时实例；启动阈值 ${CRON_START_GRACE_MINUTES}min，提醒冷却 ${CRON_NAG_COOLDOWN_MINUTES}min`);
+  logger.info(`[CronExecutionMonitor] 已启动，每 ${CRON_MONITOR_INTERVAL_MS / 1000}s 扫描 pending 定时实例；强制驱动阈值 ${CRON_FORCE_DRIVE_GRACE_MINUTES}min，提醒阈值 ${CRON_START_GRACE_MINUTES}min，提醒冷却 ${CRON_NAG_COOLDOWN_MINUTES}min`);
 
   // AssignmentDriver：每 60 秒扫描已指派但长时间未执行的任务，自动 focus + 通知
   const ASSIGN_DRIVER_INTERVAL_MS = 60 * 1000;

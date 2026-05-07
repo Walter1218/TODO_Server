@@ -31,6 +31,7 @@ const DEFAULTS = {
   toolLoopMaxIterations: 6,
   toolLoopTokenBudget: 50000,
   maxNoProgressRounds: 2,
+  maxForcedCronDrivesPerTask: 2,
 };
 
 class DriveOrchestrator {
@@ -48,6 +49,7 @@ class DriveOrchestrator {
     this.toolLoopMaxIterations = options.toolLoopMaxIterations || DEFAULTS.toolLoopMaxIterations;
     this.toolLoopTokenBudget = options.toolLoopTokenBudget || DEFAULTS.toolLoopTokenBudget;
     this.maxNoProgressRounds = options.maxNoProgressRounds || DEFAULTS.maxNoProgressRounds;
+    this.maxForcedCronDrivesPerTask = options.maxForcedCronDrivesPerTask || DEFAULTS.maxForcedCronDrivesPerTask;
     this.drivingTasks = new Set();
     this.toolLoopStats = {
       fallbackReasons: {},
@@ -293,6 +295,9 @@ class DriveOrchestrator {
     if (this.drivingTasks.has(task.id)) return false;
     if (task.is_template) return false;
     if (task.archived) return false;
+    const currentAttempts = task.attempt_count || 0;
+    const maxAttempts = task.max_attempts || 3;
+    if (currentAttempts >= maxAttempts) return false;
     const vc = task.validation_count || 0;
     if (vc >= this.maxValidationAttempts) return false;
     if (task.parent_id && task.status === 'pending') return false;
@@ -316,13 +321,17 @@ class DriveOrchestrator {
   }
 
   async prepareTaskState(task) {
+    const currentAttempts = task.attempt_count || 0;
+    const maxAttempts = task.max_attempts || 3;
+    if (currentAttempts >= maxAttempts) {
+      await this._markAttemptExhausted(task.agent_id, task, 'prepare_task_state');
+      return null;
+    }
     if (task.status === 'pending') {
       Todo.updateStatus(task.agent_id, task.id, 'in_progress');
       return Todo.findById(task.agent_id, task.id);
     }
     if (task.status === 'blocked') {
-      const currentAttempts = task.attempt_count || 0;
-      const maxAttempts = task.max_attempts || 3;
       if (currentAttempts < maxAttempts) {
         Todo.update(task.agent_id, task.id, {
           status: 'in_progress',
@@ -375,6 +384,182 @@ class DriveOrchestrator {
       fallbackReasons: {},
       exitReasons: {}
     };
+  }
+
+  async _markAttemptExhausted(agentId, task, reason = 'attempt_limit_exhausted') {
+    if (!task) return null;
+    const currentAttempts = task.attempt_count || 0;
+    const maxAttempts = task.max_attempts || 3;
+    const latest = Todo.findById(agentId, task.id) || task;
+
+    if (latest.status !== 'blocked') {
+      Todo.update(agentId, task.id, {
+        status: 'blocked',
+        heartbeatStep: `🔒 尝试次数已达上限(${currentAttempts}/${maxAttempts})，停止自动驱动，等待人工介入`
+      });
+    }
+
+    await Context.create(agentId, {
+      sessionId: 'drive-orchestrator',
+      role: 'system',
+      content: `[DriveOrchestrator] 任务「${task.title}」已达到最大尝试次数，拒绝继续自动驱动`,
+      metadata: {
+        type: 'attempt_limit_exhausted',
+        task_id: task.id,
+        reason,
+        attempt_count: currentAttempts,
+        max_attempts: maxAttempts
+      }
+    });
+    Notification.create(agentId, task.id, 'max_attempts',
+      `任务「${task.title}」已达到最大尝试次数（${currentAttempts}/${maxAttempts}），已停止自动驱动`
+    );
+
+    return Todo.findById(agentId, task.id);
+  }
+
+  _countForcedDriveAttempts(agentId, taskId, source) {
+    const db = getDb();
+    const params = [
+      agentId,
+      '%"type":"forced_drive_request"%',
+      `%"task_id":"${taskId}"%`
+    ];
+    let sql = `
+      SELECT COUNT(*) AS count
+      FROM contexts
+      WHERE agent_id = ?
+        AND session_id = 'drive-orchestrator'
+        AND metadata LIKE ?
+        AND metadata LIKE ?
+    `;
+
+    if (source) {
+      sql += ' AND metadata LIKE ?';
+      params.push(`%"source":"${source}"%`);
+    }
+
+    return db.prepare(sql).get(...params).count || 0;
+  }
+
+  async triggerTaskDrive(agentId, taskOrId, options = {}) {
+    const {
+      reason = 'forced_drive',
+      source = 'system',
+      allowPendingChildren = false,
+      maxForcedAttempts = this.maxForcedCronDrivesPerTask,
+      waitForCompletion = false,
+      setFocus = true
+    } = options;
+
+    if (!this.framework?.modules?.llmManager) {
+      return { queued: false, reason: 'framework_unavailable' };
+    }
+
+    const taskId = typeof taskOrId === 'string' ? taskOrId : taskOrId?.id;
+    const freshTask = taskId ? Todo.findById(agentId, taskId) : null;
+    if (!freshTask) {
+      return { queued: false, reason: 'task_not_found' };
+    }
+    const currentAttempts = freshTask.attempt_count || 0;
+    const maxAttempts = freshTask.max_attempts || 3;
+    if (currentAttempts >= maxAttempts) {
+      await this._markAttemptExhausted(agentId, freshTask, 'trigger_task_drive');
+      return { queued: false, reason: 'attempt_limit_exhausted', attemptCount: currentAttempts, maxAttempts };
+    }
+    if (freshTask.is_template || freshTask.archived) {
+      return { queued: false, reason: 'task_not_drivable' };
+    }
+    if (['completed', 'cancelled', 'validating'].includes(freshTask.status)) {
+      return { queued: false, reason: 'task_not_drivable' };
+    }
+    if (this.drivingTasks.has(freshTask.id)) {
+      return { queued: false, reason: 'already_driving' };
+    }
+
+    const isForcedPendingChild = allowPendingChildren && freshTask.status === 'pending' && freshTask.parent_id;
+    if (!this.shouldDrive(freshTask) && !isForcedPendingChild) {
+      return { queued: false, reason: 'should_drive_rejected' };
+    }
+
+    const forcedAttemptCount = this._countForcedDriveAttempts(agentId, freshTask.id, source);
+    if (forcedAttemptCount >= maxForcedAttempts) {
+      return { queued: false, reason: 'forced_attempt_limit_reached', forcedAttemptCount };
+    }
+
+    if (setFocus) {
+      try {
+        FocusState.createOrUpdate(agentId, { currentTaskId: freshTask.id, focusMode: 'auto' });
+      } catch (focusErr) {
+        console.warn(`[DriveOrchestrator] triggerTaskDrive focus update failed: ${focusErr.message}`);
+      }
+    }
+
+    await Context.create(agentId, {
+      sessionId: 'drive-orchestrator',
+      role: 'system',
+      content: `[ForcedDrive] source=${source} reason=${reason} task=${freshTask.id} attempt=${forcedAttemptCount + 1}/${maxForcedAttempts}`,
+      metadata: {
+        type: 'forced_drive_request',
+        task_id: freshTask.id,
+        source,
+        reason,
+        forced_attempt: forcedAttemptCount + 1,
+        max_forced_attempts: maxForcedAttempts
+      }
+    });
+
+    const runner = async () => {
+      this.drivingTasks.add(freshTask.id);
+      try {
+        const result = await this.driveTask(agentId, Todo.findById(agentId, freshTask.id) || freshTask);
+        await Context.create(agentId, {
+          sessionId: 'drive-orchestrator',
+          role: 'system',
+          content: `[ForcedDrive] source=${source} task=${freshTask.id} completed=${!!result?.success} blocked=${!!result?.blocked} stalled=${!!result?.stalled}`,
+          metadata: {
+            type: 'forced_drive_result',
+            task_id: freshTask.id,
+            source,
+            reason,
+            success: !!result?.success,
+            blocked: !!result?.blocked,
+            stalled: !!result?.stalled,
+            validation_triggered: !!result?.validationTriggered
+          }
+        });
+        return result;
+      } finally {
+        this.drivingTasks.delete(freshTask.id);
+      }
+    };
+
+    if (waitForCompletion) {
+      const result = await runner();
+      return { queued: true, started: true, result };
+    }
+
+    runner().catch(async (err) => {
+      try {
+        await Context.create(agentId, {
+          sessionId: 'drive-orchestrator',
+          role: 'system',
+          content: `[ForcedDrive] source=${source} task=${freshTask.id} error=${err.message}`,
+          metadata: {
+            type: 'forced_drive_error',
+            task_id: freshTask.id,
+            source,
+            reason,
+            error: err.message
+          }
+        });
+      } catch (contextErr) {
+        console.error('[DriveOrchestrator] forced drive context write failed:', contextErr.message);
+      }
+      console.error(`[DriveOrchestrator] forced drive failed for ${freshTask.id}:`, err.message);
+    });
+
+    return { queued: true, started: true, forcedAttemptCount: forcedAttemptCount + 1 };
   }
 
   _buildToolLoopMessages(task, retryContext) {
@@ -651,6 +836,7 @@ class DriveOrchestrator {
   async driveTask(agentId, task) {
     const task_ = await this.prepareTaskState(task);
     if (!task_) return { success: false, attempts: 0, reason: 'prepare_failed' };
+    getDb().prepare(`UPDATE todos SET last_driven_at = CURRENT_TIMESTAMP WHERE id = ?`).run(task_.id);
 
     let attempt = 0;
     let retryContext = task_._validationFeedback ? `📋 验证失败反馈（请务必解决）:\n${task_._validationFeedback}` : null;
@@ -824,9 +1010,6 @@ class DriveOrchestrator {
           blockers: parsed.blockers,
         });
       }
-
-      const db = getDb();
-      db.prepare(`UPDATE todos SET last_driven_at = CURRENT_TIMESTAMP WHERE id = ?`).run(task_.id);
 
       const refreshed = Todo.findById(agentId, task_.id);
       const after = ProgressValidator.snapshot(refreshed);

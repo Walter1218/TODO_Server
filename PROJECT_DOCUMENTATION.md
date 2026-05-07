@@ -270,9 +270,13 @@ POST /api/agents/:id/focus/auto
 
 - 任务模板（`is_template=true`）+ 调度规则（`schedule`）
 - 支持格式：`daily`、`weekly:mon,fri`、`cron:0 9 * * *`
-- **模板 → 实例**：DailyScheduler 每分钟检查到期模板，自动 spawn 实例
+- **模板 → 实例**：DailyScheduler 每分钟按当前机器本地时间检查到期模板，自动 spawn 实例
+- **本地时间基准**：`schedule` 与 cron 小时/星期字段统一基于当前运行机器的本地时区解释，不依赖数据库字符串比较
+- **自校正机制**：每轮调度前会根据模板的 `schedule`、`last_spawned_at`、`created_at` 重新校正 `next_due_at`，降低历史脏值、时区切换、旧版本残留导致的提前调度风险
+- **强制启动机制（已上线）**：定时实例 spawn 后会立即触发一次 `DriveOrchestrator.triggerTaskDrive()`；若实例在 `3` 分钟内仍无心跳，`CronExecutionMonitor` 会再补一次强制 drive；同一实例最多强制 `2` 次，若超过 `10` 分钟仍无心跳则自动升级给 `hermes-ops` 接管，避免静默卡死
+- **尝试次数硬闸门（已上线）**：`DriveOrchestrator` 与强制 drive 入口会在执行前检查 `attempt_count >= max_attempts`；超上限任务会被立即纠正为 `blocked`，不再继续留在 `pending/in_progress`
 - **实例 → 报告**：Hermes cron job 通过 `GET /todos/scheduled/pending` 查询待执行实例
-- spawn 时自动创建 `task_notification`（assigned 类型），通知 agent 有新实例待执行
+- spawn 时自动创建 `task_notification`（assigned 类型），并记录系统已尝试立即驱动
 - 手动触发模板实例化：`POST /todos/:id/spawn`
 - **模板执行规范（推荐）**：在模板任务 description 中添加 `EXEC_SPEC`，让服务端可在驱动前做 Preflight（缺目录/缺脚本/缺命令/缺环境变量直接 blocked 并给出 blockers）
   - `CWD=/abs/path`
@@ -292,8 +296,8 @@ POST /api/agents/:id/focus/auto
 | LLMInferencer | 5min | LLM 推断 idle 5-15 分钟的任务真实状态，高置信度自动标记 |
 | WorkSnapshotMonitor | 2min | 采集所有 Agent 工作快照到 contexts（保留上限 30 条/会话） |
 | GlobalCleanup | 6h | 清理过期 contexts（>7 天）、已读 notifications（>3 天），按 session 类型强制保留上限 |
-| DailyScheduler | 60s | 检查到期的模板任务并生成实例 |
-| CronExecutionMonitor | 60s | 检测未按时启动的定时实例 |
+| DailyScheduler | 60s | 检查到期的模板任务并生成实例，spawn 后立即尝试一次强制 drive |
+| CronExecutionMonitor | 60s | 对 `3` 分钟无心跳的定时实例补一次强制 drive；超过 `10` 分钟仍无心跳则提醒、自动聚焦，并在强制次数耗尽后升级给 `hermes-ops` 接管 |
 | AssignmentDriver | 60s | 自动聚焦已指派但未执行的任务 |
 | CleanupMonitor | 24h | 归档超过 30 天的 completed/cancelled 任务 + 取消超 48h 过期 pending 任务 + 清理孤儿子任务（父任务已完成） |
 
@@ -1247,6 +1251,7 @@ if (isValidationTask(task)) {
 15. **Agent 间无消息传递通道**：只有任务指派和通知，缺乏双向对话能力
 16. **所有 Agent 共享 LLM 配置**：无法为不同 Agent 配置不同模型或参数
 17. **StructuredDriveTools 已接入 DriveOrchestrator 主循环并完成阶段一闭环**：目前默认优先走结构化 tool loop，执行失败或无 tool call 时回退 legacy 命令提取链；后续工作以提升 executeCommand 覆盖率、收缩 legacy fallback、建设全局统计视图为主。
+18. **尝试次数状态机已补硬闸门**：自动 drive/强制 drive 在真正执行前会校验 `attempt_count`，超上限任务会被自动收敛到 `blocked`，避免出现“尝试次数已耗尽却仍停留在 in_progress”的状态污染。
 
 ### 15.4 V1.2 架构演进路线（Agent Loop 核心能力提升）
 
@@ -1344,7 +1349,47 @@ while (not done and iterations < MAX):
 
 **目标：** 把 `DriveOrchestrator` 升级为真正的 ReAct/Tool-Driven 执行闭环，让“被分派的任务能稳定推进并进入验收”成为系统第一能力。
 
+**当前阶段定位补充：**
+
+- `任务看板` 仍然是产品对外的主形态，用于任务展示、人工介入、异常追踪和跨 Agent 协作
+- 但本阶段的主攻方向不是继续扩展泛化待办能力，而是把系统收束为**定时作业运行管理工具**
+- 当前所有改造都应优先服务于一件事：**提升服务内已注册定时任务的启动率、完成率、验收通过率和异常可解释性**
+
 **建议周期：** 3-5 天
+
+**阶段一重点要解决的问题：**
+
+- **问题 1：到点生成了实例，但不一定真正被拉起执行**
+  - 典型表现：模板任务 `spawn` 后停在 `pending` 或刚切到 `in_progress`，长时间没有首个有效心跳
+  - 对作业的影响：任务看板里“看起来有任务”，但作业实际上没有开跑，导致错过时间窗口
+- **问题 2：执行链过度依赖自由文本和命令提取，任务推进不稳定**
+  - 典型表现：LLM 回了一段文字，但没有形成有效动作；命令执行结果没有进入下一轮推理；进度更新依赖固定文本格式
+  - 对作业的影响：同类定时任务在不同轮次表现波动大，完成率不稳定，失败原因不容易复盘
+- **问题 3：异常恢复与重试链条缺少硬约束，容易出现状态污染**
+  - 典型表现：任务在 `pending / in_progress / blocked` 之间反复拉扯，甚至出现 `attempt_count >= max_attempts` 仍继续自动 drive
+  - 对作业的影响：队列里会出现“假启动”“恢复循环”“超上限仍在跑”等噪声，影响运营判断
+- **问题 4：定时作业执行结果缺少统一的结构化闭环**
+  - 典型表现：作业完成、求助、阻塞、进入验收的留痕方式不统一
+  - 对作业的影响：很难稳定统计“今天多少作业真正开跑了、多少作业真正完成了、多少作业是靠人工兜底”
+
+**阶段一对应解决手段：**
+
+- **针对问题 1：补“强制启动链”**
+  - `DailyScheduler` 在模板实例生成后立即触发一次 `DriveOrchestrator.triggerTaskDrive()`
+  - `CronExecutionMonitor` 对 `3` 分钟无心跳实例补一次强制 drive
+  - 强制次数耗尽且超过 `10` 分钟仍无心跳时，自动升级给 `hermes-ops` 接管
+- **针对问题 2：补“工具优先执行闭环”**
+  - `DriveOrchestrator.driveTask()` 从文本驱动改成多轮工具调用循环
+  - 以 `StructuredDriveTools` 为默认执行协议，优先走 `executeCommand / readFile / checkPath / updateProgress / proposeCompletion / askForHelp`
+  - 工具结果即时回灌下一轮推理，而不是只在失败后通过文本重试兜底
+- **针对问题 3：补“状态机硬闸门”**
+  - 在自动 drive 和强制 drive 入口统一检查 `attempt_count >= max_attempts`
+  - 超上限任务立即收敛为 `blocked`，不再继续停留在 `pending / in_progress`
+  - 对 fallback、超预算、无进展、强制 drive、升级接管都写结构化 context 留痕
+- **针对问题 4：补“作业级可追踪结果链”**
+  - 完成通过 `proposeCompletion()` 统一进入 `pending_validation`
+  - 阻塞通过 `askForHelp()` 或结构化 blocker 写入
+  - 调度、强制启动、升级接管、重试耗尽都落在统一上下文链里，便于统计和追溯
 
 **核心改造：**
 
@@ -1380,6 +1425,277 @@ while (not done and iterations < MAX):
 - 常见任务默认走结构化工具更新进度和提交流程
 - 任务满足完成条件后优先进入 `pending_validation`
 - 阻塞项、求助请求、完成提案均有结构化留痕
+
+**阶段一最终应体现在作业上的结果：**
+
+- **启动层面**
+  - 定时作业在到点后不再只是“生成实例”，而是应当尽快出现首个有效执行动作
+  - 看板上能明确区分：`已生成但未启动`、`已强制启动`、`已升级接管`
+- **执行层面**
+  - 同类已注册作业的执行方式更稳定，不再高度依赖某次 LLM 回复质量
+  - 作业从 `pending -> in_progress -> pending_validation / blocked` 的迁移更可预测
+- **质量层面**
+  - 作业完成不再只看“Agent 说做完了”，而是更多通过工具调用、产出物检查和结构化提交流程进入验收
+  - 失败或卡住时，能明确知道是“没启动”“没进展”“超预算”“环境阻塞”还是“尝试次数耗尽”
+- **运营层面**
+  - 可以围绕已注册定时作业稳定统计：
+    - 到点启动率
+    - 首心跳达成率
+    - 最终完成率
+    - 自动恢复成功率
+    - 升级给 `hermes-ops` 的比例
+  - 这会让任务看板从“任务列表”变成“作业运行驾驶舱”
+
+**建议补充的作业运营指标口径：**
+
+- **计划作业数**
+  - 定义：指定时间窗口内，模板按 `schedule` 理应生成的作业实例总数
+  - 用途：作为后续所有启动率、完成率指标的分母
+- **已生成实例数**
+  - 定义：实际由 `DailyScheduler` 生成的模板实例数量
+  - 用途：观察模板计划与调度引擎是否一致，识别漏调度
+- **到点启动率**
+  - 定义：`已在阈值内进入 in_progress 的实例数 / 已生成实例数`
+  - 建议阈值：`3 分钟`
+  - 用途：衡量“生成后能否及时被拉起”
+- **首心跳达成率**
+  - 定义：`在阈值内写入首个有效 last_heartbeat 的实例数 / 已生成实例数`
+  - 建议阈值：`5 分钟`
+  - 用途：区分“假启动”和“真正开始执行”
+- **最终完成率**
+  - 定义：`进入 completed 的实例数 / 已生成实例数`
+  - 用途：衡量作业真正闭环能力
+- **自动恢复成功率**
+  - 定义：触发过自动恢复的实例中，最终完成的比例
+  - 用途：判断 `StuckTaskMonitor` / 强制 drive / 升级接管是否真的有效
+- **升级接管率**
+  - 定义：`被升级给 hermes-ops 的实例数 / 已生成实例数`
+  - 用途：衡量系统自主完成不足的程度
+- **阻塞率**
+  - 定义：`最终进入 blocked 的实例数 / 已生成实例数`
+  - 用途：衡量环境问题、脚本问题、依赖缺失等真实阻塞程度
+
+**建议的看板字段设计：**
+
+- **总览卡片**
+  - `今日计划作业数`
+  - `今日已生成实例数`
+  - `今日完成数`
+  - `今日 blocked 数`
+  - `今日升级给 hermes-ops 数`
+- **核心比率卡片**
+  - `到点启动率`
+  - `首心跳达成率`
+  - `最终完成率`
+  - `自动恢复成功率`
+  - `升级接管率`
+- **作业队列表**
+  - `作业标题`
+  - `模板 ID / 实例 ID`
+  - `所属 agent`
+  - `计划触发时间`
+  - `实例生成时间`
+  - `首次进入 in_progress 时间`
+  - `首个 last_heartbeat 时间`
+  - `当前状态`
+  - `当前进度`
+  - `当前步骤`
+  - `attempt_count / max_attempts`
+  - `是否被强制启动`
+  - `是否已升级给 hermes-ops`
+- **异常聚焦区**
+  - `超过 3 分钟未启动`
+  - `超过 5 分钟无首心跳`
+  - `自动恢复次数 >= 2`
+  - `尝试次数已耗尽`
+  - `已升级给 hermes-ops 仍未完成`
+
+**指标落地建议：**
+
+- 第一版可以先基于现有 `todos`、`contexts`、`task_notifications` 计算，不必立刻新建统计表
+- 等口径稳定后，再补 `job_runs` / `scheduler_events` 这类独立事件表，降低统计查询复杂度
+- 看板第一版先做“只读运营视图”，不要一开始就混入太多交互操作，先把口径跑稳
+
+**模板标准化与强制规范化：**
+
+- 当前系统已不再把“模板规范”仅作为人工约定，而是在任务创建与更新入口增加了**系统强制规范化**
+- 规范化适用范围：
+  - `POST /todos`
+  - `PUT /todos/:id`
+  - `POST /todos/:id/sub-tasks`
+  - 以及所有直接调用 `Todo.create()` / `Todo.update()` 的内部链路
+- 系统会自动完成的规范化动作：
+  - 自动去除 `title`、`description`、`schedule`、`assignedAgentId`、`acceptanceCriteria` 两端空白
+  - 如果传入 `schedule`，则强制将任务识别为模板任务
+  - 模板未提供默认执行者时，自动回填为当前 `agentId`
+  - 模板未提供 `acceptance_criteria` 时，自动生成默认验收标准
+  - 模板未提供 `description` 时，自动补齐模板用途说明
+  - 非法 `priority` 会回落为 `medium`
+  - 非法 `max_attempts` 会回落为 `3`
+  - 非数组的 `tags` / `dependencies` 会被规范化为数组
+  - `task_category` 会根据标题和描述自动推断
+- 系统不会自动猜测的字段：
+  - `schedule` 的业务含义不会被系统臆造；如果模板任务没有有效 `schedule`，会直接拒绝
+  - 依赖项若引用不存在任务，仍然会被接口拒绝，不会静默吞掉
+- 返回结果中会附带 `normalization` 字段，用于标记本次是否发生自动规范化，便于智能体和人工调用方及时纠偏
+- 这项机制的目标不是“让脏数据也能混进去”，而是把**可自动修复的输入偏差**当场收敛，把**无法自动推断的关键缺口**直接挡在入口外
+
+**模板最低可用标准：**
+
+- 一个可用于定时作业运营的最小合格模板，至少应具备：
+  - `schedule`
+  - `assigned_agent_id`
+  - `task_category`
+  - `description`
+  - `acceptance_criteria`
+  - `max_attempts`
+- 其中 `assigned_agent_id`、`description`、`acceptance_criteria`、`task_category` 现已支持系统自动补齐
+- `schedule` 仍然必须由调用方明确提供，因为它代表的是业务调度意图，不能由系统主观猜测
+
+**不合格模板的 Agent2Agent 治理修正：**
+
+- 对于历史遗留的“不合格模板”，系统已新增 `TemplateNormalizationService`
+- 修正入口：
+  - `POST /api/agents/:agentId/todos/templates/normalize-noncompliant`
+- 工作方式：
+  - 先扫描当前 agent 下不合格模板
+  - 由模板所属 agent 向 `template governor agent` 发起结构化治理请求
+  - 治理 agent 基于模板标题、描述、上下文和缺口字段，生成**白名单补丁建议**
+  - 系统只允许对白名单字段落库：
+    - `schedule`
+    - `assignedAgentId`
+    - `taskCategory`
+    - `description`
+    - `acceptanceCriteria`
+    - `maxAttempts`
+  - 落库后再次按最低可用标准复核是否已达标
+- 审计要求：
+  - 治理请求与治理回复会同时记录到 `owner agent` 和 `governor agent` 的 `contexts`
+  - 结果会写入模板任务通知，便于后续追踪
+- 风险控制：
+  - LLM 不能直接写数据库，只能输出建议 JSON
+  - `schedule` 只有在标题/描述中已有明显时间/频率信息时才允许补齐
+  - 无法安全推断的模板会保留为“仍需人工确认”，不会被系统强行臆造
+- 目标：
+  - 把历史脏模板治理从“人工逐条排查”升级为“系统批量扫描 + Agent2Agent 对话补齐 + 人工只处理剩余难例”
+- 当前开发库治理结果（2026-05-07）：
+  - 最低可用标准化模板已达到 `21/21`
+  - 最后一批人工确认并落库的调度规则为：
+    - `每周概念股数据同步（concept）` -> `0 18 * * 2`
+    - `每日沪深港通数据增量同步（hsgt）` -> `25 17 * * 1-5`
+    - `每日涨跌停数据增量同步（stk_limit）` -> `30 17 * * 1-5`
+  - 当前开发库已无剩余最低可用口径下的不合格模板
+
+**稳定达到 90%+ 的优化路径：**
+
+- 现阶段要把作业完成率稳定到 `90%+`，不能只靠补模板和补强制启动，还必须把系统从“能跑起来”推进到“可预测闭环”
+- 目标口径建议明确为：
+  - `最终完成率 = completed / 已生成实例数`
+  - `校验通过率 = validation_passed / 进入验收实例数`
+  - 统计范围以**已标准化注册模板**生成的作业实例为准
+- 当前 `21/21` 模板标准化已经解决了“输入质量不稳定”的问题，但距离稳定 `90%+` 还差四个层面：
+  - `到点未真正启动`
+  - `启动后缺少首心跳或很快卡住`
+  - `执行链对单次 LLM 回复仍然较敏感`
+  - `完成后证据不足，导致验收波动`
+
+**P0：先把启动率稳定到 95%+**
+
+- 对所有模板实例强制记录：
+  - `scheduled_at`
+  - `spawned_at`
+  - `first_in_progress_at`
+  - `first_heartbeat_at`
+- 以 `3 分钟` 为启动 SLA、`5 分钟` 为首心跳 SLA，超时立即进入恢复链，而不是继续等待自然推进
+- 现有强制 drive 机制保留，但要补一层“启动结果分类”：
+  - `未抢到执行权`
+  - `LLM 无响应`
+  - `工具调用失败`
+  - `环境依赖缺失`
+  - `已升级接管`
+- 对高频模板按时间带拆开，避免 `17:00-17:30` 内过度并发挤压同一 agent
+- 对 `hermes-default` 增加模板级并发预算与限流，不允许同一分钟拉起过多重型数据同步任务
+
+**P1：把执行链从“可尝试”改成“可复现”**
+
+- 对每类模板补“执行画像”，至少包括：
+  - `executor_type`
+  - `entry_command`
+  - `expected_outputs`
+  - `success_criteria`
+  - `validation_type`
+- 对脚本类模板，执行前先跑统一 preflight：
+  - 脚本是否存在
+  - 目标库路径是否存在
+  - 关键依赖是否可导入
+  - 上次实例是否仍在运行
+- `DriveOrchestrator` 里现有 `toolLoopMaxIterations=6`、`toolLoopTokenBudget=50000`、`maxNoProgressRounds=2` 更适合兜底，不适合作为高完成率主路径
+- 真正冲 `90%+` 时，主路径应该优先走“结构化执行协议”：
+  - 先明确执行计划
+  - 再执行命令
+  - 再采集结果
+  - 再结构化提交完成
+- 对重复失败的模板，增加“模板级熔断”：
+  - 当同模板连续 `N` 次失败时，暂停继续自动生成，并推送治理告警
+
+**P2：把验收通过率稳定到 90%+**
+
+- 完成不等于通过，必须把“完成证据”收成统一结构：
+  - 执行命令摘要
+  - 产出文件/表
+  - 核心结果计数
+  - 关键时间点
+  - 异常说明
+- 验证端不再只看自然语言总结，要按模板类型走固定 validator：
+  - `script`：检查脚本退出、目标表最新日期、核心行数/字段
+  - `inspection`：检查巡检结论、异常项、是否允许继续运行
+  - `backup`：检查备份文件存在、大小、抽样恢复可读
+- 对抽检场景，必须保留“执行证据 + 验证证据”双链路，保证人工抽检时能复盘
+- 对 `pending_validation` 超时任务，不能长期堆积，应在到达阈值后自动升级给验证 agent 或运营 agent
+
+**P3：把 90% 做成可持续指标，而不是一次性冲高**
+
+- 增加 `job_runs` / `scheduler_events` 两张事件表，避免后续所有运营指标都从 `todos` 反推
+- 每次作业实例至少记录：
+  - `template_id`
+  - `run_id`
+  - `planned_at`
+  - `spawned_at`
+  - `started_at`
+  - `first_heartbeat_at`
+  - `completed_at`
+  - `validated_at`
+  - `final_status`
+  - `failure_bucket`
+- `failure_bucket` 必须标准化，建议固定为：
+  - `not_started`
+  - `no_heartbeat`
+  - `tool_failure`
+  - `env_missing`
+  - `llm_unstable`
+  - `validation_failed`
+  - `human_blocked`
+- 只有把失败归因固定下来，后面才可能针对性把 `90%+` 稳住，而不是每周重复排查同类问题
+
+**建议的实施优先级：**
+
+- **第 1 步：补事件字段和失败分桶**
+  - 目标：先把“为什么没到 90%”量化出来
+- **第 2 步：补模板级 preflight + 熔断**
+  - 目标：把明显会失败的实例挡在执行前
+- **第 3 步：补固定 validator 与证据结构**
+  - 目标：把校验通过率稳定到 `90%+`
+- **第 4 步：按时间带和 agent 容量重排调度**
+  - 目标：把集中拥塞导致的启动/心跳问题压下去
+
+**阶段性验收标准：**
+
+- `到点启动率 >= 95%`
+- `首心跳达成率 >= 93%`
+- `最终完成率 >= 90%`
+- `校验通过率 >= 90%`
+- `pending_validation` 超时堆积数接近 `0`
+- 任一模板连续失败达到阈值时，系统能自动熔断并告警，而不是持续产出坏实例
 
 #### 阶段二：调度与执行中台收敛
 

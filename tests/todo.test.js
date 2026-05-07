@@ -460,6 +460,37 @@ describe('Templates and Scheduling', () => {
     expect(d.getHours()).toBe(9);
     expect(d.getMinutes()).toBe(0);
   });
+
+  test('computeNextDueAt cron respects weekday constraints in local time', () => {
+    const wednesdayAfternoon = new Date('2025-01-15T13:00:00+08:00');
+    const next = Todo.computeNextDueAt('cron:0 9 * * 1', wednesdayAfternoon);
+    const due = new Date(next);
+
+    expect(due.getDay()).toBe(1);
+    expect(due.getHours()).toBe(9);
+    expect(due.getMinutes()).toBe(0);
+    expect(due.getTime()).toBeGreaterThan(wednesdayAfternoon.getTime());
+  });
+
+  test('findDueTemplates reconciles stale next_due_at before deciding due', () => {
+    const template = Todo.create(agent.id, {
+      title: 'Local-time gated template',
+      schedule: '5 17 * * 1-5',
+      isTemplate: true
+    });
+
+    db.prepare(`
+      UPDATE todos
+      SET last_spawned_at = ?, next_due_at = ?
+      WHERE id = ? AND agent_id = ?
+    `).run('2026-05-07 04:31:32', '2026-05-07T03:05:00.000Z', template.id, agent.id);
+
+    const dueTemplates = Todo.findDueTemplates(agent.id, new Date('2026-05-07T13:06:49+08:00'), { reconcile: true });
+    const refreshed = Todo.findById(agent.id, template.id);
+
+    expect(dueTemplates.map(t => t.id)).not.toContain(template.id);
+    expect(refreshed.next_due_at).toBe('2026-05-07T09:05:00.000Z');
+  });
 });
 
 describe('Multi-agent Collaboration', () => {
@@ -523,5 +554,52 @@ describe('Stuck Tasks', () => {
 
     const stuck = Todo.findStuckTasks(agent.id, 0);
     expect(stuck.length).toBe(0);
+  });
+});
+
+describe('Template Normalization', () => {
+  let agent;
+  beforeEach(() => {
+    agent = createTestAgent();
+  });
+
+  test('create auto-normalizes template defaults for scheduled jobs', () => {
+    const todo = Todo.create(agent.id, {
+      title: '  每日数据库备份  ',
+      schedule: '  cron:0 17 * * 1-5  ',
+      description: '   ',
+      acceptanceCriteria: '   ',
+      maxAttempts: 0
+    });
+
+    expect(todo.title).toBe('每日数据库备份');
+    expect(todo.is_template).toBe(1);
+    expect(todo.schedule).toBe('cron:0 17 * * 1-5');
+    expect(todo.assigned_agent_id).toBe(agent.id);
+    expect(todo.description).toContain('定时模板任务');
+    expect(todo.acceptance_criteria).toContain('执行结果');
+    expect(todo.max_attempts).toBe(3);
+    expect(todo.task_category).toBe('script');
+    expect(todo.next_due_at).toBeTruthy();
+  });
+
+  test('update normalizes template fields when task becomes scheduled template', () => {
+    const todo = Todo.create(agent.id, { title: '每周巡检' });
+
+    const updated = Todo.update(agent.id, todo.id, {
+      isTemplate: true,
+      schedule: ' weekly:mon ',
+      description: '',
+      acceptanceCriteria: '',
+      assignedAgentId: '   '
+    });
+
+    expect(updated.is_template).toBe(1);
+    expect(updated.schedule).toBe('weekly:mon');
+    expect(updated.assigned_agent_id).toBe(agent.id);
+    expect(updated.description).toContain('定时模板任务');
+    expect(updated.acceptance_criteria).toContain('巡检结论');
+    expect(updated.task_category).toBe('inspection');
+    expect(updated.next_due_at).toBeTruthy();
   });
 });

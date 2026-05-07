@@ -8,6 +8,7 @@ const { buildDrivePrompt, parseHeartbeatReply } = require('../utils/driveHelper'
 const CommandExecutor = require('../services/CommandExecutor');
 const ProgressValidator = require('../services/ProgressValidator');
 const TaskReportService = require('../services/TaskReportService');
+const TemplateNormalizationService = require('../services/TemplateNormalizationService');
 
 const router = express.Router({ mergeParams: true });
 
@@ -57,10 +58,45 @@ function validateSchedule(schedule) {
   return null;
 }
 
+function buildNormalizedTodoPayload(agentId, rawPayload, options = {}) {
+  const payload = {
+    ...rawPayload,
+    assignedAgentId: rawPayload.assignedAgentId !== undefined
+      ? rawPayload.assignedAgentId
+      : rawPayload.assigned_agent_id,
+    taskCategory: rawPayload.taskCategory !== undefined
+      ? rawPayload.taskCategory
+      : rawPayload.task_category
+  };
+
+  return Todo.normalizeTaskInput(agentId, payload, options);
+}
+
 router.post('/', async (req, res) => {
   try {
     const { agentId } = req.params;
-    const { title, description, priority, context, tags, dependencies, projectId, position, schedule, isTemplate, assignedAgentId } = req.body;
+    const { normalizedData, normalizationNotes } = buildNormalizedTodoPayload(agentId, {
+      title: req.body.title,
+      description: req.body.description,
+      priority: req.body.priority,
+      context: req.body.context,
+      tags: req.body.tags,
+      dependencies: req.body.dependencies,
+      projectId: req.body.projectId,
+      position: req.body.position,
+      schedule: req.body.schedule,
+      isTemplate: req.body.isTemplate,
+      assignedAgentId: req.body.assignedAgentId,
+      parentId: req.body.parentId,
+      acceptanceCriteria: req.body.acceptanceCriteria,
+      criteriaConfirmed: req.body.criteriaConfirmed,
+      maxAttempts: req.body.maxAttempts,
+      taskCategory: req.body.taskCategory
+    }, {
+      operation: 'create',
+      enforceTemplateStandards: true
+    });
+    const { title, priority, dependencies, schedule, isTemplate, assignedAgentId } = normalizedData;
 
     if (!title) {
       return res.status(400).json({
@@ -69,11 +105,11 @@ router.post('/', async (req, res) => {
       });
     }
 
-    const validPriorities = ['low', 'medium', 'high', 'critical'];
-    if (priority && !validPriorities.includes(priority)) {
+    const normalizedErrors = Todo.validateNormalizedTaskInput(normalizedData, { operation: 'create' });
+    if (normalizedErrors.length > 0) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid priority. Must be one of: low, medium, high, critical'
+        message: normalizedErrors.join('; ')
       });
     }
 
@@ -133,25 +169,9 @@ router.post('/', async (req, res) => {
       Agent.create({ id: assignedAgentId, name: assignedAgentId, metadata: { auto_created: true } });
     }
 
-    const finalPriority = enforcePatrolPriority(title, tags, priority);
+    normalizedData.priority = enforcePatrolPriority(title, normalizedData.tags, priority);
 
-    const todo = Todo.create(agentId, {
-      title,
-      description,
-      priority: finalPriority,
-      context,
-      tags,
-      dependencies,
-      projectId,
-      parentId: req.body.parentId,
-      position,
-      acceptanceCriteria: req.body.acceptanceCriteria,
-      criteriaConfirmed: req.body.criteriaConfirmed,
-      maxAttempts: req.body.maxAttempts,
-      schedule,
-      isTemplate,
-      assignedAgentId
-    });
+    const todo = Todo.create(agentId, normalizedData);
 
     // 创建任务后自动重新评估聚焦
     const focus = await FocusState.autoFocus(agentId, getLlmManager(req));
@@ -159,7 +179,11 @@ router.post('/', async (req, res) => {
     res.status(201).json({
       success: true,
       data: todo,
-      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null,
+      normalization: {
+        applied: normalizationNotes.length > 0,
+        notes: normalizationNotes
+      }
     });
   } catch (error) {
     console.error('Error creating TODO:', error);
@@ -300,6 +324,34 @@ router.get('/summary', (req, res) => {
     res.status(500).json({
       error: 'Internal server error',
       message: 'Failed to fetch context summary'
+    });
+  }
+});
+
+router.post('/templates/normalize-noncompliant', async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const framework = req.app.get('driveFramework');
+    const service = new TemplateNormalizationService({ framework });
+    const limit = req.body.limit !== undefined ? Number.parseInt(req.body.limit, 10) : 50;
+    const templateIds = Array.isArray(req.body.templateIds) ? req.body.templateIds : null;
+    const dryRun = req.body.dryRun === true;
+
+    const result = await service.normalizeNonCompliantTemplates(agentId, {
+      limit: Number.isInteger(limit) && limit > 0 ? limit : 50,
+      templateIds,
+      dryRun
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    console.error('Error normalizing non-compliant templates:', error);
+    res.status(error.message && error.message.includes('LLM not available') ? 503 : 500).json({
+      error: 'Internal server error',
+      message: error.message || 'Failed to normalize non-compliant templates'
     });
   }
 });
@@ -656,12 +708,45 @@ router.get('/:id/dependency-tree', (req, res) => {
 router.put('/:id', async (req, res) => {
   try {
     const { agentId, id } = req.params;
-    const { title, description, status, priority, context, tags, dependencies, projectId, position, schedule, isTemplate, assignedAgentId } = req.body;
+    const existingTask = Todo.findById(agentId, id);
     const assignedAgentIdCompat = req.body.assigned_agent_id;
     const assignmentNote = req.body.assignmentNote !== undefined ? req.body.assignmentNote : req.body.assignment_note;
-    const normalizedAssignedAgentId = assignedAgentId !== undefined ? assignedAgentId : assignedAgentIdCompat;
+    const { normalizedData, normalizationNotes } = buildNormalizedTodoPayload(agentId, {
+      title: req.body.title,
+      description: req.body.description,
+      status: req.body.status,
+      priority: req.body.priority,
+      context: req.body.context,
+      tags: req.body.tags,
+      dependencies: req.body.dependencies,
+      projectId: req.body.projectId,
+      position: req.body.position,
+      schedule: req.body.schedule,
+      isTemplate: req.body.isTemplate,
+      assignedAgentId: req.body.assignedAgentId !== undefined ? req.body.assignedAgentId : assignedAgentIdCompat,
+      parentId: req.body.parentId,
+      acceptanceCriteria: req.body.acceptanceCriteria,
+      criteriaConfirmed: req.body.criteriaConfirmed,
+      maxAttempts: req.body.maxAttempts,
+      attemptCount: req.body.attemptCount,
+      attemptLog: req.body.attemptLog,
+      heartbeatProgress: req.body.heartbeatProgress,
+      heartbeatStep: req.body.heartbeatStep,
+      heartbeatBlockers: req.body.heartbeatBlockers,
+      taskCategory: req.body.taskCategory,
+      assignmentNote
+    }, {
+      operation: 'update',
+      existingTask,
+      enforceTemplateStandards: true
+    });
+    const normalizedAssignedAgentId = normalizedData.assignedAgentId;
+    const status = req.body.status;
+    const dependencies = normalizedData.dependencies !== undefined ? normalizedData.dependencies : req.body.dependencies;
+    const schedule = normalizedData.schedule !== undefined ? normalizedData.schedule : req.body.schedule;
+    const normalizedPriority = normalizedData.priority !== undefined ? normalizedData.priority : req.body.priority;
 
-    if (!Todo.findById(agentId, id)) {
+    if (!existingTask) {
       return res.status(404).json({
         error: 'Not found',
         message: 'TODO not found'
@@ -676,11 +761,11 @@ router.put('/:id', async (req, res) => {
       });
     }
 
-    const validPriorities = ['low', 'medium', 'high', 'critical'];
-    if (priority && !validPriorities.includes(priority)) {
+    const normalizedErrors = Todo.validateNormalizedTaskInput(normalizedData, { existingTask });
+    if (normalizedErrors.length > 0) {
       return res.status(400).json({
         error: 'Validation error',
-        message: 'Invalid priority. Must be one of: low, medium, high, critical'
+        message: normalizedErrors.join('; ')
       });
     }
 
@@ -716,11 +801,8 @@ router.put('/:id', async (req, res) => {
       }
     }
 
-    // For updates, check both the incoming title/tags and the existing task
-    const existingTask = Todo.findById(agentId, id);
-
     if (normalizedAssignedAgentId !== undefined || assignmentNote !== undefined) {
-      if (!existingTask?.is_template) {
+      if (!existingTask?.is_template && !normalizedData.isTemplate) {
         return res.status(400).json({
           error: 'Validation error',
           message: 'assigned_agent_id 不支持通过 PUT /todos/:id 直接更新。请使用 POST /todos/:id/assign 或 POST /todos/:id/transfer；模板任务（is_template=true）例外可通过 PUT 设置默认执行者。'
@@ -731,34 +813,11 @@ router.put('/:id', async (req, res) => {
       }
     }
 
-    const checkTitle = title !== undefined ? title : existingTask?.title;
-    const checkTags = tags !== undefined ? tags : existingTask?.tags;
-    const finalPriority = enforcePatrolPriority(checkTitle, checkTags, priority);
+    const checkTitle = normalizedData.title !== undefined ? normalizedData.title : existingTask?.title;
+    const checkTags = normalizedData.tags !== undefined ? normalizedData.tags : existingTask?.tags;
+    normalizedData.priority = enforcePatrolPriority(checkTitle, checkTags, normalizedPriority);
 
-    const todo = Todo.update(agentId, id, {
-      title,
-      description,
-      status,
-      priority: finalPriority,
-      context,
-      tags,
-      dependencies,
-      projectId,
-      parentId: req.body.parentId,
-      position,
-      acceptanceCriteria: req.body.acceptanceCriteria,
-      criteriaConfirmed: req.body.criteriaConfirmed,
-      maxAttempts: req.body.maxAttempts,
-      attemptCount: req.body.attemptCount,
-      attemptLog: req.body.attemptLog,
-      heartbeatProgress: req.body.heartbeatProgress,
-      heartbeatStep: req.body.heartbeatStep,
-      heartbeatBlockers: req.body.heartbeatBlockers,
-      assignedAgentId: normalizedAssignedAgentId,
-      assignmentNote,
-      schedule,
-      isTemplate
-    });
+    const todo = Todo.update(agentId, id, normalizedData);
 
     // 如果状态发生变化，重新评估聚焦
     let focus = null;
@@ -769,7 +828,11 @@ router.put('/:id', async (req, res) => {
     res.json({
       success: true,
       data: todo,
-      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null
+      focus: focus ? { task: focus, focus_reason: focus.focus_reason } : null,
+      normalization: {
+        applied: normalizationNotes.length > 0,
+        notes: normalizationNotes
+      }
     });
   } catch (error) {
     console.error('Error updating TODO:', error);
@@ -1120,7 +1183,15 @@ router.get('/:id/subtasks', (req, res) => {
 router.post('/:id/sub-tasks', (req, res) => {
   try {
     const { agentId, id } = req.params;
-    const { title, description, priority, context, tags, assignedAgentId } = req.body;
+    const { normalizedData, normalizationNotes } = buildNormalizedTodoPayload(agentId, {
+      title: req.body.title,
+      description: req.body.description,
+      priority: req.body.priority,
+      context: req.body.context,
+      tags: req.body.tags,
+      assignedAgentId: req.body.assignedAgentId !== undefined ? req.body.assignedAgentId : req.body.assigned_agent_id
+    }, { operation: 'create' });
+    const { title, priority, assignedAgentId } = normalizedData;
 
     // 验证父任务存在
     const parent = Todo.findById(agentId, id);
@@ -1132,14 +1203,6 @@ router.post('/:id/sub-tasks', (req, res) => {
       return res.status(400).json({ error: 'Validation error', message: 'Sub-task title is required' });
     }
 
-    const validPriorities = ['low', 'medium', 'high', 'critical'];
-    if (priority && !validPriorities.includes(priority)) {
-      return res.status(400).json({
-        error: 'Validation error',
-        message: 'Invalid priority. Must be one of: low, medium, high, critical'
-      });
-    }
-
     // 自动创建目标 agent（如果指定了且不存在）
     if (assignedAgentId && !Agent.exists(assignedAgentId)) {
       Agent.create({ id: assignedAgentId, name: assignedAgentId, metadata: { auto_created: true } });
@@ -1147,14 +1210,10 @@ router.post('/:id/sub-tasks', (req, res) => {
 
     // 子任务继承父任务的项目ID，优先级默认与父任务相同
     const subtask = Todo.create(agentId, {
-      title,
-      description,
+      ...normalizedData,
       priority: priority || parent.priority || 'medium',
-      context,
-      tags: tags || [],
       parentId: id,
-      projectId: parent.project_id,
-      assignedAgentId
+      projectId: parent.project_id
     });
 
     // 更新父任务心跳，记录新增了子任务
@@ -1166,7 +1225,11 @@ router.post('/:id/sub-tasks', (req, res) => {
     res.status(201).json({
       success: true,
       data: subtask,
-      message: '子任务已创建'
+      message: '子任务已创建',
+      normalization: {
+        applied: normalizationNotes.length > 0,
+        notes: normalizationNotes
+      }
     });
   } catch (error) {
     console.error('Error creating sub-task:', error);

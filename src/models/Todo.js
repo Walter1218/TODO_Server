@@ -16,10 +16,378 @@ const safeParseJson = (str, defaultValue = []) => {
   }
 };
 
+const MONTH_NAME_MAP = {
+  jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6,
+  jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12
+};
+const DAY_NAME_MAP = {
+  sun: 0, mon: 1, tue: 2, wed: 3, thu: 4, fri: 5, sat: 6
+};
+
+function coerceDate(value) {
+  if (!value) return null;
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : new Date(value.getTime());
+  const normalized = typeof value === 'string' && value.includes(' ') && !value.includes('T')
+    ? value.replace(' ', 'T')
+    : value;
+  const parsed = new Date(normalized);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function normalizeCronNumber(token, aliasMap = null) {
+  const raw = String(token).trim().toLowerCase();
+  if (!raw) return null;
+  if (aliasMap && Object.prototype.hasOwnProperty.call(aliasMap, raw)) {
+    return aliasMap[raw];
+  }
+  if (!/^-?\d+$/.test(raw)) {
+    return null;
+  }
+  return parseInt(raw, 10);
+}
+
+function expandCronPart(part, min, max, aliasMap = null, normalizeValue = value => value) {
+  const values = new Set();
+
+  const addValue = (value) => {
+    const normalized = normalizeValue(value);
+    if (normalized >= min && normalized <= max) {
+      values.add(normalized);
+    }
+  };
+
+  const parseRange = (segment) => {
+    if (segment === '*') {
+      for (let i = min; i <= max; i++) addValue(i);
+      return;
+    }
+
+    const [rangePart, stepPart] = segment.split('/');
+    const step = stepPart ? parseInt(stepPart, 10) : 1;
+    if (!Number.isInteger(step) || step <= 0) {
+      return;
+    }
+
+    if (rangePart === '*') {
+      for (let i = min; i <= max; i += step) addValue(i);
+      return;
+    }
+
+    if (rangePart.includes('-')) {
+      const [startRaw, endRaw] = rangePart.split('-');
+      const start = normalizeCronNumber(startRaw, aliasMap);
+      const end = normalizeCronNumber(endRaw, aliasMap);
+      if (start === null || end === null) return;
+      for (let i = start; i <= end; i += step) addValue(i);
+      return;
+    }
+
+    const single = normalizeCronNumber(rangePart, aliasMap);
+    if (single === null) return;
+    addValue(single);
+  };
+
+  for (const segment of String(part).split(',')) {
+    parseRange(segment.trim());
+  }
+
+  return values;
+}
+
+function matchesCronField(part, value, min, max, aliasMap = null, normalizeValue = v => v) {
+  if (!part || part === '*') return true;
+  const allowed = expandCronPart(part, min, max, aliasMap, normalizeValue);
+  return allowed.has(normalizeValue(value));
+}
+
+function matchesCronDate(parts, date) {
+  const [minutePart, hourPart, dayOfMonthPart, monthPart, dayOfWeekPart] = parts;
+  const minute = date.getMinutes();
+  const hour = date.getHours();
+  const dayOfMonth = date.getDate();
+  const month = date.getMonth() + 1;
+  const dayOfWeek = date.getDay();
+
+  if (!matchesCronField(minutePart, minute, 0, 59)) return false;
+  if (!matchesCronField(hourPart, hour, 0, 23)) return false;
+  if (!matchesCronField(monthPart, month, 1, 12, MONTH_NAME_MAP)) return false;
+
+  const domWildcard = !dayOfMonthPart || dayOfMonthPart === '*';
+  const dowWildcard = !dayOfWeekPart || dayOfWeekPart === '*';
+  const domMatches = matchesCronField(dayOfMonthPart || '*', dayOfMonth, 1, 31);
+  const dowMatches = matchesCronField(dayOfWeekPart || '*', dayOfWeek, 0, 7, DAY_NAME_MAP, value => value === 7 ? 0 : value);
+
+  if (domWildcard && dowWildcard) return true;
+  if (domWildcard) return dowMatches;
+  if (dowWildcard) return domMatches;
+  return domMatches || dowMatches;
+}
+
+function findNextCronOccurrence(cronExpr, fromTime) {
+  const parts = cronExpr.trim().split(/\s+/);
+  if (parts.length !== 5) return null;
+
+  const from = coerceDate(fromTime);
+  if (!from) return null;
+
+  const candidate = new Date(from.getTime());
+  candidate.setSeconds(0, 0);
+  candidate.setMinutes(candidate.getMinutes() + 1);
+
+  // 逐分钟向前搜索，使用当前机器的本地时区判断 cron 字段。
+  const maxIterations = 366 * 24 * 60;
+  for (let i = 0; i < maxIterations; i++) {
+    if (matchesCronDate(parts, candidate)) {
+      return candidate.toISOString();
+    }
+    candidate.setMinutes(candidate.getMinutes() + 1);
+  }
+
+  return null;
+}
+
+function isSameInstant(a, b) {
+  const left = coerceDate(a);
+  const right = coerceDate(b);
+  if (!left || !right) return false;
+  return left.getTime() === right.getTime();
+}
+
+function normalizeTextValue(value) {
+  if (typeof value !== 'string') return value;
+  return value.trim();
+}
+
+function normalizeNullableTextValue(value) {
+  if (value === null) return null;
+  if (typeof value !== 'string') return value;
+  const trimmed = value.trim();
+  return trimmed || null;
+}
+
+function coerceBoolean(value) {
+  if (typeof value === 'boolean') return value;
+  if (value === 1 || value === '1' || value === 'true') return true;
+  if (value === 0 || value === '0' || value === 'false') return false;
+  return Boolean(value);
+}
+
+function coercePositiveInteger(value, fallback) {
+  if (value === undefined || value === null || value === '') return fallback;
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) return fallback;
+  return parsed;
+}
+
+function hasOwn(data, key) {
+  return Object.prototype.hasOwnProperty.call(data, key);
+}
+
 class Todo {
+  static inferTaskCategory(title = '', description = '') {
+    const combined = `${title || ''} ${description || ''}`.toLowerCase();
+    if (combined.includes('巡检') || combined.includes('inspection') || combined.includes('质量检查') || combined.includes('monitor')) {
+      return 'inspection';
+    }
+    if (combined.includes('备份') || combined.includes('backup') || combined.includes('同步') || combined.includes('sync') || combined.includes('tushare')) {
+      return 'script';
+    }
+    if (combined.includes('fix') || combined.includes('修复') || combined.includes('调整') || combined.includes('优化')) {
+      return 'code_change';
+    }
+    return 'general';
+  }
+
+  static buildTemplateDescription(title, schedule) {
+    return `定时模板任务：${title}。系统将按调度规则 ${schedule} 生成实例，请按验收标准执行并提交结果。`;
+  }
+
+  static buildDefaultAcceptanceCriteria(title, taskCategory = 'general') {
+    if (taskCategory === 'inspection') {
+      return `完成《${title}》后，需输出巡检结论、异常项、处理建议，并明确说明是否允许继续运行。`;
+    }
+    if (taskCategory === 'script') {
+      return `完成《${title}》后，需提交执行结果、关键输出摘要、产出位置或目标库变更说明，并确认无致命报错。`;
+    }
+    if (taskCategory === 'code_change') {
+      return `完成《${title}》后，需说明修改内容、影响范围、验证方式与结果，并确认不存在阻塞性问题。`;
+    }
+    return `完成《${title}》后，需提交结果摘要、关键证据与验收结论，确保他人可以据此复核。`;
+  }
+
+  static normalizeTaskInput(agentId, rawData = {}, options = {}) {
+    const { existingTask = null, operation = 'create', enforceTemplateStandards = false } = options;
+    const normalizedData = { ...rawData };
+    const normalizationNotes = [];
+
+    if (hasOwn(rawData, 'title')) {
+      const trimmedTitle = normalizeTextValue(rawData.title);
+      normalizedData.title = trimmedTitle;
+      if (trimmedTitle !== rawData.title) normalizationNotes.push('title_trimmed');
+    }
+
+    if (hasOwn(rawData, 'description')) {
+      const trimmedDescription = normalizeTextValue(rawData.description);
+      normalizedData.description = trimmedDescription;
+      if (trimmedDescription !== rawData.description) normalizationNotes.push('description_trimmed');
+    }
+
+    if (hasOwn(rawData, 'context')) {
+      const trimmedContext = normalizeTextValue(rawData.context);
+      normalizedData.context = trimmedContext;
+      if (trimmedContext !== rawData.context) normalizationNotes.push('context_trimmed');
+    }
+
+    if (hasOwn(rawData, 'schedule')) {
+      const trimmedSchedule = normalizeNullableTextValue(rawData.schedule);
+      normalizedData.schedule = trimmedSchedule;
+      if (trimmedSchedule !== rawData.schedule) normalizationNotes.push('schedule_trimmed');
+    }
+
+    if (hasOwn(rawData, 'assignedAgentId')) {
+      const trimmedAssignedAgentId = normalizeNullableTextValue(rawData.assignedAgentId);
+      normalizedData.assignedAgentId = trimmedAssignedAgentId;
+      if (trimmedAssignedAgentId !== rawData.assignedAgentId) normalizationNotes.push('assigned_agent_trimmed');
+    }
+
+    if (hasOwn(rawData, 'acceptanceCriteria')) {
+      const trimmedAcceptanceCriteria = normalizeTextValue(rawData.acceptanceCriteria);
+      normalizedData.acceptanceCriteria = trimmedAcceptanceCriteria;
+      if (trimmedAcceptanceCriteria !== rawData.acceptanceCriteria) normalizationNotes.push('acceptance_criteria_trimmed');
+    }
+
+    if (hasOwn(rawData, 'taskCategory')) {
+      const trimmedTaskCategory = normalizeNullableTextValue(rawData.taskCategory);
+      normalizedData.taskCategory = trimmedTaskCategory;
+      if (trimmedTaskCategory !== rawData.taskCategory) normalizationNotes.push('task_category_trimmed');
+    }
+
+    if (hasOwn(rawData, 'priority')) {
+      const allowedPriorities = ['low', 'medium', 'high', 'critical'];
+      if (!allowedPriorities.includes(rawData.priority)) {
+        normalizedData.priority = 'medium';
+        normalizationNotes.push('priority_normalized_to_medium');
+      }
+    }
+
+    if (hasOwn(rawData, 'maxAttempts')) {
+      const normalizedMaxAttempts = coercePositiveInteger(rawData.maxAttempts, 3);
+      normalizedData.maxAttempts = normalizedMaxAttempts;
+      if (normalizedMaxAttempts !== rawData.maxAttempts) normalizationNotes.push('max_attempts_normalized');
+    }
+
+    if (hasOwn(rawData, 'tags') && !Array.isArray(rawData.tags)) {
+      normalizedData.tags = rawData.tags ? [String(rawData.tags)] : [];
+      normalizationNotes.push('tags_normalized_to_array');
+    }
+
+    if (hasOwn(rawData, 'dependencies') && !Array.isArray(rawData.dependencies)) {
+      normalizedData.dependencies = rawData.dependencies ? [String(rawData.dependencies)] : [];
+      normalizationNotes.push('dependencies_normalized_to_array');
+    }
+
+    const effectiveSchedule = hasOwn(normalizedData, 'schedule')
+      ? normalizedData.schedule
+      : (existingTask?.schedule || null);
+
+    const requestedTemplate = hasOwn(normalizedData, 'isTemplate')
+      ? coerceBoolean(normalizedData.isTemplate)
+      : Boolean(existingTask?.is_template);
+
+    const effectiveIsTemplate = effectiveSchedule ? true : requestedTemplate;
+    if (effectiveSchedule && normalizedData.isTemplate !== true) {
+      normalizationNotes.push('template_flag_forced_from_schedule');
+    }
+    normalizedData.isTemplate = effectiveIsTemplate;
+
+    const shouldEnforceTemplateStandards = operation === 'create' || enforceTemplateStandards;
+    if (effectiveIsTemplate && shouldEnforceTemplateStandards) {
+      const effectiveTitle = hasOwn(normalizedData, 'title')
+        ? normalizedData.title
+        : (existingTask?.title || '');
+
+      const effectiveDescription = hasOwn(normalizedData, 'description')
+        ? normalizedData.description
+        : (existingTask?.description || '');
+
+      const effectiveAssignedAgentId = hasOwn(normalizedData, 'assignedAgentId')
+        ? normalizedData.assignedAgentId
+        : (existingTask?.assigned_agent_id || null);
+
+      if (!effectiveAssignedAgentId) {
+        normalizedData.assignedAgentId = agentId;
+        normalizationNotes.push('template_assigned_agent_defaulted');
+      }
+
+      if (!effectiveDescription) {
+        normalizedData.description = this.buildTemplateDescription(effectiveTitle || '未命名任务', effectiveSchedule || '未设置');
+        normalizationNotes.push('template_description_defaulted');
+      }
+
+      const inferredCategory = this.inferTaskCategory(
+        effectiveTitle || existingTask?.title || '',
+        normalizedData.description || effectiveDescription || ''
+      );
+
+      if (!normalizedData.taskCategory) {
+        normalizedData.taskCategory = inferredCategory;
+        normalizationNotes.push('task_category_inferred');
+      }
+
+      const effectiveAcceptanceCriteria = hasOwn(normalizedData, 'acceptanceCriteria')
+        ? normalizedData.acceptanceCriteria
+        : (existingTask?.acceptance_criteria || '');
+
+      if (!effectiveAcceptanceCriteria) {
+        normalizedData.acceptanceCriteria = this.buildDefaultAcceptanceCriteria(
+          effectiveTitle || existingTask?.title || '未命名任务',
+          normalizedData.taskCategory || inferredCategory
+        );
+        normalizationNotes.push('template_acceptance_criteria_defaulted');
+      }
+    }
+
+    if (!normalizedData.taskCategory) {
+      const effectiveTitle = hasOwn(normalizedData, 'title')
+        ? normalizedData.title
+        : (existingTask?.title || '');
+      const effectiveDescription = hasOwn(normalizedData, 'description')
+        ? normalizedData.description
+        : (existingTask?.description || '');
+      normalizedData.taskCategory = this.inferTaskCategory(effectiveTitle, effectiveDescription);
+    }
+
+    return {
+      normalizedData,
+      normalizationNotes: Array.from(new Set(normalizationNotes))
+    };
+  }
+
+  static validateNormalizedTaskInput(data, options = {}) {
+    const { existingTask = null } = options;
+    const errors = [];
+    const effectiveTitle = hasOwn(data, 'title') ? data.title : existingTask?.title;
+    const effectiveSchedule = hasOwn(data, 'schedule') ? data.schedule : existingTask?.schedule;
+    const effectiveIsTemplate = hasOwn(data, 'isTemplate') ? data.isTemplate : Boolean(existingTask?.is_template);
+
+    if (!effectiveTitle) {
+      errors.push('TODO title is required');
+    }
+
+    if (effectiveIsTemplate && !effectiveSchedule) {
+      errors.push('模板任务必须提供 schedule');
+    }
+
+    return errors;
+  }
+
   static create(agentId, data) {
     const db = getDb();
     const id = data.id || uuidv4();
+    const { normalizedData } = this.normalizeTaskInput(agentId, data, {
+      operation: 'create',
+      enforceTemplateStandards: true
+    });
     const {
       title,
       description = '',
@@ -37,10 +405,11 @@ class Todo {
       schedule = null,
       isTemplate = false,
       assignedAgentId = null,
+      taskCategory = 'general',
       validationReport = '',
       validatedBy = null,
       validationCount = 0
-    } = data;
+    } = normalizedData;
 
     // Auto-set isTemplate=true if schedule is provided but isTemplate not explicitly set
     // This prevents LLM from forgetting to mark scheduled tasks as templates
@@ -58,9 +427,9 @@ class Todo {
         context, tags, dependencies, position,
         acceptance_criteria, criteria_confirmed, max_attempts,
         origin_agent_id, assigned_agent_id, schedule, is_template, next_due_at,
-        validation_report, validated_by, validation_count
+        validation_report, validated_by, validation_count, task_category
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     stmt.run(
@@ -68,7 +437,7 @@ class Todo {
       context, JSON.stringify(tags), JSON.stringify(dependencies), position,
       acceptanceCriteria, criteriaConfirmed ? 1 : 0, maxAttempts,
       agentId, assignedAgentId, schedule, finalIsTemplate ? 1 : 0, nextDueAt,
-      validationReport, validatedBy, validationCount
+      validationReport, validatedBy, validationCount, taskCategory
     );
 
     return this.findById(agentId, id);
@@ -172,6 +541,20 @@ class Todo {
 
   static update(agentId, id, data) {
     const db = getDb();
+    const existingTask = this.findById(agentId, id);
+    const { normalizedData } = this.normalizeTaskInput(agentId, data, {
+      operation: 'update',
+      existingTask,
+      enforceTemplateStandards: Boolean(
+        hasOwn(data, 'schedule')
+        || hasOwn(data, 'isTemplate')
+        || hasOwn(data, 'assignedAgentId')
+        || hasOwn(data, 'acceptanceCriteria')
+        || hasOwn(data, 'description')
+        || hasOwn(data, 'title')
+        || hasOwn(data, 'taskCategory')
+      )
+    });
     const {
       title,
       description,
@@ -201,8 +584,9 @@ class Todo {
       validatedBy,
       validationCount,
       validationDeadline,
-      archived
-    } = data;
+      archived,
+      taskCategory
+    } = normalizedData;
 
     const updates = [];
     const values = [];
@@ -342,6 +726,11 @@ class Todo {
     if (validationDeadline !== undefined) {
       updates.push('validation_deadline = ?');
       values.push(validationDeadline);
+    }
+
+    if (taskCategory !== undefined) {
+      updates.push('task_category = ?');
+      values.push(taskCategory);
     }
 
     if (archived !== undefined) {
@@ -1036,22 +1425,40 @@ class Todo {
     }));
   }
 
-  static findDueTemplates(agentId) {
-    const db = getDb();
-    const now = new Date().toISOString();
-    const stmt = db.prepare(`
-      SELECT * FROM todos
-      WHERE agent_id = ? AND is_template = 1
-        AND next_due_at IS NOT NULL AND next_due_at <= ?
-    `);
-    const todos = stmt.all(agentId, now);
-    return todos.map(todo => ({
-      ...todo,
-      tags: safeParseJson(todo.tags),
-      dependencies: safeParseJson(todo.dependencies),
-      attempt_log: safeParseJson(todo.attempt_log),
-      heartbeat_blockers: safeParseJson(todo.heartbeat_blockers)
-    }));
+  static findDueTemplates(agentId, referenceTime = new Date(), options = {}) {
+    const { reconcile = false } = options;
+    const now = coerceDate(referenceTime) || new Date();
+    let templates = this.findTemplates(agentId);
+
+    if (reconcile) {
+      templates = templates.map(template => this.reconcileTemplateNextDueAt(agentId, template, now));
+    }
+
+    return templates.filter(template => {
+      const nextDue = coerceDate(template.next_due_at);
+      return nextDue && nextDue.getTime() <= now.getTime();
+    });
+  }
+
+  static reconcileTemplateNextDueAt(agentId, template, referenceTime = new Date()) {
+    if (!template || !template.schedule) return template;
+
+    const reference = coerceDate(referenceTime) || new Date();
+    const baseTime = coerceDate(template.last_spawned_at) || coerceDate(template.created_at) || reference;
+    const computedNextDue = this.computeNextDueAt(template.schedule, baseTime);
+
+    if (!computedNextDue) return template;
+
+    if (isSameInstant(template.next_due_at, computedNextDue)) {
+      return {
+        ...template,
+        next_due_at: computedNextDue
+      };
+    }
+
+    return this.update(agentId, template.id, {
+      nextDueAt: computedNextDue
+    });
   }
 
   static spawnFromTemplate(agentId, templateId, options = {}) {
@@ -1211,7 +1618,8 @@ class Todo {
   static computeNextDueAt(schedule, fromTime) {
     if (!schedule) return null;
 
-    const from = new Date(fromTime);
+    const from = coerceDate(fromTime);
+    if (!from) return null;
 
     // daily: next occurrence is exactly 24h later
     if (schedule === 'daily') {
@@ -1238,23 +1646,11 @@ class Todo {
       return null;
     }
 
-    // cron: expression — simple parser for standard cron (minute hour day month dow)
-    // Also supports legacy raw cron expressions like "0 18 * * *"
+    // cron: expression — 使用当前机器本地时区按标准 5 段 cron 解析。
     const cronExpr = schedule.startsWith('cron:') ? schedule.slice(5).trim() : schedule;
-    const parts = cronExpr.split(/\s+/);
-    if (parts.length === 5) {
-      const minute = parseInt(parts[0], 10);
-      const hour = parseInt(parts[1], 10);
-      if (!isNaN(minute) && !isNaN(hour) && hour >= 0 && hour <= 23) {
-        const next = new Date(from);
-        next.setSeconds(0, 0);
-        next.setMinutes(minute);
-        next.setHours(hour);
-        if (next <= from) {
-          next.setDate(next.getDate() + 1);
-        }
-        return next.toISOString();
-      }
+    const nextCronDue = findNextCronOccurrence(cronExpr, from);
+    if (nextCronDue) {
+      return nextCronDue;
     }
 
     return null;
