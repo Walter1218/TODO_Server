@@ -4,6 +4,7 @@ const { getDb } = require('../db');
 
 const TUSHARE_DATA_DIR = process.env.TUSHARE_DATA_DIR || '/Users/onetwo/.openclaw/workspace/tushare_warehouse/data/';
 const BACKUP_DIR = process.env.BACKUP_DIR || '/Users/onetwo/a_share_warehouse/backups';
+const INSPECTION_REPORT_DIR = process.env.TUSHARE_REPORT_DIR || '/Users/onetwo/.openclaw/workspace/tushare_warehouse/reports';
 
 class CompletionReportBuilder {
   static build(task, agentId) {
@@ -24,6 +25,65 @@ class CompletionReportBuilder {
     const desc = task.description || '';
     const title = task.title || '';
     const report = { type: 'inspection', sections: [] };
+    const inspectionReport = this._loadInspectionJson(task);
+
+    if (inspectionReport) {
+      const summary = inspectionReport.summary || {};
+      const total = Number(summary.total || 0);
+      const ok = Number(summary.ok || 0);
+      const warning = Number(summary.warning || 0);
+      const error = Number(summary.error || 0);
+      const staticCount = Number(summary.static || 0);
+      report.overall = error > 0 ? 'error' : warning > 0 ? 'warning' : 'ok';
+      report.sections.push({
+        label: '巡检结论',
+        items: [
+          error > 0
+            ? `巡检发现 ${error} 项 error，需人工介入`
+            : warning > 0
+              ? `巡检完成，${warning} 项 warning，当前未达到阻断级别`
+              : '巡检完成，全部动态检查项正常'
+        ]
+      });
+      report.sections.push({
+        label: '数据覆盖',
+        items: [
+          `共检查 ${total} 项：ok ${ok} 项，warning ${warning} 项，error ${error} 项，static ${staticCount} 项`
+        ]
+      });
+      report.sections.push({
+        label: '健康度',
+        items: [
+          `ok: ${ok}`,
+          `warning: ${warning}`,
+          `error: ${error}`,
+          `static: ${staticCount}`
+        ]
+      });
+
+      const warningItems = Array.isArray(inspectionReport.results)
+        ? inspectionReport.results
+          .filter(item => item.status === 'warning')
+          .map(item => `${item.label}: latest=${item.max_date || item.max_ann_date || 'n/a'}, days_old=${item.days_old ?? 'n/a'}, null_rate=${item.null_rate ?? 'n/a'}`)
+        : [];
+      if (warningItems.length > 0) {
+        report.sections.push({
+          label: '告警详情',
+          items: warningItems
+        });
+      }
+
+      report.validationEvidence = {
+        criteriaMet: [
+          error === 0 ? '巡检报告 error 数量为 0' : `巡检报告存在 ${error} 项 error`,
+          `巡检报告已生成: ${this._resolveInspectionReportPath(task) || 'unknown'}`
+        ],
+        artifacts: [this._resolveInspectionReportPath(task)].filter(Boolean),
+        evidenceLines: warningItems
+      };
+      report.summary = this._generateInspectionSummary(report);
+      return report;
+    }
 
     const duckdbInfo = this._scanDuckdbFiles();
     if (duckdbInfo.exists) {
@@ -76,6 +136,29 @@ class CompletionReportBuilder {
 
     report.summary = this._generateInspectionSummary(report);
     return report;
+  }
+
+  static _resolveInspectionReportPath(task) {
+    const dateCandidates = [];
+    const createdAt = task?.created_at ? String(task.created_at).slice(0, 10) : '';
+    if (createdAt) dateCandidates.push(createdAt);
+    dateCandidates.push(new Date().toISOString().slice(0, 10));
+
+    for (const day of dateCandidates) {
+      const fullPath = path.join(INSPECTION_REPORT_DIR, `daily_inspection_${day}.json`);
+      if (fs.existsSync(fullPath)) return fullPath;
+    }
+    return null;
+  }
+
+  static _loadInspectionJson(task) {
+    try {
+      const reportPath = this._resolveInspectionReportPath(task);
+      if (!reportPath) return null;
+      return JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+    } catch (e) {
+      return null;
+    }
   }
 
   static _buildScriptReport(task, agentId) {

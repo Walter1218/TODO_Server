@@ -104,4 +104,54 @@ describe('DataTaskValidationService', () => {
     expect(result.source_probe.rows).toBe(0);
     expect(execFileSync).toHaveBeenCalledTimes(2);
   });
+
+  test('allows same-day source probe lagDays=0 for strict market close validation', () => {
+    execFileSync
+      .mockReturnValueOnce(JSON.stringify({
+        checks: [
+          { label: 'fact_stk_limit_latest_date', passed: false, rows: [{ latest_value: '2026-05-07' }] }
+        ]
+      }))
+      .mockReturnValueOnce(JSON.stringify({
+        rows: 7580,
+        trade_date: '20260508',
+        api: 'stk_limit'
+      }));
+
+    const result = DataTaskValidationService.validate({
+      title: '每日涨跌停数据增量同步（stk_limit）'
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.pass).toBe(false);
+    expect(result.deferred).toBeUndefined();
+
+    const sourceProbePayload = JSON.parse(execFileSync.mock.calls[1][2].input);
+    expect(sourceProbePayload.lagDays).toBe(0);
+  });
+
+  test('does not defer hsgt when top10 freshness also fails', () => {
+    execFileSync
+      .mockReturnValueOnce(JSON.stringify({
+        checks: [
+          { label: 'fact_hk_hold_latest_date', passed: false, rows: [{ latest_value: '2026-05-07' }] },
+          { label: 'fact_hsgt_top10_latest_date', passed: false, rows: [{ latest_value: '2026-05-07' }] }
+        ]
+      }))
+      .mockReturnValueOnce(JSON.stringify({
+        rows: 0,
+        trade_date: '20260508',
+        api: 'hk_hold'
+      }));
+
+    const result = DataTaskValidationService.validate({
+      title: '每日沪深港通数据增量同步（hsgt）'
+    });
+
+    expect(result.applied).toBe(true);
+    expect(result.pass).toBe(false);
+    expect(result.deferred).toBeUndefined();
+    expect(result.reason).toContain('fact_hk_hold_latest_date');
+    expect(result.reason).toContain('fact_hsgt_top10_latest_date');
+  });
 });

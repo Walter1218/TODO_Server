@@ -7,8 +7,8 @@ function stringifyRow(row) {
 }
 
 function normalizeLagDays(value) {
-  const days = Number(value || 1);
-  return Number.isFinite(days) && days > 0 ? Math.floor(days) : 1;
+  const days = Number(value ?? 1);
+  return Number.isFinite(days) && days >= 0 ? Math.floor(days) : 1;
 }
 
 class DataTaskValidationService {
@@ -118,34 +118,40 @@ class DataTaskValidationService {
   static _buildDeferredResult(task, spec, failedChecks, evidenceSummary) {
     if (!failedChecks.length) return null;
     const validation = spec?.validation || {};
-    const sourceProbe = validation?.sourceProbe;
-    if (!sourceProbe || sourceProbe.allowDeferred === false) return null;
+    const sourceProbes = Array.isArray(validation?.sourceProbes) && validation.sourceProbes.length > 0
+      ? validation.sourceProbes
+      : (validation?.sourceProbe ? [validation.sourceProbe] : []);
 
-    const applicableLabels = new Set(sourceProbe.appliesToLabels || []);
-    if (applicableLabels.size > 0 && failedChecks.some(check => !applicableLabels.has(check.label))) {
-      return null;
+    for (const sourceProbe of sourceProbes) {
+      if (!sourceProbe || sourceProbe.allowDeferred === false) continue;
+
+      const applicableLabels = new Set(sourceProbe.appliesToLabels || []);
+      if (applicableLabels.size > 0 && failedChecks.some(check => !applicableLabels.has(check.label))) {
+        continue;
+      }
+
+      const sourceResult = this._probeSourceAvailability(sourceProbe);
+      if (!sourceResult || sourceResult.error || sourceResult.rows !== 0) {
+        continue;
+      }
+
+      return {
+        applied: true,
+        pass: false,
+        deferred: true,
+        score: 65,
+        reason: `数据源 ${sourceProbe.api} 在目标日期无新增数据，已延期下次调度再验收`,
+        feedback: '源头当日返回 0 行，任务不记为失败，等待下次调度或下一交易日再自动校验。',
+        validator: 'policy:data_task',
+        evidence_summary: [
+          ...evidenceSummary,
+          `source_probe:${sourceProbe.api}=0`
+        ].slice(0, 5),
+        deferred_until: this._nextRetryAt(),
+        source_probe: sourceResult
+      };
     }
-
-    const sourceResult = this._probeSourceAvailability(sourceProbe);
-    if (!sourceResult || sourceResult.error || sourceResult.rows !== 0) {
-      return null;
-    }
-
-    return {
-      applied: true,
-      pass: false,
-      deferred: true,
-      score: 65,
-      reason: `数据源 ${sourceProbe.api} 在目标日期无新增数据，已延期下次调度再验收`,
-      feedback: '源头当日返回 0 行，任务不记为失败，等待下次调度或下一交易日再自动校验。',
-      validator: 'policy:data_task',
-      evidence_summary: [
-        ...evidenceSummary,
-        `source_probe:${sourceProbe.api}=0`
-      ].slice(0, 5),
-      deferred_until: this._nextRetryAt(),
-      source_probe: sourceResult
-    };
+    return null;
   }
 
   static _nextRetryAt() {
@@ -242,7 +248,8 @@ if not token:
 import tushare as ts
 ts.set_token(token)
 pro = ts.pro_api()
-lag = int(payload.get('lagDays') or 1)
+lag_value = payload.get('lagDays')
+lag = int(lag_value) if lag_value is not None else 1
 trade_date = (datetime.utcnow() - timedelta(days=lag)).strftime('%Y%m%d')
 api = payload.get('api')
 query_mode = payload.get('queryMode') or 'trade_date'

@@ -10,6 +10,7 @@ const ProgressValidator = require('../services/ProgressValidator');
 const TaskReportService = require('../services/TaskReportService');
 const TemplateNormalizationService = require('../services/TemplateNormalizationService');
 const OpsMetricsService = require('../services/OpsMetricsService');
+const MarketTaskRecoveryService = require('../services/MarketTaskRecoveryService');
 
 const router = express.Router({ mergeParams: true });
 
@@ -657,6 +658,37 @@ router.patch('/:id/status', async (req, res) => {
   }
 });
 
+router.post('/recover-market', async (req, res) => {
+  try {
+    const { agentId } = req.params;
+    const driveOrchestrator = req.app.get('driveOrchestrator');
+    if (!driveOrchestrator) {
+      return res.status(503).json({
+        error: 'Service unavailable',
+        message: 'DriveOrchestrator not initialized'
+      });
+    }
+
+    const titles = Array.isArray(req.body?.titles) && req.body.titles.length > 0
+      ? req.body.titles
+      : undefined;
+    const result = await MarketTaskRecoveryService.recoverTodayTasks(agentId, driveOrchestrator, {
+      titles,
+      source: 'manual_api_market_recovery',
+      reason: 'manual_market_recovery',
+      maxForcedAttempts: 5
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+  } catch (error) {
+    console.error('Error recovering market tasks:', error);
+    res.status(500).json({ error: 'Internal server error', message: error.message });
+  }
+});
+
 router.post('/:id/dependencies', (req, res) => {
   try {
     const { agentId, id } = req.params;
@@ -1173,13 +1205,18 @@ router.post('/:id/confirm-completion', async (req, res) => {
 router.post('/:id/heartbeat', (req, res) => {
   try {
     const { agentId, id } = req.params;
-    const { progress, step, blockers } = req.body;
+    const { progress, step, message, blockers } = req.body;
+    const normalizedStep = step || message;
 
     if (!Todo.findById(agentId, id)) {
       return res.status(404).json({ error: 'Not found', message: 'TODO not found' });
     }
 
-    const todo = Todo.updateHeartbeat(agentId, id, { progress, step, blockers });
+    const todo = Todo.updateHeartbeat(agentId, id, {
+      progress,
+      step: normalizedStep,
+      blockers
+    });
     res.json({ success: true, data: todo });
   } catch (error) {
     console.error('Error updating heartbeat:', error);

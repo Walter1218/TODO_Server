@@ -77,7 +77,29 @@ describe('Todo CRUD', () => {
     expect(foundTemplate.task_spec).toBeTruthy();
     expect(foundTemplate.task_spec.kind).toBe('data_task');
     expect(spawned.task_spec).toBeTruthy();
-    expect(spawned.task_spec.path).toBe('/tmp/example.duckdb');
+    expect(spawned.task_spec.path).toContain('tushare_moneyflow.duckdb');
+  });
+
+  test('findById refreshes stale data-task task_spec to canonical preset', () => {
+    const todo = Todo.create(agent.id, {
+      title: '每日龙虎榜数据增量同步（top_list）',
+      taskSpec: {
+        kind: 'data_task',
+        engine: 'duckdb',
+        path: '/tmp/legacy.duckdb',
+        target: { table: 'legacy_top_list' },
+        checks: [{
+          label: 'legacy_latest_date',
+          sql: "SELECT CAST(MAX(trade_date) AS VARCHAR) >= strftime(CURRENT_DATE - INTERVAL 1 DAY, '%Y%m%d') AS passed FROM legacy_top_list"
+        }]
+      }
+    });
+
+    const refreshed = Todo.findById(agent.id, todo.id);
+
+    expect(refreshed.task_spec.path).toContain('tushare_toplist.duckdb');
+    expect(refreshed.task_spec.target.table).toBe('fact_top_list');
+    expect(refreshed.task_spec.checks[0].sql).toContain('CURRENT_DATE - INTERVAL 0 DAY');
   });
 
   test('spawnFromTemplate stores last_spawned_at in ISO format', () => {
@@ -92,6 +114,31 @@ describe('Todo CRUD', () => {
 
     expect(refreshed.last_spawned_at).toMatch(/T/);
     expect(refreshed.last_spawned_at).toMatch(/Z$/);
+  });
+
+  test('archiveSiblingActiveInstances keeps current instance and archives other active siblings', () => {
+    const template = Todo.create(agent.id, {
+      title: '每日 A股数据同步到 SQLite stock.db',
+      schedule: '50 17 * * 1-5',
+      isTemplate: true
+    });
+
+    const old1 = Todo.spawnFromTemplate(agent.id, template.id);
+    const old2 = Todo.spawnFromTemplate(agent.id, template.id);
+    const current = Todo.spawnFromTemplate(agent.id, template.id);
+
+    Todo.update(agent.id, old1.id, { status: 'in_progress' });
+    Todo.update(agent.id, old2.id, { status: 'blocked' });
+    Todo.update(agent.id, current.id, { status: 'pending' });
+
+    const archived = Todo.archiveSiblingActiveInstances(agent.id, current.id);
+
+    expect(archived.map(t => t.id).sort()).toEqual([old1.id, old2.id].sort());
+    expect(Todo.findById(agent.id, current.id).status).toBe('pending');
+    expect(Todo.findById(agent.id, old1.id).status).toBe('cancelled');
+    expect(Todo.findById(agent.id, old1.id).archived).toBe(1);
+    expect(Todo.findById(agent.id, old2.id).status).toBe('cancelled');
+    expect(Todo.findById(agent.id, old2.id).archived).toBe(1);
   });
 
   test('delete todo', () => {
@@ -129,7 +176,7 @@ describe('Todo CRUD', () => {
   test('find todos by agent with todayOnly excludes historical instances', () => {
     const todayTask = Todo.create(agent.id, { title: 'Today Task' });
     const oldTask = Todo.create(agent.id, { title: 'Old Task' });
-    db.prepare("UPDATE todos SET created_at = datetime('now', 'localtime', '-1 day') WHERE id = ?").run(oldTask.id);
+    db.prepare("UPDATE todos SET created_at = datetime('now', '-1 day') WHERE id = ?").run(oldTask.id);
 
     const todos = Todo.findAllByAgent(agent.id, { todayOnly: true });
 

@@ -1159,7 +1159,10 @@
             if (this.secretKey && !this.localBypassEnabled) {
                 headers['X-Agent-Secret'] = this.secretKey;
             }
-            const res = await fetch(path, { headers });
+            const res = await fetch(path, {
+                headers,
+                cache: 'no-store'
+            });
             if (!res.ok) return { success: false, error: res.status };
             return res.json();
         },
@@ -1842,7 +1845,12 @@
             for (const c of matchedChildren) {
                 if (!displayTopMap.has(c.parent_id)) {
                     const parent = this.allTasks.find(t => t.id === c.parent_id);
-                    if (parent) displayTopMap.set(parent.id, parent);
+                    if (parent) {
+                        displayTopMap.set(parent.id, parent);
+                    } else {
+                        // Today-only child tasks may point to templates that are rendered in a separate panel.
+                        displayTopMap.set(c.id, c);
+                    }
                 }
             }
 

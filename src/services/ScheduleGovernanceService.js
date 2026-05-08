@@ -52,9 +52,10 @@ class ScheduleGovernanceService {
     return policy;
   }
 
-  evaluateBeforeSpawn(agentId, template) {
+  evaluateBeforeSpawn(agentId, template, options = {}) {
     const db = getDb();
     const policy = this.getPolicy(template);
+    const { enforceAgentCapacity = false } = options;
 
     const sameTemplateActive = db.prepare(`
       SELECT COUNT(*) as cnt
@@ -78,7 +79,7 @@ class ScheduleGovernanceService {
     }
 
     const agentCapacity = Agent.canAcceptNewTask(agentId);
-    if (!agentCapacity.canAccept) {
+    if (enforceAgentCapacity && !agentCapacity.canAccept) {
       return {
         allowed: false,
         reason: 'agent_capacity_reached',
@@ -117,6 +118,9 @@ class ScheduleGovernanceService {
       reason: 'governance_passed',
       details: {
         title: template.title,
+        agent_at_capacity: !agentCapacity.canAccept,
+        active_tasks: agentCapacity.active,
+        max_concurrent: agentCapacity.max,
         active_instances: sameTemplateActive,
         max_active_instances: policy.maxActiveInstances,
         recent_spawns: recentSpawns,

@@ -357,7 +357,16 @@ class DriveOrchestrator {
   }
 
   async _runOfficialExecution(agentId, task) {
-    const execution = DataTaskSpecService.getOfficialExecution(task);
+    Todo.archiveSiblingActiveInstances(agentId, task.id, {
+      reason: '正式脚本执行前自动清理同模板旧实例'
+    });
+
+    const execution = DataTaskSpecService.getOfficialExecution(task, {
+      env: {
+        TODO_TASK_ID: task.id,
+        TODO_AGENT_ID: agentId
+      }
+    });
     if (!execution?.command) return null;
 
     const commands = [{ index: 0, command: execution.command, source: 'official_script' }];

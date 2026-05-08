@@ -1,4 +1,5 @@
 const DataTaskValidationService = require('./DataTaskValidationService');
+const CompletionReportBuilder = require('./CompletionReportBuilder');
 
 function safeJsonParse(value, fallback = null) {
   if (!value) return fallback;
@@ -37,7 +38,13 @@ class ValidationPolicyService {
   }
 
   static extractStructuredEvidence(task) {
-    const report = safeJsonParse(task.completion_report, null);
+    let report = safeJsonParse(task.completion_report, null);
+    if (!report && (task.task_category === 'inspection' || `${task.title || ''} ${task.description || ''}`.includes('巡检'))) {
+      report = CompletionReportBuilder.build(task, task.agent_id);
+      if (report) {
+        CompletionReportBuilder.storeReport(task.id, task.agent_id, report);
+      }
+    }
     if (!report) {
       return { report: null, evidence: null };
     }

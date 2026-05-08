@@ -69,6 +69,9 @@ const apiLimiter = rateLimit({
 
 // Apply rate limiter to all API routes
 app.use('/api', (req, res, next) => {
+  if (process.env.NODE_ENV !== 'production') {
+    res.setHeader('Cache-Control', 'no-store');
+  }
   if (isLocalRequest(req) && process.env.DISABLE_LOCAL_DASHBOARD_BYPASS !== '1') {
     return next();
   }
@@ -80,7 +83,13 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.static(path.join(__dirname, '..', 'public')));
+app.use(express.static(path.join(__dirname, '..', 'public'), {
+  setHeaders: (res) => {
+    if (process.env.NODE_ENV !== 'production') {
+      res.setHeader('Cache-Control', 'no-store');
+    }
+  }
+}));
 
 app.get('/health', (req, res) => {
   res.json({

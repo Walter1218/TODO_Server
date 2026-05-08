@@ -1,6 +1,7 @@
 const { v4: uuidv4 } = require('uuid');
 const { getDb } = require('../db');
 const Context = require('./Context');
+const DataTaskSpecService = require('../services/DataTaskSpecService');
 
 // 安全解析 JSON 字段，处理可能的非 JSON 格式
 const safeParseJson = (str, defaultValue = []) => {
@@ -41,6 +42,11 @@ function normalizeTaskSpecValue(value) {
 
 function hydrateTodoRecord(todo) {
   if (!todo) return todo;
+  const runtimeTaskSpec = safeParseObjectJson(todo.task_spec, null);
+  const effectiveTaskSpec = DataTaskSpecService.buildRuntimeTaskSpec({
+    ...todo,
+    task_spec: runtimeTaskSpec
+  });
   return {
     ...todo,
     requires_plan: coerceBoolean(todo.requires_plan),
@@ -48,7 +54,7 @@ function hydrateTodoRecord(todo) {
     dependencies: safeParseJson(todo.dependencies),
     attempt_log: safeParseJson(todo.attempt_log),
     heartbeat_blockers: safeParseJson(todo.heartbeat_blockers),
-    task_spec: safeParseObjectJson(todo.task_spec, null)
+    task_spec: effectiveTaskSpec || runtimeTaskSpec
   };
 }
 
@@ -1712,6 +1718,55 @@ class Todo {
       spawned._replacedFrom = replacedTask;
     }
     return spawned;
+  }
+
+  static archiveSiblingActiveInstances(agentId, taskId, options = {}) {
+    const db = getDb();
+    const current = this.findById(agentId, taskId);
+    if (!current || !current.parent_id) return [];
+
+    const activeStatuses = options.activeStatuses || ['pending', 'in_progress', 'blocked', 'pending_validation', 'validating'];
+    const reason = options.reason || '新实例已接管执行';
+    const placeholders = activeStatuses.map(() => '?').join(', ');
+    const siblings = db.prepare(`
+      SELECT id, title, status, created_at
+      FROM todos
+      WHERE agent_id = ?
+        AND parent_id = ?
+        AND id != ?
+        AND (archived = 0 OR archived IS NULL)
+        AND status IN (${placeholders})
+      ORDER BY datetime(created_at) DESC
+    `).all(agentId, current.parent_id, taskId, ...activeStatuses);
+
+    if (siblings.length === 0) return [];
+
+    const updateStmt = db.prepare(`
+      UPDATE todos
+      SET status = 'cancelled',
+          archived = 1,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ? AND agent_id = ?
+    `);
+
+    for (const sibling of siblings) {
+      updateStmt.run(sibling.id, agentId);
+    }
+
+    Context.create(agentId, {
+      sessionId: 'scheduler',
+      role: 'system',
+      content: `[TaskCleanup] 任务「${current.title}」接管执行，已自动归档同模板旧实例 ${siblings.length} 个`,
+      metadata: {
+        type: 'task_cleanup',
+        task_id: taskId,
+        template_id: current.parent_id,
+        archived_task_ids: siblings.map(s => s.id),
+        reason
+      }
+    });
+
+    return siblings.map(sibling => this.findById(agentId, sibling.id)).filter(Boolean);
   }
 
   static writeReport(agentId, taskId, reportData) {

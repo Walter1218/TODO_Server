@@ -1974,6 +1974,52 @@ while (not done and iterations < MAX):
 - 默认不再把昨天遗留实例和模板任务混在同一个常规列表里，避免凌晨看到 `0508` 任务时误以为已经提前调度
 - 列表后端新增 `todayOnly` 过滤口径，按当前机器本地时间判断 `created_at` 是否属于今天
 - 今日日常任务卡片额外显示“今日生成时间”和“来源模板”，方便快速区分这条实例是今天几点生成、由哪个模板派生
+- 补充修复：全局任务列表对“来源模板但模板本身不在 todayOnly 返回集内”的子任务，改为直接展示子任务本身，避免 `每日 A股日线数据增量同步（Tushare）` 这类今日已生成实例从列表中漏掉
+- 补充修复：本地开发态 Dashboard 的静态页面和 `fetch` 请求统一禁缓存，避免浏览器继续拿旧版 `index.html` / 旧版 `todayOnly` 响应，导致任务列表与数据库状态不一致
+- 补充修复：本地开发态 `/api/*` 响应同样禁缓存，确保任务列表、统计卡片与数据库实时状态一致
+
+**17:00 批量数据模板漏跑修正（2026-05-08 已落地）：**
+
+- 根因确认：`DailyScheduler` 在“模板到点生成实例”前就套用了 `Agent.canAcceptNewTask()`，把 agent 执行并发上限误当成了实例生成门槛
+- 直接后果：`hermes-default` 当时已有 `5` 个执行中任务时，`top_list / adj_factor / block_trade / hsgt / stk_limit / index_daily / daily_quote+daily_basic / stock.db` 等模板虽然已到期，但被持续记成 `task_spawn_skipped(agent_capacity_reached)`，页面自然只看到少量实例
+- 修正规则：调度治理层保留“同模板活跃实例限制”和“短时 burst 限流”，但默认不再用 agent 执行并发上限阻断模板实例落库；执行并发继续由后续 drive / 运行态控制
+- 已补回归测试：覆盖“agent 槽位已满时仍允许 scheduler 生成实例”和“需要时仍可显式启用 capacity 硬阻塞”两条路径
+- 当晚加速补齐：对 `Tushare / dividend / moneyflow / top_list / adj_factor / block_trade / hsgt / stk_limit / index_daily / daily_quote+daily_basic / stock.db` 这组收盘模板追加 `SCHEDULE_BURST_LIMIT=8`、`SCHEDULE_BURST_WINDOW_MINUTES=5`，只放宽该组模板的补发速度，不改全局默认值
+- 运行态验证：`top_list / adj_factor / block_trade / hsgt / stk_limit / index_daily / daily_quote+daily_basic / stock.db` 已在后续调度周期内陆续生成当天实例；当前剩余主要卡点已转为执行链 `blocked`，不再是“到点不生成”
+
+**数据任务正式执行链修正（2026-05-08 已落地）：**
+
+- 根因 1：`DataTaskSpecService` 之前把正式脚本包装成 `source run_index.sh && python3 script.py`，但 `run_index.sh` 在 `source` 时会直接执行 `fetch_index_daily_v2.py`，导致目标脚本被副作用脚本串扰，失败后还会把真实报错吞掉
+- 根因 2：`bash -lc` 登录 shell 内的 `python3` 实际解析到 `/usr/bin/python3`，缺少 `tushare` 依赖；同一台机器非登录 shell 的 `python3` 才是可用解释器
+- 修正规则：正式脚本执行统一改成“从 `~/.openclaw/workspace/stock_backfill/.token` 注入 `TUSHARE_API_TOKEN/TUSHARE_TOKEN` + 使用固定绝对路径 Python 解释器 + 直接执行目标脚本”，不再依赖 `source run_index.sh`
+- 验收 SQL 修正：`trade_date` 类检查统一改为 `REPLACE(CAST(trade_date AS VARCHAR), '-', '')` 再参与比较，避免 DuckDB 中 `2026-05-07` 与 `20260507` 口径不一致导致误判
+- 规则匹配修正：`每日 A股日线数据全量采集（daily_quote + daily_basic）` 的 preset 提前到通用 `daily_quote` 规则前，避免被宽泛匹配截胡后丢失 `execution`
+- 脚本参数修正：`fetch_daily_tushare.py` 补齐 `--days 1`，避免脚本因缺少 `--full-backfill / --days / --trade-date` 之一直接退出
+- 已补单测：覆盖正式脚本命令构造、`trade_date` 归一化检查、`daily_quote + daily_basic` 匹配优先级与 `--days 1` 参数绑定
+- 运行态验证：`每日涨跌停数据增量同步（stk_limit）`、`每日指数日线数据增量同步（index_daily）`、`每日 A股日线数据全量采集（daily_quote + daily_basic）`、`每日大宗交易数据增量同步（block_trade）`、`每日沪深港通数据增量同步（hsgt）`、`每日复权因子数据增量同步（adj_factor）`、`每日分红数据增量同步（dividend）`、`每日龙虎榜数据增量同步（top_list）`、`每日资金流向数据增量同步（moneyflow）`、`每日 A股数据同步到 SQLite stock.db` 已在新执行链或修正后的本地服务执行链下成功跑脚本并通过规则验收，从 `blocked/no_heartbeat` 收口为 `completed`
+- 补充桥接修正：`todo_bridge.py` 现在优先复用“今天新生成且最新”的模板实例，不再把正式脚本心跳错误绑定到昨天遗留的 `in_progress/blocked` 旧实例；同时服务端 `/heartbeat` 已兼容桥接脚本上报的 `message` 字段，避免心跳文本被吞掉
+- 根治补强：TODO Server 正式脚本执行链现在会显式注入 `TODO_TASK_ID / TODO_AGENT_ID`，`todo_bridge.py` 若检测到当前任务 ID 就直接回写该实例，不再依赖模板标题匹配或活跃实例猜测；`stock.db` 这类脚本桥接不再会误绑到历史遗留任务
+- 运行前收敛：`DriveOrchestrator` 在正式脚本执行前会自动归档同模板下其它 `pending / in_progress / blocked / pending_validation / validating` 旧实例，只保留当前执行实例，减少历史僵尸任务继续污染页面和桥接目标
+- 恢复脚本入口：已新增 `npm run recover:market`，会基于开发库中“今天最新生成”的 `stock.db / block_trade / hsgt / adj_factor / dividend / top_list / moneyflow` 实例，逐条执行“归档旧实例 -> 强制 drive -> 输出结果摘要”的恢复流程，便于剩余股市任务批量收口
+- 服务化收敛：已新增 `MarketTaskRecoveryService` 统一封装“筛选今天最新实例 / 跳过已完成任务 / 归档同模板旧实例 / 调用强制 drive”的恢复逻辑，脚本入口和后续潜在 API 入口都复用同一条链路，避免恢复规则再次分叉
+- 本地 API 入口：已新增 `POST /api/agents/:agentId/todos/recover-market`，本地开发态免登下可直接触发这 7 条剩余股市数据任务的批量恢复；若传 `titles` 数组，也可只恢复指定子集
+- `stock.db` 补充修正：`daily_update_wrapper.py` 现在会把当前 `task_id` 显式传入子 shell；`daily_update.sh` 的 `todo_report_safe()` 会优先使用 `TODO_TASK_ID`，不再依赖旧缓存任务 ID；`todo_report.sh` 也已改为优先读取环境变量中的 `TODO_TASK_ID`
+- `stock.db` 执行链补充修正：`daily_update.sh` 里的 `fetch_daily_tushare.py / sync_tushare_to_stock_db.py / DuckDB 验证` 已统一切换到固定解释器 `DATA_TASK_PYTHON`（默认 `/opt/anaconda3/bin/python`），不再受 shell 默认 `python3` 指向影响；本次已修复 `ModuleNotFoundError: No module named 'tushare'`
+- 巡检验收补强：`CompletionReportBuilder` 现在会直接读取 `~/.openclaw/workspace/tushare_warehouse/reports/daily_inspection_YYYY-MM-DD.json`，为 `每日 DuckDB 数据仓库巡检` 自动生成结构化 `completion_report`；`ValidationPolicyService` 在巡检任务缺少 `completion_report` 时也会自动回填并按 inspection policy 验收
+- 巡检运行态收口：`每日 DuckDB 数据仓库巡检` 已基于当日巡检报告（`total=15 / ok=11 / warning=2 / error=0 / static=2`）从 `validation_failed` 收口为 `completed`；warning 项为 `分红数据` 与 `财务指标`，当前不构成阻断
+- 最新 freshness 根因复盘：`fetch_stk_limit.py / fetch_top_list.py / fetch_hsgt_hk_hold.py / fetch_block_trade_v2.py` 之前都把增量终点硬编码到“昨天”，即使 `2026-05-08` 源头已出数，也会天然停在 `2026-05-07`
+- 同日验收口径修正：`DataTaskSpecService` 已把 `block_trade / hsgt / stk_limit / top_list` 改成同日严格校验（`lagDays=0`）并补上同日 `sourceProbe`；`DataTaskValidationService` 不仅 JS 层 `normalizeLagDays()` 支持 `0`，内嵌 Python probe 也已修复，不再把 `0` 吞回 `1`
+- 历史实例规格刷新：`Todo` 模型在读取任务时现在会自动把实例上残留的旧 `task_spec` 与当前 canonical preset 合并，返回给页面、drive、validation、恢复链的都是最新规格；旧实例不再继续暴露 `INTERVAL 1 DAY`、旧目标表名或旧目标库路径
+- 执行脚本补丁继续收口：`fetch_stk_limit.py` 已修复“最近开放交易日排序”以及增量分支遗漏 `table` 参数导致脚本直接报错的问题；`MarketTaskRecoveryService` 也已把 `stk_limit` 纳入 `recover-market` 默认恢复集合，避免后续批量恢复时再次漏掉
+- 宿主运行态复核：由于 sandbox 直接写 DuckDB 仍会遇到 `Operation not permitted`，本次改为通过 PM2 宿主进程执行正式脚本并复核目标库；当前最新结果已更新为：
+  - `block_trade`：最新 `2026-05-08`，最新日 `133` 行
+  - `top_list`：最新 `2026-05-08`，最新日 `103` 行
+  - `stk_limit`：最新 `2026-05-08`，最新日 `7580` 行
+  - `hsgt_top10`：最新 `2026-05-08`，最新日 `20` 行
+  - `hk_hold`：源头 `2026-05-08` 返回 `0` 行，当前仍停在 `2026-05-07 / 925` 行，后续应按“`top10` 同日严格、`hk_hold` 允许延期”处理
+- `hsgt` 口径显式化：当前 `task_spec.validation` 已支持 `sourceProbes` 数组；`hsgt` 明确只对 `hk_hold` 两个 freshness label 绑定 `hk_hold` 源头探测和延期逻辑，`fact_hsgt_top10_*` 不在可延期集合内，因此 `top10` 若仍停在昨天会直接失败，不会再被 `hk_hold=0` 的特例掩盖
+- 今日完成率口径修正：`2026-05-08` 的 `hermes-default` 非模板任务最终结果仍是 `13/13 completed`、完成率 `100%`、且 `13/13` 已带验证结果；但这明确是“修复脚本 / bridge / 验收规则并人工重驱后的最终结果”，不能当作“自然调度已稳定达到 90%+”的证明
+- 自然调度仍未达 90% 的已确认链路：17:00 模板实例生成曾被 capacity 门槛误挡、正式脚本执行链曾受解释器/bridge 旧链路影响、freshness 旧规则默认允许“到昨天也算通过”、`recover-market` 之前遗漏 `stk_limit`、以及 `manual_api` / `forced_drive` 还有按 source 计数的尝试上限，这些都属于自然完成率仍需继续收口的系统问题
 
 **股市定时任务跨天补跑修正（2026-05-08 已落地）：**
 

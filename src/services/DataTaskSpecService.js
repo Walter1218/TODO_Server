@@ -7,25 +7,48 @@ const SCRIPTS_ROOT = path.join(TUSHARE_ROOT, 'scripts');
 const STOCK_BACKFILL_ROOT = path.join(WORKSPACE_ROOT, 'stock_backfill');
 const DATA_ROOT = process.env.DATA_TASK_DB_ROOT || path.join(TUSHARE_ROOT, 'data');
 const RUN_INDEX_PATH = path.join(TUSHARE_ROOT, 'run_index.sh');
+const TUSHARE_TOKEN_PATH = path.join(STOCK_BACKFILL_ROOT, '.token');
+const DATA_TASK_PYTHON = process.env.DATA_TASK_PYTHON || process.env.CONDA_PYTHON_EXE || '/opt/homebrew/bin/python3';
 
 function shellQuote(value) {
   return `'${String(value || '').replace(/'/g, `'\\''`)}'`;
 }
 
+function withShellEnv(command, env = {}) {
+  const entries = Object.entries(env).filter(([, value]) => value !== undefined && value !== null && value !== '');
+  if (entries.length === 0) return command;
+
+  const exports = entries.map(([key, value]) => `export ${key}=${shellQuote(value)};`).join(' ');
+  if (!command.startsWith('bash -lc ')) {
+    return `${exports} ${command}`.trim();
+  }
+
+  const rawShell = command.slice('bash -lc '.length);
+  let shellBody = rawShell;
+  if (rawShell.startsWith("'") && rawShell.endsWith("'")) {
+    shellBody = rawShell.slice(1, -1).replace(/'\\''/g, "'");
+  }
+  return `bash -lc ${shellQuote(`${exports} ${shellBody}`.trim())}`;
+}
+
 function buildOfficialScript(scriptName, options = {}) {
   const cwd = options.cwd || SCRIPTS_ROOT;
   const scriptPath = path.isAbsolute(scriptName) ? scriptName : path.join(cwd, scriptName);
+  const args = Array.isArray(options.args) ? options.args.filter(Boolean) : [];
   const bootstrap = options.sourceRunIndex === false
     ? ''
-    : `source ${shellQuote(RUN_INDEX_PATH)} >/dev/null 2>&1 && `;
+    : `TOKEN_FILE=${shellQuote(TUSHARE_TOKEN_PATH)}; if [ -f "$TOKEN_FILE" ]; then export TUSHARE_API_TOKEN="$(tr -d '\\r\\n' < "$TOKEN_FILE")"; export TUSHARE_TOKEN="$TUSHARE_API_TOKEN"; fi; `;
+  const argScript = args.map(shellQuote).join(' ');
+  const shellScript = `${bootstrap}cd ${shellQuote(cwd)} && ${shellQuote(DATA_TASK_PYTHON)} ${shellQuote(scriptPath)}${argScript ? ` ${argScript}` : ''}`;
   return {
     mode: 'official_script',
     cwd,
     scriptPath,
     timeoutMs: options.timeoutMs || 300000,
-    command: `bash -lc "${bootstrap}cd ${shellQuote(cwd)} && python3 ${shellQuote(scriptPath)}"`,
+    command: `bash -lc ${shellQuote(shellScript)}`,
     requirements: {
       runIndexPath: options.sourceRunIndex === false ? null : RUN_INDEX_PATH,
+      tokenPath: options.sourceRunIndex === false ? null : TUSHARE_TOKEN_PATH,
       cwd,
       scriptPath
     }
@@ -37,10 +60,23 @@ function buildSourceProbe(api, options = {}) {
     provider: 'tushare',
     api,
     tokenSourcePath: RUN_INDEX_PATH,
-    lagDays: options.lagDays || 1,
+    lagDays: options.lagDays ?? 1,
     queryMode: options.queryMode || 'trade_date',
     appliesToLabels: options.appliesToLabels || [],
     allowDeferred: options.allowDeferred !== false
+  };
+}
+
+function normalizeSourceProbes(validation) {
+  if (!validation || typeof validation !== 'object') return null;
+  const probes = Array.isArray(validation.sourceProbes)
+    ? validation.sourceProbes.filter(Boolean)
+    : (validation.sourceProbe ? [validation.sourceProbe] : []);
+  if (probes.length === 0) return validation;
+  return {
+    ...validation,
+    sourceProbe: probes[0],
+    sourceProbes: probes
   };
 }
 
@@ -61,22 +97,16 @@ function buildTradeDateChecks(table, lagDays = 1, dateFormat = '%Y%m%d', latestR
   return [
     {
       label: `${table}_latest_date`,
-      sql: `SELECT CAST(MAX(trade_date) AS VARCHAR) >= strftime(CURRENT_DATE - INTERVAL ${lagDays} DAY, '${dateFormat}') AS passed, CAST(MAX(trade_date) AS VARCHAR) AS latest_value FROM ${table}`
+      sql: `SELECT REPLACE(CAST(MAX(trade_date) AS VARCHAR), '-', '') >= strftime(CURRENT_DATE - INTERVAL ${lagDays} DAY, '${dateFormat}') AS passed, CAST(MAX(trade_date) AS VARCHAR) AS latest_value FROM ${table}`
     },
     {
       label: `${table}_latest_rows`,
-      sql: `SELECT COUNT(*) >= ${latestRowsMin} AS passed, COUNT(*) AS latest_rows FROM ${table} WHERE CAST(trade_date AS VARCHAR) = (SELECT CAST(MAX(trade_date) AS VARCHAR) FROM ${table})`
+      sql: `SELECT COUNT(*) >= ${latestRowsMin} AS passed, COUNT(*) AS latest_rows FROM ${table} WHERE REPLACE(CAST(trade_date AS VARCHAR), '-', '') = (SELECT REPLACE(CAST(MAX(trade_date) AS VARCHAR), '-', '') FROM ${table})`
     }
   ];
 }
 
 const PRESETS = [
-  {
-    match: /每日 A股日线数据增量同步|daily_quote/i,
-    build: (title) => buildDuckDbSpec(title, 'tushare_daily.duckdb', buildTradeDateChecks('daily_quote'), {
-      target: { table: 'daily_quote', dateColumn: 'trade_date' }
-    })
-  },
   {
     match: /每日 A股日线数据全量采集/i,
     build: (title) => buildDuckDbSpec(title, 'tushare_daily.duckdb', [
@@ -84,7 +114,15 @@ const PRESETS = [
       ...buildTradeDateChecks('daily_basic')
     ], {
       target: { tables: ['daily_quote', 'daily_basic'], dateColumn: 'trade_date' },
-      execution: buildOfficialScript('fetch_daily_tushare.py')
+      execution: buildOfficialScript('fetch_daily_tushare.py', {
+        args: ['--days', '1']
+      })
+    })
+  },
+  {
+    match: /每日 A股日线数据增量同步|daily_quote/i,
+    build: (title) => buildDuckDbSpec(title, 'tushare_daily.duckdb', buildTradeDateChecks('daily_quote'), {
+      target: { table: 'daily_quote', dateColumn: 'trade_date' }
     })
   },
   {
@@ -130,9 +168,15 @@ const PRESETS = [
   },
   {
     match: /block_trade/i,
-    build: (title) => buildDuckDbSpec(title, 'tushare_block_trade_v2.duckdb', buildTradeDateChecks('block_trade'), {
+    build: (title) => buildDuckDbSpec(title, 'tushare_block_trade_v2.duckdb', buildTradeDateChecks('block_trade', 0), {
       target: { table: 'block_trade', dateColumn: 'trade_date' },
-      execution: buildOfficialScript('fetch_block_trade_v2.py')
+      execution: buildOfficialScript('fetch_block_trade_v2.py'),
+      validation: {
+        sourceProbe: buildSourceProbe('block_trade', {
+          lagDays: 0,
+          appliesToLabels: ['block_trade_latest_date', 'block_trade_latest_rows']
+        })
+      }
     })
   },
   {
@@ -145,23 +189,32 @@ const PRESETS = [
   {
     match: /hsgt/i,
     build: (title) => buildDuckDbSpec(title, 'tushare_hsgt.duckdb', [
-      ...buildTradeDateChecks('fact_hk_hold'),
-      ...buildTradeDateChecks('fact_hsgt_top10')
+      ...buildTradeDateChecks('fact_hk_hold', 0),
+      ...buildTradeDateChecks('fact_hsgt_top10', 0)
     ], {
       target: { tables: ['fact_hk_hold', 'fact_hsgt_top10'], dateColumn: 'trade_date' },
       execution: buildOfficialScript('fetch_hsgt_hk_hold.py'),
-      validation: {
-        sourceProbe: buildSourceProbe('hk_hold', {
-          appliesToLabels: ['fact_hk_hold_latest_date', 'fact_hk_hold_latest_rows']
-        })
-      }
+      validation: normalizeSourceProbes({
+        sourceProbes: [
+          buildSourceProbe('hk_hold', {
+            lagDays: 0,
+            appliesToLabels: ['fact_hk_hold_latest_date', 'fact_hk_hold_latest_rows']
+          })
+        ]
+      })
     })
   },
   {
     match: /stk_limit/i,
-    build: (title) => buildDuckDbSpec(title, 'tushare_stklimit.duckdb', buildTradeDateChecks('fact_stk_limit'), {
+    build: (title) => buildDuckDbSpec(title, 'tushare_stklimit.duckdb', buildTradeDateChecks('fact_stk_limit', 0), {
       target: { table: 'fact_stk_limit', dateColumn: 'trade_date' },
-      execution: buildOfficialScript('fetch_stk_limit.py')
+      execution: buildOfficialScript('fetch_stk_limit.py'),
+      validation: {
+        sourceProbe: buildSourceProbe('stk_limit', {
+          lagDays: 0,
+          appliesToLabels: ['fact_stk_limit_latest_date', 'fact_stk_limit_latest_rows']
+        })
+      }
     })
   },
   {
@@ -198,9 +251,15 @@ const PRESETS = [
   },
   {
     match: /top_list/i,
-    build: (title) => buildDuckDbSpec(title, 'tushare_toplist.duckdb', buildTradeDateChecks('fact_top_list'), {
+    build: (title) => buildDuckDbSpec(title, 'tushare_toplist.duckdb', buildTradeDateChecks('fact_top_list', 0), {
       target: { table: 'fact_top_list', dateColumn: 'trade_date' },
-      execution: buildOfficialScript('fetch_top_list.py')
+      execution: buildOfficialScript('fetch_top_list.py'),
+      validation: {
+        sourceProbe: buildSourceProbe('top_list', {
+          lagDays: 0,
+          appliesToLabels: ['fact_top_list_latest_date', 'fact_top_list_latest_rows']
+        })
+      }
     })
   },
   {
@@ -229,13 +288,14 @@ class DataTaskSpecService {
   static mergeTaskSpec(runtimeSpec, canonicalSpec) {
     if (!canonicalSpec) return runtimeSpec || null;
     if (!runtimeSpec || typeof runtimeSpec !== 'object') return canonicalSpec;
+    const mergedValidation = canonicalSpec.validation || runtimeSpec.validation || null;
     return {
       ...runtimeSpec,
       ...canonicalSpec,
       target: canonicalSpec.target || runtimeSpec.target || null,
       checks: canonicalSpec.checks || runtimeSpec.checks || [],
       execution: canonicalSpec.execution || runtimeSpec.execution || null,
-      validation: canonicalSpec.validation || runtimeSpec.validation || null,
+      validation: normalizeSourceProbes(mergedValidation),
       metadata: {
         ...(runtimeSpec.metadata || {}),
         ...(canonicalSpec.metadata || {}),
@@ -250,8 +310,27 @@ class DataTaskSpecService {
     return this.mergeTaskSpec(runtimeSpec, canonicalSpec);
   }
 
-  static getOfficialExecution(task) {
-    return this.getEffectiveTaskSpec(task)?.execution || null;
+  static shouldPersistCanonicalSpec(task) {
+    return Boolean(this.inferTaskSpec(task));
+  }
+
+  static buildRuntimeTaskSpec(task) {
+    return this.getEffectiveTaskSpec(task);
+  }
+
+  static getOfficialExecution(task, options = {}) {
+    const execution = this.getEffectiveTaskSpec(task)?.execution || null;
+    if (!execution) return null;
+
+    const env = options.env && typeof options.env === 'object' ? options.env : null;
+    if (!env || Object.keys(env).length === 0) {
+      return execution;
+    }
+
+    return {
+      ...execution,
+      command: withShellEnv(execution.command, env)
+    };
   }
 
   static getValidationOptions(task) {

@@ -14,6 +14,7 @@
     "patch:hermes": "node scripts/patch-hermes-scheduler.js",
     "sync:skills": "node scripts/sync_skills.js",
     "setup:hermes": "node scripts/setup_hermes_agents.js && node scripts/sync_skills.js",
+    "recover:market": "node scripts/recover_market_tasks.js",
     "start:agents": "node scripts/start_all.js",
     "pm2:start": "npx pm2 start ecosystem.config.js",
     "pm2:stop": "npx pm2 stop todo-server hermes-default hermes-ops hermes-coder",
